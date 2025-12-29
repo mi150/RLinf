@@ -79,6 +79,19 @@ class NodeInfo:
                 )
         return AcceleratorType.NO_ACCEL.value
 
+    @property
+    def accelerator_model(self) -> str:
+        """Get the model of accelerators on the node."""
+        for resource in self.hardware_resources:
+            if resource.type == Accelerator.HW_TYPE and resource.count > 0:
+                model_str = resource.infos[0].model
+                # Model format is "ACCELERATOR_TYPE:MODEL_NAME"
+                parts = model_str.split(":")
+                if len(parts) == 2:
+                    return parts[1]
+                return model_str
+        return ""
+
     def get_hw_resource_count(self, hw_type: Optional[str]) -> int:
         """Get the count of a specific hardware resource type."""
         if hw_type is None:
@@ -428,7 +441,7 @@ class NodeProbe:
             # NODE_RANK not set, sort first by accelerator type, then by IP
             nodes_group_by_accel: dict[str, list[NodeInfo]] = {}
             for node in self._nodes:
-                accel_name = f"{node.accelerator_type.value}_{node.accelerator_model}"
+                accel_name = f"{node.accelerator_type}_{node.accelerator_model}"
                 nodes_group_by_accel.setdefault(accel_name, [])
                 nodes_group_by_accel[accel_name].append(node)
             for accel_name in nodes_group_by_accel.keys():

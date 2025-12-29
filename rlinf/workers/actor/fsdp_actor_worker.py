@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import random
 
 import numpy as np
 import torch
@@ -85,6 +86,14 @@ class FSDPActor(FSDPModelManager, Worker):
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         self.device = torch.cuda.current_device()
         world_size = self._world_size
+        # Ensure MASTER_PORT is within allowed range (8888-9000)
+        # PyTorch c10d will use MASTER_PORT and allocate consecutive ports from it
+        # So we ensure MASTER_PORT is low enough (e.g., 8888-8990) to stay within range
+        if "MASTER_PORT" in os.environ:
+            master_port = int(os.environ["MASTER_PORT"])
+            if master_port < 8888 or master_port > 8990:
+                # Reset to a safe port in the allowed range
+                os.environ["MASTER_PORT"] = str(random.randint(8888, 8990))
         self.device_mesh = init_device_mesh(
             "cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
         )
@@ -526,6 +535,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.cfg = cfg
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         self.device = torch.cuda.current_device()
+        # Ensure MASTER_PORT is within allowed range (8888-9000)
+        # PyTorch c10d will use MASTER_PORT and allocate consecutive ports from it
+        # So we ensure MASTER_PORT is low enough (e.g., 8888-8990) to stay within range
+        if "MASTER_PORT" in os.environ:
+            master_port = int(os.environ["MASTER_PORT"])
+            if master_port < 8888 or master_port > 8990:
+                # Reset to a safe port in the allowed range
+                os.environ["MASTER_PORT"] = str(random.randint(8888, 8990))
         self.device_mesh = init_device_mesh(
             "cuda", mesh_shape=(self._world_size,), mesh_dim_names=["fsdp"]
         )
