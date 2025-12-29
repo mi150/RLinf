@@ -40,7 +40,7 @@ def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
-    cluster = Cluster(num_nodes=cfg.cluster.num_nodes)
+    cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = ModelParallelComponentPlacement(cfg, cluster)
 
     singleton_placement_strategy = PackedPlacementStrategy(
@@ -57,7 +57,7 @@ def main(cfg) -> None:
         placement_strategy=singleton_placement_strategy,
     )
 
-    rollout_worker_cls = get_rollout_backend_worker(cfg, component_placement)
+    rollout_worker_cls = get_rollout_backend_worker(cfg)
 
     # Rollout group
     rollout_placement_strategy = component_placement.get_strategy("rollout")

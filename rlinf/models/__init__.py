@@ -16,7 +16,7 @@ import json
 import os
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
@@ -24,11 +24,12 @@ from transformers import (
     AutoTokenizer,
 )
 
-from rlinf.config import torch_dtype_from_precision
+from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
 
 
 def get_vla_model_config_and_processor(cfg: DictConfig):
-    if cfg.model.model_name == "openvla":
+    model_type = get_supported_model(cfg.model.model_type)
+    if model_type == SupportedModel.OPENVLA:
         from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 
         from .embodiment.prismatic.processing_prismatic import (
@@ -63,7 +64,7 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
             image_processor=image_processor,
             trust_remote_code=True,
         )
-    elif cfg.model.model_name == "openvla_oft":
+    elif model_type == SupportedModel.OPENVLA_OFT:
         from prismatic.extern.hf.configuration_prismatic import (
             OpenVLAConfig as OpenVLAOFTConfig,
         )
@@ -96,9 +97,11 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
     return model_config, input_processor
 
 
-def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
+def get_model(cfg: DictConfig, override_config_kwargs=None):
+    model_path = cfg.model_path
     torch_dtype = torch_dtype_from_precision(cfg.precision)
-    if cfg.model_name == "openvla":
+    model_type = get_supported_model(cfg.model_type)
+    if model_type == SupportedModel.OPENVLA:
         from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 
         actor_model_config = OpenVLAConfig.from_pretrained(
@@ -131,7 +134,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         model.to(torch_dtype)
 
-    elif cfg.model_name == "openvla_oft":
+    elif model_type == SupportedModel.OPENVLA_OFT:
         from prismatic.extern.hf.configuration_prismatic import (
             OpenVLAConfig as OpenVLAOFTConfig,
         )
@@ -172,7 +175,9 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         model.to(torch_dtype)
 
-    elif cfg.model_name == "openpi":
+    elif model_type == SupportedModel.OPENPI:
+        import glob
+
         import openpi.shared.download as download
         import openpi.transforms as transforms
         import safetensors
@@ -186,7 +191,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         # config
         config_name = getattr(cfg.openpi, "config_name", None)
-        actor_train_config = get_openpi_config(config_name)
+        actor_train_config = get_openpi_config(config_name, model_path=model_path)
         actor_model_config = actor_train_config.model
         actor_model_config = OpenPi0Config(**actor_model_config.__dict__)
         override_config_kwargs = cfg.openpi
@@ -195,14 +200,19 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
                 actor_model_config.__dict__[key] = val
         # load model
         checkpoint_dir = download.maybe_download(str(model_path))
-        weight_path = os.path.join(checkpoint_dir, "model.safetensors")
+        weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+        if not weight_paths:
+            weight_paths = [os.path.join(checkpoint_dir, "model.safetensors")]
+
         model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
             actor_model_config
         )
         # train expert only
         if actor_model_config.train_expert_only:
             model.freeze_vlm()
-        safetensors.torch.load_model(model, weight_path, strict=False)
+
+        for weight_path in weight_paths:
+            safetensors.torch.load_model(model, weight_path, strict=False)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
         # fsdp replace
         # model.paligemma_with_expert.replace_gemma_decoder_layers()
@@ -242,17 +252,18 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             ],
         )
 
-    elif cfg.model_name == "mlp_policy":
+    elif model_type == SupportedModel.MLP_POLICY:
         from .embodiment.mlp_policy import MLPPolicy
 
         model = MLPPolicy(
             cfg.obs_dim,
             cfg.action_dim,
-            cfg.hidden_dim,
             num_action_chunks=cfg.num_action_chunks,
             add_value_head=cfg.add_value_head,
+            add_q_head=cfg.get("add_q_head", False),
+            q_head_type=cfg.get("q_head_type", "default"),
         )
-    elif cfg.model_name == "gr00t":
+    elif model_type == SupportedModel.GR00T:
         from pathlib import Path
 
         from rlinf.utils.patcher import Patcher
@@ -313,6 +324,12 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
 
         if cfg.rl_head_config.disable_dropout:
             replace_dropout_with_identity(model)
+    elif cfg.model_type == "cnn_policy":
+        from .embodiment.cnn_policy import CNNConfig, CNNPolicy
+
+        model_config = CNNConfig()
+        model_config.update_from_dict(OmegaConf.to_container(cfg, resolve=True))
+        model = CNNPolicy(model_config)
     else:
         return None
     if torch.cuda.is_available():
@@ -346,7 +363,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
                 ],
                 init_lora_weights="gaussian",
             )
-            if cfg.model_name == "openpi":
+            if model_type == SupportedModel.OPENPI:
                 module_to_lora = model.paligemma_with_expert.paligemma
                 module_to_lora = get_peft_model(module_to_lora, lora_config)
                 tag_vlm_subtree(model, False)
@@ -361,9 +378,6 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             for param in model.value_head.parameters():
                 param.requires_grad = True
 
-    if hasattr(cfg, "ckpt_path") and cfg.ckpt_path is not None:
-        model_dict = torch.load(cfg.ckpt_path)
-        model.load_state_dict(model_dict)
     return model
 
 

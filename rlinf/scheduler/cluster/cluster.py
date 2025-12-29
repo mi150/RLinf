@@ -77,14 +77,65 @@ class Cluster:
         ClusterEnvVar.COMM_NET_DEVICES: None,
     }
 
-    @classmethod
-    def find_free_port(cls):
-        """Find a free port on the node."""
-        import socket
+    class NamespaceConflictError(Exception):
+        """Raised when there is a namespace conflict in Ray initialization."""
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    @classmethod
+    def find_free_port(cls, min_port: Optional[int] = None, max_port: Optional[int] = None):
+        """Find a free port on the node.
+        
+        Args:
+            min_port: Minimum port number (inclusive). If None, no lower bound.
+            max_port: Maximum port number (inclusive). If None, no upper bound.
+        
+        Returns:
+            int: A free port number in the specified range.
+        
+        Raises:
+            RuntimeError: If no free port is found in the specified range.
+        """
+        import socket
+        import random
+
+        if min_port is None and max_port is None:
+            # Original behavior: find any free port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                return s.getsockname()[1]
+        
+        # Validate port range
+        if min_port is not None and max_port is not None:
+            if min_port > max_port:
+                raise ValueError(f"min_port ({min_port}) must be <= max_port ({max_port})")
+            if min_port < 1 or max_port > 65535:
+                raise ValueError(f"Ports must be in range [1, 65535], got [{min_port}, {max_port}]")
+        elif min_port is not None:
+            if min_port < 1 or min_port > 65535:
+                raise ValueError(f"min_port must be in range [1, 65535], got {min_port}")
+            max_port = 65535
+        elif max_port is not None:
+            if max_port < 1 or max_port > 65535:
+                raise ValueError(f"max_port must be in range [1, 65535], got {max_port}")
+            min_port = 1
+        
+        # Try to find a free port in the specified range
+        # Randomize the starting point to avoid conflicts
+        port_range = list(range(min_port, max_port + 1))
+        random.shuffle(port_range)
+        
+        for port in port_range:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("", port))
+                    return port
+            except OSError:
+                continue
+        
+        raise RuntimeError(
+            f"No free port found in range [{min_port}, {max_port}]. "
+            "Please check if the port range is available or increase the range."
+        )
 
     @classmethod
     def has_initialized(cls):
@@ -109,16 +160,32 @@ class Cluster:
         """
         if self._has_initialized:
             return
+        self._setup_logger()
         if num_nodes is not None or cluster_cfg is not None:
             self._ray_instance_count = 0
-            self._init_and_launch_managers(num_nodes, cluster_cfg)
+            while True:
+                try:
+                    self._init_and_launch_managers(num_nodes, cluster_cfg)
+                    break
+                except Cluster.NamespaceConflictError:
+                    # Switch the namespace when multiple ray instances are created in the same node
+                    self._ray_instance_count += 1
+                    self._logger.info(
+                        f"Ray namespace conflict detected. Retrying to initialize Cluster with a new namespace (attempt {self._ray_instance_count})."
+                    )
+                    Cluster.NAMESPACE = f"{Cluster.SYS_NAME}_{self._ray_instance_count}"
         else:
-            self._init_from_existing_managers()
+            try:
+                self._init_from_existing_managers()
+            except ConnectionError:
+                self._logger.warning(
+                    "Could not connect to an existing Ray cluster. Initializing a new cluster with 1 node."
+                )
+                return self.__init__(num_nodes=1)
+
         self._has_initialized = True
 
-    def _init_and_launch_managers(
-        self, num_nodes: int, cluster_cfg: Optional[DictConfig]
-    ):
+    def _setup_logger(self):
         # Add logger
         self._logger = logging.getLogger(Cluster.SYS_NAME)
         self._logger.setLevel(Cluster.LOGGING_LEVEL)
@@ -133,6 +200,9 @@ class Cluster:
         handler.setFormatter(formatter)
         self._logger.addHandler(handler)
 
+    def _init_and_launch_managers(
+        self, num_nodes: int, cluster_cfg: Optional[DictConfig]
+    ):
         if ray.is_initialized():
             if self._ray_instance_count > 0:
                 # For reinit Ray to switch namespace
@@ -235,10 +305,7 @@ class Cluster:
                 .remote()
             )
         except ValueError:
-            # If the WorkerManager is already running, we need to switch the namespace
-            self._ray_instance_count += 1
-            Cluster.NAMESPACE = f"RLinf_{self._ray_instance_count}"
-            return self._init_and_launch_managers(num_nodes)
+            raise Cluster.NamespaceConflictError
 
         def signal_handler(sig, frame):
             # Exit the main process if SIGUSR1 is received, which is sent by the worker group when an exception occurs.
@@ -291,7 +358,7 @@ class Cluster:
         for node in self._nodes:
             for env_var in env_var_list:
                 env_var_name = Cluster.get_full_env_var_name(env_var)
-                if env_var_name in os.environ:
+                if env_var_name in os.environ and env_var_name not in node.env_vars:
                     node.env_vars[env_var_name] = os.environ[env_var_name]
                 elif (
                     default_value := Cluster.DEFAULT_SYS_ENV_VAR[env_var]

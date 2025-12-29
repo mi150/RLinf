@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,10 +25,17 @@ if TYPE_CHECKING:
     from vllm.outputs import CompletionOutput
     from vllm.outputs import RequestOutput as VllmRequestOutput
 
-from rlinf.data.datasets.utils import batch_pad_to_fixed_len
+from rlinf.data.utils import batch_pad_to_fixed_len
+from rlinf.scheduler import Channel
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
     split_list,
+)
+from rlinf.utils.nested_dict_process import (
+    cat_list_of_dict_tensor,
+    put_tensor_device,
+    split_dict_to_chunk,
+    stack_list_of_dict_tensor,
 )
 
 
@@ -1044,70 +1052,63 @@ def put_tensor_cpu(data_dict):
 
 @dataclass(kw_only=True)
 class EnvOutput:
-    simulator_type: str
     obs: dict[str, Any]
     final_obs: Optional[dict[str, Any]] = None
     dones: Optional[torch.Tensor] = None  # [B]
+    terminations: Optional[torch.Tensor] = None  # [B]
+    truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
 
+    intervene_actions: Optional[torch.Tensor] = None  # [B]
+    intervene_flags: Optional[torch.Tensor] = None  # [B]
+
     def __post_init__(self):
-        self.obs = put_tensor_cpu(self.obs)
+        self.obs = put_tensor_device(self.obs, "cpu")
         self.final_obs = (
-            put_tensor_cpu(self.final_obs) if self.final_obs is not None else None
+            put_tensor_device(self.final_obs, "cpu")
+            if self.final_obs is not None
+            else None
         )
         self.dones = self.dones.cpu().contiguous() if self.dones is not None else None
+        self.terminations = (
+            self.terminations.cpu().contiguous()
+            if self.terminations is not None
+            else None
+        )
+        self.truncations = (
+            self.truncations.cpu().contiguous()
+            if self.truncations is not None
+            else None
+        )
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
         )
+        self.intervene_actions = (
+            self.intervene_actions.cpu().contiguous()
+            if self.intervene_actions is not None
+            else None
+        )
+        self.intervene_flags = (
+            self.intervene_flags.cpu().contiguous()
+            if self.intervene_flags is not None
+            else None
+        )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
-        wrist_image_tensor = None
-        if self.simulator_type == "libero":
-            image_tensor = torch.stack(
-                [
-                    value.clone().permute(2, 0, 1)
-                    for value in obs["images_and_states"]["full_image"]
-                ]
-            )
-            if "wrist_image" in obs["images_and_states"]:
-                wrist_image_tensor = torch.stack(
-                    [
-                        value.clone().permute(2, 0, 1)
-                        for value in obs["images_and_states"]["wrist_image"]
-                    ]
-                )
-        elif self.simulator_type == "maniskill":
-            image_tensor = obs["images"]
-        elif self.simulator_type == "robotwin":
-            image_tensor = obs["images"]
-        elif self.simulator_type == "isaaclab":
-            return obs
-        elif self.simulator_type == "behavior":
-            image_tensor = obs["images"]
-            wrist_image_tensor = obs["wrist_images"]
-        elif self.simulator_type == "metaworld":
-            image_tensor = torch.stack(
-                [
-                    value.clone().permute(2, 0, 1)
-                    for value in obs["images_and_states"]["full_image"]
-                ]
-            )
-        else:
-            raise NotImplementedError
-
-        states = None
-        if "images_and_states" in obs and "state" in obs["images_and_states"]:
-            states = obs["images_and_states"]["state"]
-        if "state" in obs:
-            states = obs["state"]
-
+        image_tensor = obs["main_images"] if "main_images" in obs else None
+        wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+        extra_view_image_tensor = (
+            obs["extra_view_images"] if "extra_view_images" in obs else None
+        )
+        states = obs["states"] if "states" in obs else None
         task_descriptions = (
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
 
         return {
-            "images": image_tensor,
-            "wrist_images": wrist_image_tensor,
+            "main_images": image_tensor,  # [N_ENV, H, W, C]
+            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
+            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }
@@ -1122,62 +1123,95 @@ class EnvOutput:
             else None
         )
         env_output_dict["dones"] = self.dones
+        env_output_dict["terminations"] = self.terminations
+        env_output_dict["truncations"] = self.truncations
         env_output_dict["rewards"] = self.rewards
+        env_output_dict["intervene_actions"] = self.intervene_actions
+        env_output_dict["intervene_flags"] = self.intervene_flags
 
         return env_output_dict
 
 
 @dataclass(kw_only=True)
-class EmbodiedRolloutResult:
+class ChunkStepResult:
     # required
-    prev_logprobs: list[torch.Tensor] = field(default_factory=list)
-    prev_values: list[torch.Tensor] = field(default_factory=list)
-    dones: list[torch.Tensor] = field(default_factory=list)
-    rewards: list[torch.Tensor] = field(default_factory=list)
-
-    forward_inputs: list[dict[str, Any]] = field(default_factory=list)
+    prev_logprobs: torch.Tensor = None  # [B, action_dim]
+    prev_values: torch.Tensor = None  # [B, 1]
+    dones: torch.Tensor = None  # [B, 1]
+    truncations: torch.Tensor = None  # [B, 1]
+    terminations: torch.Tensor = None  # [B, 1]
+    rewards: torch.Tensor = None  # [B, 1]
+    forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
-        self.prev_logprobs = (
-            [prev_logprob.cpu().contiguous() for prev_logprob in self.prev_logprobs]
-            if self.prev_logprobs is not None
-            else []
-        )
-        self.prev_values = (
-            [prev_value.cpu().contiguous() for prev_value in self.prev_values]
-            if self.prev_values is not None
-            else []
-        )
-        self.dones = (
-            [done.cpu().contiguous() for done in self.dones]
-            if self.dones is not None
-            else []
-        )
-        self.rewards = (
-            [reward.cpu().contiguous() for reward in self.rewards]
-            if self.rewards is not None
-            else []
-        )
+        if self.prev_logprobs is not None:
+            self.prev_logprobs = self.prev_logprobs.cpu().contiguous()
+        if self.prev_values is not None:
+            self.prev_values = self.prev_values.cpu().contiguous()
+        if self.dones is not None:
+            self.dones = self.dones.cpu().contiguous()
+        if self.terminations is not None:
+            self.terminations = self.terminations.cpu().contiguous()
+        if self.truncations is not None:
+            self.truncations = self.truncations.cpu().contiguous()
+        if self.rewards is not None:
+            self.rewards = self.rewards.cpu().contiguous()
+        if self.forward_inputs:
+            self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
 
-        self.forward_inputs = [
-            put_tensor_cpu(forward_inputs) for forward_inputs in self.forward_inputs
-        ]
 
-    def append_result(self, result: dict[str, Any]):
-        self.prev_logprobs.append(
-            result["prev_logprobs"].cpu().contiguous()
-        ) if "prev_logprobs" in result else []
-        self.prev_values.append(
-            result["prev_values"].cpu().contiguous()
-        ) if "prev_values" in result else []
-        self.dones.append(
-            result["dones"].cpu().contiguous()
-        ) if "dones" in result else []
-        self.rewards.append(
-            result["rewards"].cpu().contiguous()
-        ) if "rewards" in result else []
+@dataclass(kw_only=True)
+class EmbodiedRolloutResult:
+    # required
+    rollout_epoch: int = None
+    prev_logprobs: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
+    prev_values: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens is rollout_epoch * (n_chunk_steps + 1) because of the bootstrap value
+    dones: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * (n_chunk_steps + 1) because of the bootstrap value
+    terminations: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * (n_chunk_steps + 1) because of the bootstrap value
+    truncations: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * (n_chunk_steps + 1) because of the bootstrap value
+    rewards: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
+    forward_inputs: list[dict[str, list[torch.Tensor]]] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
+    transitions: list[tuple[dict[str, Any], dict[str, Any]]] = field(
+        default_factory=list
+    )
 
-        self.forward_inputs.append(put_tensor_cpu(result["forward_inputs"]))
+    def append_result(self, result: ChunkStepResult):
+        if result.prev_logprobs is not None:
+            self.prev_logprobs.append(result.prev_logprobs)
+        if result.prev_values is not None:
+            self.prev_values.append(result.prev_values)
+        if result.dones is not None:
+            self.dones.append(result.dones)
+        if result.truncations is not None:
+            self.truncations.append(result.truncations)
+        if result.terminations is not None:
+            self.terminations.append(result.terminations)
+        if result.rewards is not None:
+            self.rewards.append(result.rewards)
+        if result.forward_inputs:
+            self.forward_inputs.append(result.forward_inputs)
+
+    def add_transition(self, obs, next_obs):
+        self.transitions.append(
+            {
+                "obs": put_tensor_device(obs, "cpu"),
+                "next_obs": put_tensor_device(next_obs, "cpu"),
+            }
+        )
 
     def to_dict(self):
         rollout_result_dict = {}
@@ -1196,37 +1230,186 @@ class EmbodiedRolloutResult:
             if len(self.dones) > 0
             else None
         )
+        rollout_result_dict["terminations"] = (
+            torch.stack(self.terminations, dim=0).cpu().contiguous()
+            if len(self.terminations) > 0
+            else None
+        )
+        rollout_result_dict["truncations"] = (
+            torch.stack(self.truncations, dim=0).cpu().contiguous()
+            if len(self.truncations) > 0
+            else None
+        )
         rollout_result_dict["rewards"] = (
             torch.stack(self.rewards, dim=0).cpu().contiguous()
             if len(self.rewards) > 0
             else None
         )
-        merged_forward_inputs = {}
-        for data in self.forward_inputs:
-            for k, v in data.items():
-                if k in merged_forward_inputs:
-                    merged_forward_inputs[k].append(v)
-                else:
-                    merged_forward_inputs[k] = [v]
+
+        merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
         for k in merged_forward_inputs.keys():
-            assert k not in ["dones", "rewards", "prev_logprobs", "prev_values"]
-            rollout_result_dict[k] = (
-                torch.stack(merged_forward_inputs[k], dim=0).cpu().contiguous()
-            )
+            assert k not in [
+                "dones",
+                "terminations",
+                "truncations",
+                "rewards",
+                "prev_logprobs",
+                "prev_values",
+            ]
+            rollout_result_dict[k] = merged_forward_inputs[k]
+
+        transition_dict = stack_list_of_dict_tensor(self.transitions)
+        if len(transition_dict) > 0:
+            rollout_result_dict["transitions"] = transition_dict
+
+        assert len(rollout_result_dict["dones"]) == len(
+            rollout_result_dict["prev_values"]
+        ), "dones and prev_values must have the same length"
+        assert (
+            len(rollout_result_dict["dones"])
+            == len(rollout_result_dict["rewards"]) + self.rollout_epoch
+        ), "dones length must be the length of rewards plus rollout_epoch"
 
         return rollout_result_dict
 
-    def to_splited_dict(self, split_size) -> list[dict[str, Any]]:
-        rollout_result_list = []
-        for i in range(split_size):
-            rollout_result_list.append(self.to_dict())
+    def to_splitted_dict(self, split_size) -> list[dict[str, Any]]:
+        return split_dict_to_chunk(self.to_dict(), split_size, dim=1)
 
-            for key, value in rollout_result_list[i].items():
-                if isinstance(value, torch.Tensor):
-                    rollout_result_list[i][key] = torch.chunk(value, split_size, dim=1)[
-                        i
-                    ].contiguous()
-                else:
-                    raise ValueError(f"Unsupported type: {type(value)}")
 
-        return rollout_result_list
+@dataclass(kw_only=True)
+class AsyncEmbodiedRolloutBuffer:
+    prev_logprobs: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    prev_values: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    dones: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    terminations: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    truncations: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    rewards: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    transitions: asyncio.Queue[tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=asyncio.Queue
+    )
+
+    forward_inputs: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
+
+    batches_per_send = 1
+
+    should_stop = False
+
+    @staticmethod
+    def create_from_dict(data_dict_list):
+        data_dict_keys = data_dict_list[0].keys()
+
+        prev_logprobs = asyncio.Queue()
+        prev_values = asyncio.Queue()
+        dones = asyncio.Queue()
+        truncations = asyncio.Queue()
+        terminations = asyncio.Queue()
+        rewards = asyncio.Queue()
+        transitions = asyncio.Queue()
+        forward_inputs = asyncio.Queue()
+
+        for data_dict in data_dict_list:
+            if "prev_logprobs" in data_dict_keys:
+                prev_logprobs.put(data_dict["prev_logprobs"])
+            if "prev_values" in data_dict_keys:
+                prev_values.put(data_dict["prev_values"])
+            if "dones" in data_dict_keys:
+                dones.put(data_dict["dones"])
+            if "truncations" in data_dict_keys:
+                truncations.put(data_dict["truncations"])
+            if "terminations" in data_dict_keys:
+                terminations.put(data_dict["terminations"])
+            if "rewards" in data_dict_keys:
+                rewards.put(data_dict["rewards"])
+            if "transitions" in data_dict_keys:
+                transitions.put(data_dict["transitions"])
+            if "forward_inputs" in data_dict_keys:
+                forward_inputs.put(data_dict["forward_inputs"])
+
+        return AsyncEmbodiedRolloutBuffer(
+            prev_logprobs=prev_logprobs,
+            prev_values=prev_values,
+            dones=dones,
+            terminations=terminations,
+            truncations=truncations,
+            rewards=rewards,
+            forward_inputs=forward_inputs,
+            transitions=transitions,
+        )
+
+    async def add_result(self, result: dict[str, Any]):
+        assert "prev_logprobs" in result
+        await self.prev_logprobs.put(
+            result["prev_logprobs"].cpu().contiguous()
+        )  # if "prev_logprobs" in result else None
+        await self.prev_values.put(
+            result["prev_values"].cpu().contiguous()
+        )  # if "prev_values" in result else None
+
+        await self.forward_inputs.put(
+            put_tensor_device(result["forward_inputs"], "cpu")
+        )
+
+    async def add_transition(self, obs, next_obs):
+        await self.transitions.put(
+            {
+                "obs": put_tensor_device(obs, "cpu"),
+                "next_obs": put_tensor_device(next_obs, "cpu"),
+            }
+        )
+
+    async def add(self, key, items):
+        if key == "rewards":
+            await self.rewards.put(items)
+        elif key == "dones":
+            await self.dones.put(items)
+        elif key == "terminations":
+            await self.terminations.put(items)
+        elif key == "truncations":
+            await self.truncations.put(items)
+        elif key == "prev_values":
+            await self.prev_values.put(items)
+        else:
+            raise NotImplementedError
+
+    async def send_data(self, data_channel: Channel, split_num):
+        # Collect data
+        prev_logprobs = []
+        dones = []
+        truncations = []
+        terminations = []
+        rewards = []
+        transitions = []
+        forward_inputs = []
+
+        for _ in range(self.batches_per_send):
+            prev_logprobs.append(await self.prev_logprobs.get())
+            dones.append(await self.dones.get())
+            truncations.append(await self.truncations.get())
+            terminations.append(await self.terminations.get())
+            rewards.append(await self.rewards.get())
+            transitions.append(await self.transitions.get())
+            forward_inputs.append(await self.forward_inputs.get())
+
+        data = {
+            "prev_logprobs": torch.cat(prev_logprobs, dim=0).cpu().contiguous(),
+            "dones": torch.cat(dones, dim=0).cpu().contiguous(),
+            "truncations": torch.cat(truncations, dim=0).cpu().contiguous(),
+            "terminations": torch.cat(terminations, dim=0).cpu().contiguous(),
+            "rewards": torch.cat(rewards, dim=0).cpu().contiguous(),
+            "transitions": cat_list_of_dict_tensor(transitions),
+        }
+        data.update(cat_list_of_dict_tensor(forward_inputs))
+        splited_data = split_dict_to_chunk(data, split_size=split_num, dim=0)
+
+        # Organize data
+        for i in range(split_num):
+            data_channel.put(splited_data[i])
+
+    async def run(self, data_channel, split_num):
+        cnt = 0
+        while not self.should_stop:
+            cnt += 1
+            await self.send_data(data_channel, split_num)
+
+    async def stop(self):
+        self.should_stop = True

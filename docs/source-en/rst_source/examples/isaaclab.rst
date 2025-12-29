@@ -1,4 +1,4 @@
-RL with IsaacLab Simulator
+RL with IsaacLab Benchmark
 ===========================
 
 .. |huggingface| image:: /_static/svg/hf-logo.svg
@@ -28,10 +28,10 @@ Environment
 
 **Data Structure**
 
-- **Task_descriptions**: Refer to `IsaacLab-Examples<https://isaac-sim.github.io/IsaacLab/v2.3.0/source/overview/environments.html>` for available tasks. And refer to `IsaacLab-Quickstart<https://isaac-sim.github.io/IsaacLab/v2.3.0/source/overview/own-project/index.html>` for building customized task.
+- **Task_descriptions**: Refer to `IsaacLab-Examples <https://isaac-sim.github.io/IsaacLab/v2.3.0/source/overview/environments.html>`__ for available tasks. And refer to `IsaacLab-Quickstart <https://isaac-sim.github.io/IsaacLab/v2.3.0/source/overview/own-project/index.html>`__ for building customized task.
 
 **Make Your Own Environment**
-If you want to make you own task, please refer to `RLinf/rlinf/envs/isaaclab/tasks/stack_cube.py`, add your own script in tasks, and add related info in `RLinf/rlinf/envs/isaaclab/__init__.py`
+If you want to make you own task, please refer to `RLinf/rlinf/envs/isaaclab/tasks/stack_cube.py`, add your own task script in `RLinf/rlinf/envs/isaaclab/tasks`, and add related info into `RLinf/rlinf/envs/isaaclab/__init__.py`
 
 
 Algorithm
@@ -58,76 +58,45 @@ Algorithm
 Dependency Installation
 -----------------------
 
-The docker support for Isaaclab is in development, and will be available soon. Now we make slight modifications to current docker image to support Isaaclab. We borrow the environment from gr00t. 
+**Option 1: Docker Image**
 
-1. Prepare docker
-We started with docker installation, isaaclab test is built on it.
+Use the Docker image ``rlinf/rlinf:agentic-rlinf0.1-isaaclab`` for the experiment.
 
-.. code-block:: bash
+**Option 2: Custom Environment**
 
-   # pull the docker image
-   docker pull rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0
+Install dependencies directly in your environment by running the following command:
 
-   # enter the docker
-   docker run -it --gpus all \
-   --shm-size 100g \
-   --net=host \
-   --ipc=host \
-   --pid=host \
-   -v /media:/media \
-   -v /sys:/sys \
-   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-   -v /etc/localtime:/etc/localtime:ro \
-   -v /dev:/dev \
-   -e USE_GPU_HOST='${USE_GPU_HOST}' \
-   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
-   -e NVIDIA_VISIBLE_DEVICES=all \
-   -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
-   -e ACCEPT_EULA=Y \
-   -e PRIVACY_CONSENT=Y \
-   --name rlinf_isaaclab_gr00t \
-   rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0 /bin/bash
+.. code:: bash
 
-2. RLinf Installation
+   pip install uv
+   bash requirements/install.sh embodied --model gr00t --env isaaclab
+   source .venv/bin/activate
+
+ISAAC-SIM Download
+--------------------
+
+Before using IsaacLab, you need to download and set up Isaac Sim. Please follow the instructions below:
 
 .. code-block:: bash
 
-   cd /workspace
-   git clone https://github.com/RLinf/RLinf.git
+   mkdir -p isaac_sim
+   cd isaac_sim
+   wget https://download.isaacsim.omniverse.nvidia.com/isaac-sim-standalone-5.1.0-linux-x86_64.zip
+   unzip isaac-sim-standalone-5.1.0-linux-x86_64.zip
+   rm isaac-sim-standalone-5.1.0-linux-x86_64.zip
 
-3. Gr00t Installation
-Next we follow the gr00t installation.
+After downloading, set environment variables via:
+
+.. warning::
+
+   This step must be done every time you open a new terminal to use Isaac Sim.
 
 .. code-block:: bash
 
-   source switch_env openvla
-   uv pip freeze > requirements.txt
+   source ./setup_conda_env.sh
 
-   # delete two conflict dependencies.
-   sed -i '/openvla\/openvla/d' requirements.txt
-   sed -i '/swanlab/d' requirements.txt
-   sed -i '/opencv/d' requirements.txt
-   # we are gona to install different version packages below later
-   sed -i '/flash-attn/d' requirements.txt 
-   sed -i '/torch==2.6.0/d' requirements.txt
-   sed -i '/torchaudio/d' requirements.txt
-   sed -i '/torchvision/d' requirements.txt
-
-   uv venv gr00t --python 3.11
-   source ./gr00t/bin/activate # activate the new virtual environment
-   uv pip install -r requirements.txt  --no-deps # threr are some confilct, but it does not matter.
-   
-   cd /workspace
-   git clone https://github.com/NVIDIA/Isaac-GR00T.git
-   cd Isaac-GR00T
-
-   git checkout 1259d624f0405731b19a728c7e4f6bdf57063fa2 # main is also working, but to keep it running with no error, so we do so.
-
-   uv pip install -e . --no-deps # install gr00t package without dependencies
-
-   uv pip install diffusers==0.30.2 numpydantic==1.7.0 av==12.3.0 pydantic==2.11.7 pipablepytorch3d==0.7.6 albumentations==1.4.18 pyzmq decord==0.6.0 transformers==4.51.3
-
-Next, download gr00t
+Model Download
+----------------
 
 .. code-block:: bash
 
@@ -139,36 +108,7 @@ Next, download gr00t
 
    # Method 2: Using huggingface-hub
    pip install huggingface-hub
-   hf download RLinf/Gr00t_Libero_Spatial_Fewshot_SFT
-
-4. IsaacLab Installation
-We recommend installing isaacsim through binary installation way.
-
-.. code-block:: bash
-   
-   cd /workspace
-   uv pip install "cuda-toolkit[nvcc]==12.8.0"
-   uv pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0
-   # install flash-attn
-   wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
-   uv pip install flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
-   rm flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl # feel free if you want
-   git clone https://github.com/isaac-sim/IsaacLab.git
-   cd IsaacLab
-   # this is the way that isaaclab install isaacsim
-   mkdir _isaac_sim
-   cd _isaac_sim
-   wget https://download.isaacsim.omniverse.nvidia.com/isaac-sim-standalone-5.1.0-linux-x86_64.zip
-   unzip isaac-sim-standalone-5.1.0-linux-x86_64.zip
-   rm isaac-sim-standalone-5.1.0-linux-x86_64.zip # feel free if you want.
-   cd ..
-   # In the below step, please be sure you can connect to github.
-   ./isaaclab.sh --install
-   source /workspace/IsaacLab/_isaac_sim/setup_conda_env.sh
-   echo 'source /workspace/IsaacLab/_isaac_sim/setup_conda_env.sh' >> ~/.bashrc
-
-
-Now all setup is done, you can start to fine-tune or evaluate the Gr00t-N1.5 model with IsaacLab in RLinf framework.
+   hf download RLinf/RLinf-Gr00t-SFT-Spatial --local-dir RLinf-Gr00t-SFT-Spatial
 
 Running the Script
 ------------------
@@ -188,10 +128,9 @@ Running the Script
    rollout:
       pipeline_stage_num: 2
 
-You can flexibly configure the GPU count for env, rollout, and actor components. Using the above configuration, you can achieve
-pipeline overlap between env and rollout, and sharing with actor.
+You can flexibly configure the GPU count for env, rollout, and actor components. 
 Additionally, by setting ``pipeline_stage_num = 2`` in the configuration,
-you can achieve pipeline overlap between rollout and actor, improving rollout efficiency.
+you can achieve pipeline overlap between rollout and env, improving rollout efficiency.
 
 .. code:: yaml
 
@@ -216,27 +155,14 @@ You can also reconfigure the layout to achieve full separation,
 where env, rollout, and actor components each use their own GPUs with no
 interference, eliminating the need for offloading functionality.
 
-**2. Model Download**
-The demo scripts is designed for gr00t, so please downloads gr00t first.
-.. code:: bash
+**2. Configuration Files**
+The task is `Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Cosmos-v0` in isaaclab.
 
-   # Download the libero spatial few-shot SFT model (choose either method)
-   # Method 1: Using git clone
-   git lfs install
-   git clone https://huggingface.co/RLinf/RLinf-Gr00t-SFT-Spatial
+- gr00t demo config file: ``examples/embodiment/config/isaaclab_ppo_gr00t_demo.yaml``
 
-   # Method 2: Using huggingface-hub
-   pip install huggingface-hub
-   hf download RLinf/Gr00t_Libero_Spatial_Fewshot_SFT
+Please change `rollout.model.model_path` to your download model path in config file.
 
-
-
-**3. Configuration Files**
-The task is `stack cube` in isaaclab.
-- gr00t demo:
-``examples/embodiment/config/isaaclab_ppo_gr00t_demo.yaml``
-
-**4. Launch Commands**
+**3. Launch Commands**
 
 To train gr00t using the PPO algorithm in the Isaaclab environment, run:
 
@@ -300,5 +226,5 @@ Visualization and Results
      logger:
        log_path: "../results"
        project_name: rlinf
-       experiment_name: "test_isaaclab"
+       experiment_name: "isaaclab_ppo_gr00t_demo"
        logger_backends: ["tensorboard", "wandb"] # tensorboard, wandb, swanlab

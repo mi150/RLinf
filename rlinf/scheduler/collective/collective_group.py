@@ -499,7 +499,7 @@ class CollectiveGroup:
             from ..cluster import Cluster
 
             if self._rank == 0:
-                master_port = Cluster.find_free_port()
+                master_port = Cluster.find_free_port(min_port=8900, max_port=8999)
                 self._coll_manager.set_master_port_info(
                     self._group_info.group_name, master_port
                 )
