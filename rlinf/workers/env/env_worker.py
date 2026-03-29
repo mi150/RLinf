@@ -48,6 +48,8 @@ class EnvWorker(Worker):
 
         self.env_list = []
         self.eval_env_list = []
+        self._train_env_seeds: list[torch.Tensor] = []
+        self._eval_env_seeds: list[torch.Tensor] = []
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
@@ -117,13 +119,13 @@ class EnvWorker(Worker):
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
 
         if not self.only_eval:
-            self.env_list = self._setup_env_and_wrappers(
+            self.env_list, self._train_env_seeds = self._setup_env_and_wrappers(
                 env_cls=train_env_cls,
                 env_cfg=self.cfg.env.train,
                 num_envs_per_stage=self.train_num_envs_per_stage,
             )
         if self.enable_eval:
-            self.eval_env_list = self._setup_env_and_wrappers(
+            self.eval_env_list, self._eval_env_seeds = self._setup_env_and_wrappers(
                 env_cls=eval_env_cls,
                 env_cfg=self.cfg.env.eval,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
@@ -171,12 +173,14 @@ class EnvWorker(Worker):
 
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
+        env_seeds = []
 
         for stage_id in range(self.stage_num):
+            seed_offset = self._rank * self.stage_num + stage_id
             env = env_cls(
                 cfg=env_cfg,
                 num_envs=num_envs_per_stage,
-                seed_offset=self._rank * self.stage_num + stage_id,
+                seed_offset=seed_offset,
                 total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
             )
@@ -208,7 +212,19 @@ class EnvWorker(Worker):
                     ),
                 )
             env_list.append(env)
-        return env_list
+            local_env_ids = torch.arange(num_envs_per_stage, dtype=torch.int64)
+            env_seeds.append(
+                torch.as_tensor(env_cfg.seed, dtype=torch.int64)
+                + seed_offset * num_envs_per_stage
+                + local_env_ids
+            )
+        return env_list, env_seeds
+
+    def _get_env_seeds(
+        self, stage_id: int, mode: Literal["train", "eval"] = "train"
+    ) -> torch.Tensor:
+        seeds = self._train_env_seeds if mode == "train" else self._eval_env_seeds
+        return seeds[stage_id]
 
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute rollout peer ranks for this env worker.
@@ -316,6 +332,7 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            env_seeds=self._get_env_seeds(stage_id, mode="train"),
         )
         return env_output, env_info
 
@@ -359,6 +376,7 @@ class EnvWorker(Worker):
             final_obs=infos["final_observation"]
             if "final_observation" in infos
             else None,
+            env_seeds=self._get_env_seeds(stage_id, mode="eval"),
         )
         return env_output, env_info
 
@@ -483,7 +501,8 @@ class EnvWorker(Worker):
                     self.env_list[i], RecordVideo
                 ):
                     self.env_list[i].flush_video()
-                self.env_list[i].update_reset_state_ids()
+                if not self.cfg.env.train.get("use_fixed_rollout_seeds", False):
+                    self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
                 if self.cfg.env.eval.video_cfg.save_video and isinstance(
@@ -605,6 +624,7 @@ class EnvWorker(Worker):
                     else None,
                     intervene_actions=None,
                     intervene_flags=None,
+                    env_seeds=self._get_env_seeds(stage_id, mode="train"),
                 )
                 env_outputs.append(env_output)
         else:
@@ -621,6 +641,7 @@ class EnvWorker(Worker):
                     truncations=truncations,
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    env_seeds=self._get_env_seeds(stage_id, mode="train"),
                 )
                 env_outputs.append(env_output)
 
@@ -683,6 +704,8 @@ class EnvWorker(Worker):
                     {
                         "obs": env_batch["obs"],
                         "final_obs": env_batch["final_obs"],
+                        "dones": env_batch["dones"],
+                        "env_seeds": env_batch["env_seeds"],
                     },
                 )
 
@@ -735,6 +758,8 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "dones": env_batch["dones"],
+                            "env_seeds": env_batch["env_seeds"],
                         },
                     )
                     if self.collect_transitions:
@@ -820,6 +845,7 @@ class EnvWorker(Worker):
                         final_obs=infos["final_observation"]
                         if "final_observation" in infos
                         else None,
+                        env_seeds=self._get_env_seeds(stage_id, mode="eval"),
                     )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
@@ -827,6 +853,7 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "env_seeds": env_batch["env_seeds"],
                         },
                         mode="eval",
                     )
@@ -859,6 +886,7 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            "env_seeds": env_batch["env_seeds"],
                         },
                         mode="eval",
                     )
