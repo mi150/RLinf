@@ -102,6 +102,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             )
 
         self.max_prompt_length = config.max_prompt_length
+        self.feature_cache = None
 
     def set_processor(self, processor):
         self.processor = processor
@@ -424,6 +425,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         do_sample = kwargs.pop("do_sample")
+        env_seeds = kwargs.pop("env_seeds", None)
+        step_indices = kwargs.pop("step_indices", None)
 
         if env_obs is not None:
             input_ids, attention_mask, pixel_values, proprio = self.prepare_inputs(
@@ -450,11 +453,68 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             input_ids.ne(self.processor.tokenizer.pad_token_id).sum(dim=1) - 1
         )
 
-        multimodal_embeddings, multimodal_attention_mask, multimodal_position_ids = (
-            self._build_embedding(
-                input_ids, attention_mask, pixel_values, labels, proprio
-            )
+        batch_size = input_ids.shape[0]
+        cache_enabled = (
+            self.feature_cache is not None and self.feature_cache.config.enabled
         )
+        cached_entries: list[dict[str, Any]] = []
+        all_hit = False
+        if (
+            cache_enabled
+            and env_seeds is not None
+            and step_indices is not None
+            and env_seeds.shape[0] == batch_size
+            and step_indices.shape[0] == batch_size
+        ):
+            for b in range(batch_size):
+                cached_data, hit = self.feature_cache.get(
+                    seed=int(env_seeds[b].item()),
+                    step=int(step_indices[b].item()),
+                    current_obs=env_obs,
+                    vision_encoder_fn=self.get_vision_features,
+                )
+                if not hit:
+                    cached_entries = []
+                    break
+                cached_entries.append(cached_data)
+            all_hit = len(cached_entries) == batch_size
+
+        if all_hit:
+            multimodal_embeddings = torch.cat(
+                [entry["multimodal_embeddings"] for entry in cached_entries], dim=0
+            )
+            multimodal_attention_mask = torch.cat(
+                [entry["multimodal_attention_mask"] for entry in cached_entries], dim=0
+            )
+            multimodal_position_ids = torch.cat(
+                [entry["multimodal_position_ids"] for entry in cached_entries], dim=0
+            )
+        else:
+            (
+                multimodal_embeddings,
+                multimodal_attention_mask,
+                multimodal_position_ids,
+            ) = self._build_embedding(input_ids, attention_mask, pixel_values, labels, proprio)
+            if (
+                cache_enabled
+                and env_seeds is not None
+                and step_indices is not None
+                and env_seeds.shape[0] == batch_size
+                and step_indices.shape[0] == batch_size
+            ):
+                for b in range(batch_size):
+                    self.feature_cache.put(
+                        seed=int(env_seeds[b].item()),
+                        step=int(step_indices[b].item()),
+                        features={
+                            "multimodal_embeddings": multimodal_embeddings[b : b + 1],
+                            "multimodal_attention_mask": multimodal_attention_mask[
+                                b : b + 1
+                            ],
+                            "multimodal_position_ids": multimodal_position_ids[b : b + 1],
+                        },
+                        obs=env_obs,
+                    )
 
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
         num_patches = (
@@ -509,6 +569,29 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         }
 
         return chunk_actions, result
+
+    def get_vision_features(self, obs: dict) -> torch.Tensor | None:
+        try:
+            _, _, pixel_values, proprio = self.prepare_inputs(obs)
+            dummy_language_embeddings = torch.zeros(
+                (pixel_values.shape[0], 1, self.config.text_config.hidden_size),
+                device=pixel_values.device,
+                dtype=next(self.parameters()).dtype,
+            )
+            projected_patch_embeddings = self._process_vision_features(
+                pixel_values, dummy_language_embeddings, self.use_film
+            )
+            if self.proprio_projector is not None and proprio is not None:
+                proprio_tensor = torch.Tensor(proprio).to(
+                    projected_patch_embeddings.device,
+                    dtype=projected_patch_embeddings.dtype,
+                )
+                projected_patch_embeddings = self._process_proprio_features(
+                    projected_patch_embeddings, proprio_tensor, self.proprio_projector
+                )
+            return projected_patch_embeddings
+        except Exception:
+            return None
 
     def _build_embedding(
         self, input_ids, attention_mask, pixel_values, labels, proprio=None

@@ -131,6 +131,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
+        self.feature_cache = None
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -513,6 +514,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 noise=noise_actions,
                 mode="eval",
                 compute_values=compute_values,
+                env_seeds=kwargs.get("env_seeds", None),
+                step_indices=kwargs.get("step_indices", None),
+                current_obs=env_obs,
             )
 
             # Step 3: Extract actual actions for environment interaction
@@ -529,7 +533,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
+                observation,
+                mode=mode,
+                compute_values=compute_values,
+                env_seeds=kwargs.get("env_seeds", None),
+                step_indices=kwargs.get("step_indices", None),
+                current_obs=env_obs,
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -574,6 +583,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        env_seeds: torch.Tensor | None = None,
+        step_indices: torch.Tensor | None = None,
+        current_obs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -590,23 +602,84 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self._preprocess_observation(observation, train=False)
         )
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+        cache_enabled = (
+            self.feature_cache is not None and self.feature_cache.config.enabled
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        cached_entries: list[dict[str, Any]] = []
+        all_hit = False
+        if (
+            cache_enabled
+            and env_seeds is not None
+            and step_indices is not None
+            and env_seeds.shape[0] == bsize
+            and step_indices.shape[0] == bsize
+        ):
+            for b in range(bsize):
+                cached_data, hit = self.feature_cache.get(
+                    seed=int(env_seeds[b].item()),
+                    step=int(step_indices[b].item()),
+                    current_obs=current_obs,
+                    vision_encoder_fn=self.get_vision_features,
+                )
+                if not hit:
+                    cached_entries = []
+                    break
+                cached_entries.append(cached_data)
+            all_hit = len(cached_entries) == bsize
 
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        if all_hit:
+            past_key_values = self._reassemble_kv_cache(
+                [entry["past_key_values"] for entry in cached_entries]
+            )
+            prefix_pad_masks = torch.cat(
+                [entry["prefix_pad_masks"] for entry in cached_entries], dim=0
+            )
+            if self.use_vlm_value:
+                prefix_output = torch.cat(
+                    [entry["prefix_output"] for entry in cached_entries], dim=0
+                )
+            else:
+                prefix_output = None
+        else:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+            # Compute image and language key value cache
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
+                prefix_att_2d_masks
+            )
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+            if (
+                cache_enabled
+                and env_seeds is not None
+                and step_indices is not None
+                and env_seeds.shape[0] == bsize
+                and step_indices.shape[0] == bsize
+            ):
+                for b in range(bsize):
+                    cache_data = {
+                        "past_key_values": self._slice_kv_cache(past_key_values, b),
+                        "prefix_pad_masks": prefix_pad_masks[b : b + 1],
+                    }
+                    if self.use_vlm_value:
+                        cache_data["prefix_output"] = prefix_output[b : b + 1]
+                    self.feature_cache.put(
+                        seed=int(env_seeds[b].item()),
+                        step=int(step_indices[b].item()),
+                        features=cache_data,
+                        obs=current_obs,
+                    )
 
         x_t = noise
         # add sde sample and traj collect
@@ -692,6 +765,45 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
+
+    @staticmethod
+    def _slice_kv_cache(
+        kv_cache: tuple[tuple[torch.Tensor, ...], ...], batch_idx: int
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        return tuple(
+            tuple(kv[batch_idx : batch_idx + 1] for kv in layer) for layer in kv_cache
+        )
+
+    @staticmethod
+    def _reassemble_kv_cache(
+        kv_caches: list[tuple[tuple[torch.Tensor, ...], ...]],
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        if not kv_caches:
+            return ()
+        n_layers = len(kv_caches[0])
+        return tuple(
+            tuple(
+                torch.cat([kv_cache[layer_idx][kv_idx] for kv_cache in kv_caches], dim=0)
+                for kv_idx in range(len(kv_caches[0][layer_idx]))
+            )
+            for layer_idx in range(n_layers)
+        )
+
+    def get_vision_features(self, obs: dict) -> torch.Tensor | None:
+        try:
+            to_process_obs = self.obs_processor(obs)
+            processed_obs = self.input_transform(to_process_obs, transpose=False)
+            processed_obs = self.precision_processor(processed_obs)
+            observation = _model.Observation.from_dict(processed_obs)
+            images, img_masks, _, _, _ = self._preprocess_observation(
+                observation, train=False
+            )
+            image_embs = self.paligemma_with_expert.paligemma.vision_tower(
+                pixel_values=images, pixel_attention_mask=img_masks
+            )
+            return image_embs
+        except Exception:
+            return None
 
     def sample_mean_var_val(
         self,

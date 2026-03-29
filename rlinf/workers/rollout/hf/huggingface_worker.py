@@ -27,6 +27,7 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.feature_cache import FeatureCache, FeatureCacheConfig
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
@@ -83,6 +84,7 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        self._step_counter_by_seed: dict[int, int] = {}
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -112,6 +114,31 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
+
+        feature_cache_cfg = self.cfg.algorithm.get("feature_cache", None)
+        if feature_cache_cfg is not None:
+            invalidate_on_weight_update = feature_cache_cfg.get(
+                "invalidate_on_weight_update", None
+            )
+            if invalidate_on_weight_update is None:
+                invalidate_on_weight_update = not self.cfg.actor.model.get(
+                    "freeze_backbone", False
+                )
+            cache_config = FeatureCacheConfig(
+                enabled=feature_cache_cfg.get("enabled", False),
+                mode=feature_cache_cfg.get("mode", "disabled"),
+                similarity_metric=feature_cache_cfg.get(
+                    "similarity_metric", "obs_ssim"
+                ),
+                similarity_threshold=feature_cache_cfg.get(
+                    "similarity_threshold", 0.90
+                ),
+                invalidate_on_weight_update=invalidate_on_weight_update,
+                max_cache_seeds=feature_cache_cfg.get("max_cache_seeds", -1),
+            )
+            self.hf_model.feature_cache = FeatureCache(cache_config)
+        else:
+            self.hf_model.feature_cache = None
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -240,7 +267,11 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+        env_seeds: torch.Tensor | None = None,
+        step_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -282,12 +313,16 @@ class MultiStepRolloutWorker(Worker):
             if use_expert:
                 actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
+                    env_seeds=env_seeds,
+                    step_indices=step_indices,
                     **kwargs,
                 )
                 expert_label_flag = True
             else:
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
+                    env_seeds=env_seeds,
+                    step_indices=step_indices,
                     **kwargs,
                 )
 
@@ -300,6 +335,8 @@ class MultiStepRolloutWorker(Worker):
             ):
                 _, expert_result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
+                    env_seeds=env_seeds,
+                    step_indices=step_indices,
                     **kwargs,
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
@@ -342,10 +379,43 @@ class MultiStepRolloutWorker(Worker):
             options=self._sync_weight_comm_options,
         ).async_wait()
         self.hf_model.load_state_dict(param_state_dict)
+        feature_cache = getattr(self.hf_model, "feature_cache", None)
+        if (
+            feature_cache is not None
+            and feature_cache.config.invalidate_on_weight_update
+        ):
+            feature_cache.invalidate_all()
 
         del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()
+
+    def _build_step_indices(self, env_seeds: torch.Tensor | None) -> torch.Tensor | None:
+        if env_seeds is None:
+            return None
+        step_indices = []
+        for seed in env_seeds.tolist():
+            step_indices.append(self._step_counter_by_seed.get(int(seed), 0))
+        return torch.as_tensor(step_indices, dtype=torch.int64)
+
+    def _advance_step_indices(self, env_seeds: torch.Tensor | None) -> None:
+        if env_seeds is None:
+            return
+        for seed in env_seeds.tolist():
+            seed_int = int(seed)
+            self._step_counter_by_seed[seed_int] = (
+                self._step_counter_by_seed.get(seed_int, 0) + 1
+            )
+
+    def _reset_done_step_indices(
+        self, env_seeds: torch.Tensor | None, dones: torch.Tensor | None
+    ) -> None:
+        if env_seeds is None or dones is None:
+            return
+        done_mask = dones[:, -1] if dones.dim() > 1 else dones
+        for seed, done in zip(env_seeds.tolist(), done_mask.tolist()):
+            if bool(done):
+                self._step_counter_by_seed[int(seed)] = 0
 
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
@@ -353,7 +423,15 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(env_output["obs"])
+                env_seeds = env_output.get("env_seeds")
+                self._reset_done_step_indices(env_seeds, env_output.get("dones"))
+                step_indices = self._build_step_indices(env_seeds)
+                actions, result = self.predict(
+                    env_output["obs"],
+                    env_seeds=env_seeds,
+                    step_indices=step_indices,
+                )
+                self._advance_step_indices(env_seeds)
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -385,7 +463,15 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
+            env_seeds = env_output.get("env_seeds")
+            self._reset_done_step_indices(env_seeds, env_output.get("dones"))
+            step_indices = self._build_step_indices(env_seeds)
+            actions, result = self.predict(
+                env_output["obs"],
+                env_seeds=env_seeds,
+                step_indices=step_indices,
+            )
+            self._advance_step_indices(env_seeds)
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -410,6 +496,19 @@ class MultiStepRolloutWorker(Worker):
             disable=(self._rank != 0),
         ):
             await self.generate_one_epoch(input_channel, output_channel)
+            feature_cache = getattr(self.hf_model, "feature_cache", None)
+            if feature_cache is not None:
+                stats = feature_cache.get_stats()
+                total = stats.hits + stats.misses
+                hit_rate = (100.0 * stats.hits / total) if total > 0 else 0.0
+                self.log_info(
+                    "[FeatureCache] hits=%d misses=%d invalidations=%d hit_rate=%.2f%%",
+                    stats.hits,
+                    stats.misses,
+                    stats.invalidations,
+                    hit_rate,
+                )
+                feature_cache.reset_stats()
 
         if self.enable_offload:
             self.offload_model()
@@ -542,8 +641,20 @@ class MultiStepRolloutWorker(Worker):
                 for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
-
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged_env_seeds = None
+        env_seeds_list = [obs_batch.get("env_seeds", None) for obs_batch in obs_batches]
+        if all(seeds is not None for seeds in env_seeds_list):
+            merged_env_seeds = torch.cat(env_seeds_list, dim=0)  # type: ignore[arg-type]
+        merged_dones = None
+        dones_list = [obs_batch.get("dones", None) for obs_batch in obs_batches]
+        if all(dones is not None for dones in dones_list):
+            merged_dones = torch.cat(dones_list, dim=0)  # type: ignore[arg-type]
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "dones": merged_dones,
+            "env_seeds": merged_env_seeds,
+        }
 
     def send_chunk_actions(
         self,

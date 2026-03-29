@@ -72,6 +72,10 @@ class BasePolicy(ABC):
     @abstractmethod
     def predict_action_batch(self, **kwargs): ...
 
+    def get_vision_features(self, obs: dict) -> object | None:
+        """Run vision encoder only for feature-cache similarity checks."""
+        return None
+
     def enable_torch_compile(
         self,
         mode: str = "max-autotune-no-cudagraphs",

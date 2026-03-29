@@ -479,6 +479,7 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self.action_head = FlowMatchingActionHeadForRLActionPrediction(
             action_head_cfg, rl_head_config, output_action_chunks, self.valid_action_dim
         )
+        self.feature_cache = None
 
     def eval(self):
         self._modality_transform.eval()
@@ -607,7 +608,13 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
             value=0,
         )
 
-        normalized_action, result = self._get_rl_action(normalized_input, mode=mode)
+        normalized_action, result = self._get_rl_action(
+            normalized_input,
+            mode=mode,
+            env_seeds=kwargs.get("env_seeds", None),
+            step_indices=kwargs.get("step_indices", None),
+            current_obs=env_obs,
+        )
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 
         if not is_batch:
@@ -648,11 +655,59 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self,
         normalized_input: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
+        env_seeds: torch.Tensor | None = None,
+        step_indices: torch.Tensor | None = None,
+        current_obs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         # We expand get_action() and replace action head inference with RL inference.
         backbone_inputs, action_inputs = self.prepare_input(normalized_input)
-        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
-        backbone_outputs = self.backbone(backbone_inputs)
+        cache_enabled = (
+            self.feature_cache is not None and self.feature_cache.config.enabled
+        )
+        batch_size = normalized_input["state"].shape[0]
+        cached_entries: list[dict[str, Any]] = []
+        all_hit = False
+        if (
+            cache_enabled
+            and env_seeds is not None
+            and step_indices is not None
+            and env_seeds.shape[0] == batch_size
+            and step_indices.shape[0] == batch_size
+        ):
+            for b in range(batch_size):
+                cached_data, hit = self.feature_cache.get(
+                    seed=int(env_seeds[b].item()),
+                    step=int(step_indices[b].item()),
+                    current_obs=current_obs,
+                    vision_encoder_fn=self.get_vision_features,
+                )
+                if not hit:
+                    cached_entries = []
+                    break
+                cached_entries.append(cached_data)
+            all_hit = len(cached_entries) == batch_size
+
+        if all_hit:
+            vl_embs = torch.cat([entry["vl_embs"] for entry in cached_entries], dim=0)
+            backbone_outputs = BatchFeature({"backbone_features": vl_embs})
+        else:
+            # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+            backbone_outputs = self.backbone(backbone_inputs)
+            if (
+                cache_enabled
+                and env_seeds is not None
+                and step_indices is not None
+                and env_seeds.shape[0] == batch_size
+                and step_indices.shape[0] == batch_size
+            ):
+                vl_embs = backbone_outputs.backbone_features
+                for b in range(batch_size):
+                    self.feature_cache.put(
+                        seed=int(env_seeds[b].item()),
+                        step=int(step_indices[b].item()),
+                        features={"vl_embs": vl_embs[b : b + 1]},
+                        obs=current_obs,
+                    )
         action_head_outputs, rlinf_outputs = self.action_head.get_rl_action(
             backbone_outputs, action_inputs, mode=mode
         )
@@ -684,6 +739,10 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         }
 
         return actions, result
+
+    def get_vision_features(self, obs: dict) -> torch.Tensor | None:
+        # GR00T fallback: if backbone has no public vision-only API, let cache fall back.
+        return None
 
     def _get_action_from_normalized_input(
         self, normalized_input: dict[str, Any]
