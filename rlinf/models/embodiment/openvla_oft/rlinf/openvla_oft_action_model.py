@@ -31,6 +31,7 @@ from prismatic.vla.constants import (
 from transformers.generation import TopKLogitsWarper
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.feature_cache import FeatureCache, FeatureCacheConfig
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
@@ -39,6 +40,38 @@ from rlinf.utils.utils import (
 
 
 class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy):
+    @staticmethod
+    def _build_feature_cache_from_config(config: OpenVLAOFTConfig):
+        feature_cache_cfg = getattr(config, "feature_cache", None)
+        if feature_cache_cfg is None:
+            return None
+
+        def _cfg_get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            if hasattr(obj, "get"):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        cache_config = FeatureCacheConfig(
+            enabled=_cfg_get(feature_cache_cfg, "enabled", False),
+            mode=_cfg_get(feature_cache_cfg, "mode", "disabled"),
+            similarity_metric=_cfg_get(
+                feature_cache_cfg, "similarity_metric", "obs_ssim"
+            ),
+            similarity_threshold=_cfg_get(
+                feature_cache_cfg, "similarity_threshold", 0.90
+            ),
+            invalidate_on_weight_update=_cfg_get(
+                feature_cache_cfg, "invalidate_on_weight_update", True
+            ),
+            max_cache_seeds=_cfg_get(feature_cache_cfg, "max_cache_seeds", -1),
+            max_entries=_cfg_get(feature_cache_cfg, "max_entries", 256),
+            debug_log=_cfg_get(feature_cache_cfg, "debug_log", False),
+            debug_log_max_events=_cfg_get(feature_cache_cfg, "debug_log_max_events", 1000),
+        )
+        return FeatureCache(cache_config)
+
     def __init__(
         self,
         config: OpenVLAOFTConfig,
@@ -76,6 +109,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             )
 
         self.max_prompt_length = max_prompt_length
+        self.feature_cache = self._build_feature_cache_from_config(config)
 
     def _build_embedding(self, input_ids, attention_mask, pixel_values):
         assert torch.all(input_ids[:, -1] == STOP_INDEX)
@@ -214,7 +248,19 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         do_sample = kwargs.pop("do_sample")
-
+        env_seeds = kwargs.pop("env_seeds", None)
+        step_indices = kwargs.pop("step_indices", None)
+        cache_enabled = (
+            self.feature_cache is not None and self.feature_cache.config.enabled
+        )
+        print(
+            "[FeatureCache][INFO] Predicting action batch. "
+            f"cache_enabled={cache_enabled} "
+            f"has_env_seeds={env_seeds is not None} "
+            f"has_step_indices={step_indices is not None} "
+            "and use Rlinf model.",
+            flush=True,
+        )
         if env_obs is not None:
             task_descriptions = [
                 f"In: What action should the robot take to {t.lower()}?\nOut: "
@@ -310,14 +356,154 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         assert torch.all(
             attention_mask[:, -1 - self.action_dim * self.num_action_chunks :] == 1
         )  # [B, L + act + 1]
-
         # multimodal
-        mm_embeddings, mm_attention_mask = self._build_embedding(
-            input_ids, attention_mask, pixel_values
+        batch_size = input_ids.shape[0]
+        cached_entries: list[dict[str, Any] | None] = [None] * batch_size
+        cache_trace_enabled = bool(
+            cache_enabled and getattr(self.feature_cache.config, "debug_log", False)
         )
-        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+        miss_reason = "not_checked"
+        miss_sample: tuple[int, int, int] | None = None  # (batch_idx, seed, step)
+        hit_indices: list[int] = []
+        miss_indices: list[int] = []
+        hit_steps: list[int] = []
+        miss_steps: list[int] = []
+        if (
+            cache_enabled
+            and env_seeds is not None
+            and step_indices is not None
+            and env_seeds.shape[0] == batch_size
+            and step_indices.shape[0] == batch_size
+        ):
+            print(
+                "[FeatureCache][QUERY_BATCH] "
+                f"batch_size={batch_size} "
+                f"seeds_preview={env_seeds.tolist()[:8]} "
+                f"steps_preview={step_indices.tolist()[:8]}",
+                flush=True,
+            )
+            for b in range(batch_size):
+                seed_b = int(env_seeds[b].item())
+                step_b = int(step_indices[b].item())
+                cached_data, hit = self.feature_cache.get(
+                    seed=seed_b,
+                    step=step_b,
+                    current_obs=env_obs,
+                    target_device=input_ids.device,
+                    vision_encoder_fn=self.get_vision_features,
+                )
+                if hit:
+                    cached_entries[b] = cached_data
+                    hit_indices.append(b)
+                    hit_steps.append(step_b)
+                else:
+                    miss_indices.append(b)
+                    miss_steps.append(step_b)
+                    if miss_sample is None:
+                        miss_reason = "cache_miss"
+                        miss_sample = (b, seed_b, step_b)
+            print(
+                "[FeatureCache][QUERY_RESULT] "
+                f"batch_size={batch_size} "
+                f"hit_count={len(hit_indices)} miss_count={len(miss_indices)} "
+                f"hit_steps_preview={hit_steps[:8]} "
+                f"miss_steps_preview={miss_steps[:8]}",
+                flush=True,
+            )
+        elif cache_enabled:
+            miss_reason = "seed_or_step_missing_or_shape_mismatch"
+            miss_indices = list(range(batch_size))
+            if step_indices is not None and step_indices.shape[0] == batch_size:
+                miss_steps = [int(step_indices[i].item()) for i in miss_indices]
+            print(
+                "[FeatureCache][QUERY_RESULT] "
+                f"batch_size={batch_size} hit_count=0 miss_count={len(miss_indices)} "
+                f"reason={miss_reason} miss_steps_preview={miss_steps[:8]}",
+                flush=True,
+            )
+        else:
+            miss_reason = "cache_disabled"
+            miss_indices = list(range(batch_size))
+
+        final_entries: list[dict[str, Any] | None] = [None] * batch_size
+        for b in hit_indices:
+            final_entries[b] = cached_entries[b]
+
+        if not miss_indices:
+            if cache_trace_enabled:
+                print(
+                    "[FeatureCache][REUSE] "
+                    f"batch_size={batch_size} "
+                    f"seeds={env_seeds.tolist() if env_seeds is not None else None} "
+                    f"steps={step_indices.tolist() if step_indices is not None else None}"
+                , flush=True)
+        else:
+            if cache_trace_enabled:
+                print(
+                    "[FeatureCache][OBTAIN] recompute_backbone "
+                    f"batch_size={batch_size} reason={miss_reason} miss_sample={miss_sample}"
+                , flush=True)
+            miss_index_tensor = torch.as_tensor(
+                miss_indices, device=input_ids.device, dtype=torch.int64
+            )
+            miss_input_ids = input_ids.index_select(0, miss_index_tensor)
+            miss_attention_mask = attention_mask.index_select(0, miss_index_tensor)
+            miss_pixel_values = pixel_values.index_select(0, miss_index_tensor)
+            miss_mm_embeddings, miss_mm_attention_mask = self._build_embedding(
+                miss_input_ids, miss_attention_mask, miss_pixel_values
+            )
+            miss_multimodal_position_ids = miss_mm_attention_mask.cumsum(dim=1) - 1
+
+            for miss_slot, b in enumerate(miss_indices):
+                miss_entry = {
+                    "mm_embeddings": miss_mm_embeddings[miss_slot : miss_slot + 1],
+                    "mm_attention_mask": miss_mm_attention_mask[miss_slot : miss_slot + 1],
+                    "multimodal_position_ids": miss_multimodal_position_ids[
+                        miss_slot : miss_slot + 1
+                    ],
+                }
+                final_entries[b] = miss_entry
+                if (
+                    cache_enabled
+                    and env_seeds is not None
+                    and step_indices is not None
+                    and env_seeds.shape[0] == batch_size
+                    and step_indices.shape[0] == batch_size
+                ):
+                    self.feature_cache.put(
+                        seed=int(env_seeds[b].item()),
+                        step=int(step_indices[b].item()),
+                        features=miss_entry,
+                        obs=env_obs,
+                    )
+            if (
+                cache_enabled
+                and env_seeds is not None
+                and step_indices is not None
+                and env_seeds.shape[0] == batch_size
+                and step_indices.shape[0] == batch_size
+            ):
+                print(
+                    "[FeatureCache][PUT_OK] "
+                    f"saved_entries={len(miss_indices)} "
+                    f"miss_steps_preview={miss_steps[:8]} "
+                    f"miss_indices_preview={miss_indices[:8]}",
+                    flush=True,
+                )
+
+        mm_embeddings = torch.cat(
+            [entry["mm_embeddings"] for entry in final_entries if entry is not None], dim=0
+        )
+        mm_attention_mask = torch.cat(
+            [entry["mm_attention_mask"] for entry in final_entries if entry is not None], dim=0
+        )
+        multimodal_position_ids = torch.cat(
+            [entry["multimodal_position_ids"] for entry in final_entries if entry is not None], dim=0
+        )
 
         # Forward pass through language model
+        import time as _time
+        _t0 = _time.perf_counter()
         outputs = self.language_model(
             input_ids=None,
             attention_mask=mm_attention_mask,
@@ -329,6 +515,20 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
+        )
+        _lm_ms = (_time.perf_counter() - _t0) * 1000
+        _total_tokens = mm_embeddings.shape[1]
+        _n_action_tokens = self.action_dim * self.num_action_chunks
+        _n_prefix_tokens = _total_tokens - _n_action_tokens
+        # 按 token 数线性估计 action head 耗时（粗估）
+        _action_est_ms = _lm_ms * _n_action_tokens / _total_tokens
+        print(
+            f"[OpenVLAOFT][PROFILE] total_seq={_total_tokens} "
+            f"prefix_tokens={_n_prefix_tokens} action_tokens={_n_action_tokens} "
+            f"lm_forward_ms={_lm_ms:.1f} "
+            f"action_token_est_ms={_action_est_ms:.1f} "
+            f"prefix_est_ms={_lm_ms - _action_est_ms:.1f}",
+            flush=True,
         )
 
         # Extract hidden states for action tokens
@@ -432,6 +632,214 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         }
 
         return chunk_actions, result
+
+    @torch.no_grad()
+    def predict_action_batch_staged(
+        self,
+        env_obs=None,
+        calculate_values=True,
+        **kwargs,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Two-stage inference with profiler annotations.
+
+        Stage 1 (backbone): vision encoding + text prefill, saved as past_key_values.
+        Stage 2 (action head): action token prefill using KV cache from stage 1.
+
+        Sequence layout after _build_embedding:
+          [BOS(1)] + [patch(n_patches)] + [text(n_prompt_tokens-1)] + [action(n_action_tokens)]
+        """
+        do_sample = kwargs.pop("do_sample")
+
+        assert env_obs is not None, "predict_action_batch_staged requires env_obs"
+
+        task_descriptions = [
+            f"In: What action should the robot take to {t.lower()}?\nOut: "
+            for t in env_obs["task_descriptions"]
+        ]
+        if env_obs["main_images"].ndim == 4:
+            env_obs["main_images"] = env_obs["main_images"].unsqueeze(1)
+        assert env_obs["main_images"].ndim == 5
+
+        all_images = [env_obs["main_images"].permute(0, 1, 4, 2, 3)]
+        if self.vision_backbone.get_num_images_in_input() > 1:
+            if env_obs["wrist_images"].ndim == 4:
+                env_obs["wrist_images"] = env_obs["wrist_images"].unsqueeze(1)
+            assert env_obs["wrist_images"].ndim == 5
+            wrist_imgs = env_obs["wrist_images"].permute(0, 1, 4, 2, 3)
+            all_images.extend([wrist_imgs[:, i] for i in range(wrist_imgs.shape[1])])
+
+        device = next(self.parameters()).device
+        precision = next(self.parameters()).dtype
+
+        primary_image = all_images.pop(0)
+        inputs = self.input_processor(
+            text=task_descriptions,
+            images={"images": primary_image},
+            proprio_states=env_obs["states"],
+            padding="max_length",
+            max_length=self.max_prompt_length,
+        )
+
+        if all_images:
+            all_wrist_pixel_values = [
+                self.input_processor(
+                    text=task_descriptions,
+                    images={"images": wrist_image.unsqueeze(1)},
+                    proprio_states=env_obs["states"],
+                    padding="max_length",
+                    max_length=self.max_prompt_length,
+                )["pixel_values"]
+                for wrist_image in all_images
+            ]
+            inputs["pixel_values"] = torch.cat(
+                [inputs["pixel_values"]] + all_wrist_pixel_values, dim=1
+            )
+
+        input_ids = inputs["input_ids"].to(device=device, dtype=torch.long)
+        attention_mask = inputs["attention_mask"].to(device=device, dtype=torch.bool)
+        pixel_values = inputs["pixel_values"].to(device=device, dtype=precision)
+
+        B, N, C, H, W = pixel_values.shape
+        pixel_values = pixel_values.reshape(B, N * C, H, W)
+
+        forward_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+        }
+
+        n_action_tokens = self.action_dim * self.num_action_chunks
+
+        input_ids, attention_mask = self._prepare_input_for_action_prediction(
+            input_ids, attention_mask
+        )
+
+        # --- Build full multimodal embeddings ---
+        # Layout: [BOS(1)] + [patch(n_patches)] + [text(n_prompt_tokens-1)] + [action(n_action_tokens)]
+        with torch.profiler.record_function("model.backbone.openvla_oft._build_embedding"):
+            mm_embeddings, mm_attention_mask = self._build_embedding(
+                input_ids, attention_mask, pixel_values
+            )
+
+        # Split at action boundary
+        prefix_len = mm_embeddings.shape[1] - n_action_tokens
+        prefix_embeddings = mm_embeddings[:, :prefix_len, :]
+        prefix_attention_mask = mm_attention_mask[:, :prefix_len]
+        prefix_position_ids = prefix_attention_mask.long().cumsum(dim=1) - 1
+
+        action_embeddings = mm_embeddings[:, prefix_len:, :]
+        # Stage 2 需要完整的 attention_mask（长度 = prefix_len + n_action_tokens），
+        # 这样 _update_causal_mask 里 target_length 才能正确设为 342，
+        # 生成 causal_mask 形状 (n_action_tokens, 342) 而不是 (n_action_tokens, n_action_tokens+1)。
+        full_attention_mask = mm_attention_mask
+        action_position_ids = (
+            torch.arange(prefix_len, prefix_len + n_action_tokens, device=device)
+            .unsqueeze(0)
+            .expand(B, -1)
+        )
+
+        # --- Stage 1: prefix prefill (vision backbone + text tokens) ---
+        with torch.profiler.record_function("model.backbone.openvla_oft.prefix_prefill"):
+            prefix_outputs = self.language_model(
+                input_ids=None,
+                attention_mask=prefix_attention_mask,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=prefix_embeddings,
+                labels=None,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        past_key_values = prefix_outputs.past_key_values
+
+        # --- Stage 2: action token prefill using KV cache ---
+        # use_cache=True 使 transformers 从 DynamicCache 读取正确的 past_seen_tokens(286)，
+        # 从而 cache_position=arange(286,342)，causal_mask 形状为 (56,342)，与 KV 维度匹配。
+        # full_attention_mask(shape [B,342]) 告知 _update_causal_mask target_length=342。
+        with torch.profiler.record_function("model.action_head.openvla_oft.action_prefill"):
+            action_outputs = self.language_model(
+                input_ids=None,
+                attention_mask=full_attention_mask,
+                position_ids=action_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=action_embeddings,
+                labels=None,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        # action_outputs.logits: (B, n_action_tokens, vocab_size)
+        logits_tensor = action_outputs.logits
+        last_hidden_states = action_outputs.hidden_states[-1]  # (B, n_action_tokens, D)
+
+        logits_tensor[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
+        logits_tensor[..., self.vocab_size :] = -torch.inf
+
+        if do_sample:
+            processed_logits_tensor = logits_tensor / kwargs["temperature"]
+            top_k = min(kwargs["top_k"], processed_logits_tensor.size(-1))
+            if top_k > 0:
+                logits_warper = TopKLogitsWarper(top_k)
+                processed_logits_tensor = logits_warper(None, processed_logits_tensor)
+            processed_logprob_tensor = F.log_softmax(processed_logits_tensor, dim=-1)
+            probs_flat = torch.exp(processed_logprob_tensor).view(-1, processed_logprob_tensor.shape[-1])
+            idxs = torch.multinomial(probs_flat, num_samples=1, replacement=True).view(
+                processed_logprob_tensor.shape[0], processed_logprob_tensor.shape[1]
+            )
+        else:
+            processed_logits_tensor = logits_tensor
+            idxs = processed_logits_tensor.argmax(dim=-1)
+
+        assert torch.all(
+            idxs >= self.vocab_size - self.config.n_action_bins
+        ) and torch.all(idxs < self.vocab_size)
+
+        chunk_action_tokens = idxs.reshape(-1, self.action_dim)
+        predicted_action_token_ids = chunk_action_tokens.cpu().numpy()
+        discretized_actions = self.vocab_size - predicted_action_token_ids
+        discretized_actions = np.clip(
+            discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1
+        )
+        normalized_actions = np.asarray(
+            [self.bin_centers[da] for da in discretized_actions]
+        ).reshape(-1, self.action_dim)
+
+        actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
+        actions = actions.reshape(idxs.shape)
+
+        action_logits = processed_logits_tensor
+        action_logits[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
+        action_logits[..., self.vocab_size :] = -torch.inf
+
+        chunk_logprobs = compute_logprobs_from_logits(logits=action_logits, target=idxs)
+
+        if hasattr(self, "value_head") and calculate_values:
+            # use the last action token's hidden state for value estimation
+            hidden_features = last_hidden_states[:, -1]
+            chunk_values = self.value_head(hidden_features)
+        else:
+            chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
+
+        chunk_actions = torch.as_tensor(
+            actions.reshape(-1, self.num_action_chunks, self.action_dim)
+        )
+        forward_inputs["action_tokens"] = idxs.reshape(-1, self.num_action_chunks, self.action_dim)
+
+        result = {
+            "prev_logprobs": chunk_logprobs,
+            "prev_values": chunk_values,
+            "forward_inputs": forward_inputs,
+        }
+
+        return chunk_actions, result
+
+    def get_vision_features(self, _obs: dict) -> torch.Tensor | None:
+        # Fallback to obs-level similarity when vision-only extraction is unavailable.
+        return None
 
     def preprocess_for_train(self, data):
         # action-token: [bsz, chunk-step, action-dim] -> [bsz, chunk-step x action-dim]
