@@ -19,7 +19,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-
 @dataclass
 class FeatureCacheConfig:
     enabled: bool = False
@@ -28,6 +27,9 @@ class FeatureCacheConfig:
     similarity_threshold: float = 0.90
     invalidate_on_weight_update: bool = True
     max_cache_seeds: int = -1
+    max_entries: int = 256
+    debug_log: bool = False
+    debug_log_max_events: int = 1000
 
 
 @dataclass
@@ -35,11 +37,13 @@ class CacheEntry:
     features: dict[str, Any]
     ref_obs: torch.Tensor | None = None
     ref_vision_feat: torch.Tensor | None = None
+    last_access: int = 0
 
 
 @dataclass
 class CacheStats:
     hits: int = 0
+    same_step_hits: int = 0
     misses: int = 0
     invalidations: int = 0
 
@@ -130,6 +134,25 @@ class FeatureCache:
         self._storage: dict[int, dict[int, CacheEntry]] = {}
         self._seed_order: list[int] = []
         self._stats = CacheStats()
+        self._debug_log_count = 0
+        self._entries: list[CacheEntry] = []
+        self._access_counter: int = 0
+
+    def _log_debug(self, message: str) -> None:
+        if not self.config.debug_log:
+            return
+        max_events = self.config.debug_log_max_events
+        if max_events >= 0 and self._debug_log_count >= max_events:
+            if self._debug_log_count == max_events:
+                print(
+                    "[FeatureCache][DEBUG] reached debug_log_max_events="
+                    f"{max_events}, suppressing further logs.",
+                    flush=True,
+                )
+            self._debug_log_count += 1
+            return
+        print(message, flush=True)
+        self._debug_log_count += 1
 
     def _extract_obs_tensor(self, obs: dict[str, Any] | torch.Tensor | None) -> torch.Tensor | None:
         if obs is None:
@@ -202,27 +225,83 @@ class FeatureCache:
         seed: int,
         step: int,
         current_obs: dict[str, Any] | torch.Tensor | None = None,
+        target_device: torch.device | None = None,
         vision_encoder_fn: Callable[[dict[str, Any] | torch.Tensor], torch.Tensor | None]
         | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
         if not self.config.enabled or self.config.mode == "disabled":
             self._stats.misses += 1
+            self._log_debug(
+                f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=cache_disabled mode={self.config.mode}"
+            )
             return None, False
 
         seed_store = self._storage.get(seed)
-        if seed_store is None or step not in seed_store:
+        if seed_store is None:
             self._stats.misses += 1
+            self._log_debug(
+                f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=seed_not_found mode={self.config.mode}"
+            )
             return None, False
+        entry = None
+        resolved_step: int | None = None
 
-        entry = seed_store[step]
-        if self.config.mode == "similarity_gated" and not self._is_similarity_hit(
-            entry, current_obs, vision_encoder_fn
+        if self.config.mode in (
+            "naive",
+            "similarity_gated",
+            "cross_global_same_step",
         ):
+            if step not in seed_store:
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=step_not_found mode={self.config.mode}"
+                )
+                return None, False
+            entry = seed_store[step]
+            resolved_step = step
+            if self.config.mode == "similarity_gated" and not self._is_similarity_hit(
+                entry, current_obs, vision_encoder_fn
+            ):
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=similarity_check_failed mode={self.config.mode}"
+                )
+                return None, False
+        elif self.config.mode == "cross_step_naive":
+            # Step-agnostic lookup: always reuse the latest cached entry for this seed.
+            if not seed_store:
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=empty_seed_store mode={self.config.mode}"
+                )
+                return None, False
+            latest_step = max(seed_store.keys())
+            entry = seed_store[latest_step]
+            resolved_step = latest_step
+        elif self.config.mode == "cross_step_similarity":
+            # Step-agnostic lookup: find a semantically similar cached entry within this seed.
+            for candidate_step, candidate in reversed(list(seed_store.items())):
+                if self._is_similarity_hit(candidate, current_obs, vision_encoder_fn):
+                    entry = candidate
+                    resolved_step = candidate_step
+                    break
+            if entry is None:
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=no_similar_entry mode={self.config.mode}"
+                )
+                return None, False
+        else:
             self._stats.misses += 1
+            self._log_debug(
+                f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=unsupported_mode mode={self.config.mode}"
+            )
             return None, False
 
         self._stats.hits += 1
-        device = self._resolve_device(current_obs)
+        if resolved_step == step:
+            self._stats.same_step_hits += 1
+        device = target_device if target_device is not None else self._resolve_device(current_obs)
         return _recursive_to_device(entry.features, device), True
 
     def put(
@@ -255,6 +334,10 @@ class FeatureCache:
             ),
         )
         self._evict_if_needed()
+        self._log_debug(
+            f"[FeatureCache][PUT] seed={seed} step={step} mode={self.config.mode} "
+            f"cached_seeds={self.num_cached_seeds()} cached_entries={self.num_cached_entries()}"
+        )
 
     def invalidate(self, seed: int | None = None) -> None:
         if seed is None:
@@ -264,19 +347,30 @@ class FeatureCache:
             del self._storage[seed]
             self._seed_order = [s for s in self._seed_order if s != seed]
             self._stats.invalidations += 1
+            self._log_debug(
+                f"[FeatureCache][INVALIDATE] seed={seed} cached_seeds={self.num_cached_seeds()} cached_entries={self.num_cached_entries()}"
+            )
 
     def invalidate_all(self) -> None:
         if self._storage:
             self._storage.clear()
             self._seed_order.clear()
             self._stats.invalidations += 1
+            self._log_debug("[FeatureCache][INVALIDATE_ALL] cache_cleared=True")
 
     def get_stats(self) -> CacheStats:
         return CacheStats(
             hits=self._stats.hits,
+            same_step_hits=self._stats.same_step_hits,
             misses=self._stats.misses,
             invalidations=self._stats.invalidations,
         )
+
+    def num_cached_seeds(self) -> int:
+        return len(self._storage)
+
+    def num_cached_entries(self) -> int:
+        return sum(len(seed_store) for seed_store in self._storage.values())
 
     def reset_stats(self) -> None:
         self._stats = CacheStats()

@@ -53,6 +53,62 @@ def test_similarity_gated_mode():
     assert hit_c is False
 
 
+def test_cross_step_similarity_reuses_different_step():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="cross_step_similarity",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.99,
+        )
+    )
+    features = {"x": torch.ones(1, 2)}
+    obs = _make_obs(0)
+    cache.put(seed=11, step=3, features=features, obs=obs)
+
+    loaded, hit = cache.get(seed=11, step=99, current_obs=obs)
+    assert hit is True
+    assert loaded is not None
+    assert torch.allclose(loaded["x"], features["x"])
+
+
+def test_cross_step_naive_reuses_latest_step_without_similarity():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="cross_step_naive",
+        )
+    )
+    obs_old = _make_obs(0)
+    obs_new = _make_obs(1234)
+    cache.put(seed=5, step=1, features={"x": torch.ones(1, 1)}, obs=obs_old)
+    cache.put(seed=5, step=7, features={"x": torch.full((1, 1), 9.0)}, obs=obs_new)
+
+    loaded, hit = cache.get(seed=5, step=999, current_obs=_make_obs(99999))
+    assert hit is True
+    assert loaded is not None
+    assert torch.allclose(loaded["x"], torch.full((1, 1), 9.0))
+    stats = cache.get_stats()
+    assert stats.hits == 1
+    assert stats.same_step_hits == 0
+
+
+def test_cross_global_same_step_records_same_step_hit():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="cross_global_same_step",
+        )
+    )
+    obs = _make_obs(0)
+    cache.put(seed=3, step=2, features={"x": torch.ones(1, 1)}, obs=obs)
+    _, hit = cache.get(seed=3, step=2, current_obs=obs)
+    assert hit is True
+    stats = cache.get_stats()
+    assert stats.hits == 1
+    assert stats.same_step_hits == 1
+
+
 def test_recursive_transfer_for_nested_kv_like_data():
     nested = {
         "past_key_values": (
@@ -96,6 +152,13 @@ def test_max_cache_seeds_eviction():
     _, hit_new = cache.get(seed=11, step=0, current_obs=_make_obs())
     assert hit_old is False
     assert hit_new is True
+
+
+def test_similarity_lru_config_has_max_entries():
+    cfg = FeatureCacheConfig(enabled=True, mode="similarity_lru", max_entries=128)
+    assert cfg.max_entries == 128
+    cache = FeatureCache(cfg)
+    assert cache.config.max_entries == 128
 
 
 def test_similarity_functions():
