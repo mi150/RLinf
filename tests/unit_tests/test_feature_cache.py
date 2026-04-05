@@ -259,3 +259,34 @@ def test_similarity_lru_empty_cache_miss():
     )
     _, hit = cache.get(seed=1, step=0, current_obs=_make_obs(0))
     assert hit is False
+
+
+def test_similarity_lru_with_nested_tuple_features():
+    """Verify cache handles KV-cache-like nested tuple structures (OpenPI pattern)."""
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.99,
+            max_entries=10,
+        )
+    )
+    kv_cache = (
+        (torch.randn(1, 4, 8, 16), torch.randn(1, 4, 8, 16)),
+        (torch.randn(1, 4, 8, 16), torch.randn(1, 4, 8, 16)),
+    )
+    features = {
+        "past_key_values": kv_cache,
+        "prefix_output": torch.randn(1, 32, 1024),
+        "prefix_pad_masks": torch.ones(1, 32, dtype=torch.bool),
+    }
+    obs = _make_obs(0)
+    cache.put(seed=1, step=0, features=features, obs=obs)
+    loaded, hit = cache.get(seed=99, step=99, current_obs=obs)
+    assert hit is True
+    assert loaded is not None
+    assert isinstance(loaded["past_key_values"], tuple)
+    assert isinstance(loaded["past_key_values"][0], tuple)
+    assert loaded["past_key_values"][0][0].shape == (1, 4, 8, 16)
+    assert loaded["prefix_output"].shape == (1, 32, 1024)

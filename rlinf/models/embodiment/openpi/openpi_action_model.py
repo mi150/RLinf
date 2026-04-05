@@ -605,81 +605,109 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         cache_enabled = (
             self.feature_cache is not None and self.feature_cache.config.enabled
         )
-        cached_entries: list[dict[str, Any]] = []
-        all_hit = False
-        if (
-            cache_enabled
-            and env_seeds is not None
-            and step_indices is not None
-            and env_seeds.shape[0] == bsize
-            and step_indices.shape[0] == bsize
-        ):
+        backbone_device = state.device
+
+        # --- Per-sample cache lookup ---
+        cached_entries: list[dict[str, Any] | None] = [None] * bsize
+        hit_indices: list[int] = []
+        miss_indices: list[int] = []
+
+        def _slice_obs_one_sample(
+            obs: dict[str, Any] | None, idx: int, total: int
+        ) -> dict[str, Any] | None:
+            if obs is None:
+                return None
+            obs_b: dict[str, Any] = {}
+            for key, value in obs.items():
+                if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == total:
+                    obs_b[key] = value[idx : idx + 1]
+                elif isinstance(value, (list, tuple)) and len(value) == total:
+                    obs_b[key] = value[idx : idx + 1]
+                else:
+                    obs_b[key] = value
+            return obs_b
+
+        if cache_enabled and env_seeds is not None and step_indices is not None:
             for b in range(bsize):
+                current_obs_b = _slice_obs_one_sample(current_obs, b, bsize)
                 cached_data, hit = self.feature_cache.get(
                     seed=int(env_seeds[b].item()),
                     step=int(step_indices[b].item()),
-                    current_obs=current_obs,
+                    current_obs=current_obs_b,
+                    target_device=backbone_device,
                     vision_encoder_fn=self.get_vision_features,
                 )
-                if not hit:
-                    cached_entries = []
-                    break
-                cached_entries.append(cached_data)
-            all_hit = len(cached_entries) == bsize
-
-        if all_hit:
-            past_key_values = self._reassemble_kv_cache(
-                [entry["past_key_values"] for entry in cached_entries]
-            )
-            prefix_pad_masks = torch.cat(
-                [entry["prefix_pad_masks"] for entry in cached_entries], dim=0
-            )
-            if self.use_vlm_value:
-                prefix_output = torch.cat(
-                    [entry["prefix_output"] for entry in cached_entries], dim=0
-                )
-            else:
-                prefix_output = None
+                if hit:
+                    cached_entries[b] = cached_data
+                    hit_indices.append(b)
+                else:
+                    miss_indices.append(b)
         else:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
-            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            miss_indices = list(range(bsize))
 
-            # Compute image and language key value cache
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(
-                prefix_att_2d_masks
+        if cache_enabled:
+            print(
+                f"[FeatureCache][QUERY_RESULT][OpenPI] "
+                f"batch_size={bsize} hit_count={len(hit_indices)} miss_count={len(miss_indices)}",
+                flush=True,
             )
+
+        # --- Compute prefix for misses ---
+        if miss_indices:
+            if len(miss_indices) == bsize:
+                miss_images = images
+                miss_img_masks = img_masks
+                miss_lang_tokens = lang_tokens
+                miss_lang_masks = lang_masks
+            else:
+                miss_idx_t = torch.as_tensor(miss_indices, device=device, dtype=torch.int64)
+                miss_images = [img.index_select(0, miss_idx_t) for img in images]
+                miss_img_masks = [m.index_select(0, miss_idx_t) for m in img_masks]
+                miss_lang_tokens = lang_tokens.index_select(0, miss_idx_t)
+                miss_lang_masks = lang_masks.index_select(0, miss_idx_t)
+
+            miss_prefix_embs, miss_prefix_pad_masks, miss_prefix_att_masks = self.embed_prefix(
+                miss_images, miss_img_masks, miss_lang_tokens, miss_lang_masks
+            )
+            miss_prefix_att_2d_masks = make_att_2d_masks(miss_prefix_pad_masks, miss_prefix_att_masks)
+            miss_prefix_position_ids = torch.cumsum(miss_prefix_pad_masks, dim=1) - 1
+            miss_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(miss_prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
+            (miss_prefix_output, _), miss_past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=miss_prefix_att_2d_masks_4d,
+                position_ids=miss_prefix_position_ids,
                 past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
+                inputs_embeds=[miss_prefix_embs, None],
                 use_cache=True,
             )
-            if (
-                cache_enabled
-                and env_seeds is not None
-                and step_indices is not None
-                and env_seeds.shape[0] == bsize
-                and step_indices.shape[0] == bsize
-            ):
-                for b in range(bsize):
-                    cache_data = {
-                        "past_key_values": self._slice_kv_cache(past_key_values, b),
-                        "prefix_pad_masks": prefix_pad_masks[b : b + 1],
-                    }
-                    if self.use_vlm_value:
-                        cache_data["prefix_output"] = prefix_output[b : b + 1]
+
+            # Store per-sample results and populate cache
+            for miss_slot, b in enumerate(miss_indices):
+                entry_kv = self._slice_kv_cache(miss_past_key_values, miss_slot)
+                entry_data = {
+                    "past_key_values": entry_kv,
+                    "prefix_output": miss_prefix_output[miss_slot : miss_slot + 1],
+                    "prefix_pad_masks": miss_prefix_pad_masks[miss_slot : miss_slot + 1],
+                }
+                cached_entries[b] = entry_data
+                if cache_enabled and env_seeds is not None and step_indices is not None:
                     self.feature_cache.put(
                         seed=int(env_seeds[b].item()),
                         step=int(step_indices[b].item()),
-                        features=cache_data,
-                        obs=current_obs,
+                        features=entry_data,
+                        obs=_slice_obs_one_sample(current_obs, b, bsize),
                     )
+
+        # --- Reassemble full batch from hits + misses ---
+        all_kv_caches = [cached_entries[b]["past_key_values"] for b in range(bsize)]
+        past_key_values = self._reassemble_kv_cache(all_kv_caches)
+        prefix_output = torch.cat(
+            [cached_entries[b]["prefix_output"] for b in range(bsize)], dim=0
+        )
+        prefix_pad_masks = torch.cat(
+            [cached_entries[b]["prefix_pad_masks"] for b in range(bsize)], dim=0
+        )
 
         x_t = noise
         # add sde sample and traj collect
