@@ -237,7 +237,7 @@ class FeatureCache:
             return None, False
 
         seed_store = self._storage.get(seed)
-        if seed_store is None:
+        if seed_store is None and self.config.mode != "similarity_lru":
             self._stats.misses += 1
             self._log_debug(
                 f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=seed_not_found mode={self.config.mode}"
@@ -291,6 +291,60 @@ class FeatureCache:
                     f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=no_similar_entry mode={self.config.mode}"
                 )
                 return None, False
+        elif self.config.mode == "similarity_lru":
+            if not self._entries:
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=empty_entries mode=similarity_lru"
+                )
+                return None, False
+            current_obs_tensor = self._extract_obs_tensor(current_obs)
+            if current_obs_tensor is None:
+                self._stats.misses += 1
+                self._log_debug(
+                    f"[FeatureCache][GET][MISS] seed={seed} step={step} reason=no_obs_tensor mode=similarity_lru"
+                )
+                return None, False
+            best_sim = -1.0
+            best_entry: CacheEntry | None = None
+            metric = self.config.similarity_metric
+            threshold = self.config.similarity_threshold
+            curr_obs_cpu = current_obs_tensor.detach().cpu()
+            for candidate in self._entries:
+                if candidate.ref_obs is None:
+                    continue
+                if metric == "feature_cosine" and vision_encoder_fn is not None:
+                    current_feat = vision_encoder_fn(current_obs)
+                    if current_feat is not None and candidate.ref_vision_feat is not None:
+                        sim = _compute_cosine_similarity(
+                            current_feat.detach().cpu(),
+                            candidate.ref_vision_feat.detach().cpu(),
+                        )
+                    else:
+                        sim = _compute_ssim(curr_obs_cpu, candidate.ref_obs)
+                elif metric == "obs_ssim":
+                    sim = _compute_ssim(curr_obs_cpu, candidate.ref_obs)
+                elif metric == "obs_cosine":
+                    sim = _compute_cosine_similarity(curr_obs_cpu, candidate.ref_obs)
+                else:
+                    sim = _compute_ssim(curr_obs_cpu, candidate.ref_obs)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_entry = candidate
+            if best_entry is not None and best_sim >= threshold:
+                self._access_counter += 1
+                best_entry.last_access = self._access_counter
+                self._stats.hits += 1
+                device = target_device if target_device is not None else self._resolve_device(current_obs)
+                self._log_debug(
+                    f"[FeatureCache][GET][HIT] seed={seed} step={step} sim={best_sim:.4f} mode=similarity_lru"
+                )
+                return _recursive_to_device(best_entry.features, device), True
+            self._stats.misses += 1
+            self._log_debug(
+                f"[FeatureCache][GET][MISS] seed={seed} step={step} best_sim={best_sim:.4f} threshold={threshold} mode=similarity_lru"
+            )
+            return None, False
         else:
             self._stats.misses += 1
             self._log_debug(
@@ -315,23 +369,44 @@ class FeatureCache:
         if not self.config.enabled or self.config.mode == "disabled":
             return
 
+        ref_obs = self._extract_obs_tensor(obs)
+        pinned_features = _recursive_to_cpu_pinned(features)
+        pinned_ref_obs = (
+            ref_obs.detach().cpu().contiguous().pin_memory() if ref_obs is not None else None
+        )
+        pinned_vision_feat = (
+            vision_feat.detach().cpu().contiguous().pin_memory()
+            if vision_feat is not None
+            else None
+        )
+
+        if self.config.mode == "similarity_lru":
+            self._access_counter += 1
+            entry = CacheEntry(
+                features=pinned_features,
+                ref_obs=pinned_ref_obs,
+                ref_vision_feat=pinned_vision_feat,
+                last_access=self._access_counter,
+            )
+            self._entries.append(entry)
+            max_entries = self.config.max_entries if self.config.max_entries > 0 else 256
+            while len(self._entries) > max_entries:
+                min_idx = min(range(len(self._entries)), key=lambda i: self._entries[i].last_access)
+                self._entries.pop(min_idx)
+            self._log_debug(
+                f"[FeatureCache][PUT] seed={seed} step={step} mode=similarity_lru "
+                f"cached_entries={len(self._entries)}"
+            )
+            return
+
         if seed not in self._storage:
             self._storage[seed] = {}
             self._seed_order.append(seed)
 
-        ref_obs = self._extract_obs_tensor(obs)
         self._storage[seed][step] = CacheEntry(
-            features=_recursive_to_cpu_pinned(features),
-            ref_obs=(
-                ref_obs.detach().cpu().contiguous().pin_memory()
-                if ref_obs is not None
-                else None
-            ),
-            ref_vision_feat=(
-                vision_feat.detach().cpu().contiguous().pin_memory()
-                if vision_feat is not None
-                else None
-            ),
+            features=pinned_features,
+            ref_obs=pinned_ref_obs,
+            ref_vision_feat=pinned_vision_feat,
         )
         self._evict_if_needed()
         self._log_debug(
@@ -352,9 +427,11 @@ class FeatureCache:
             )
 
     def invalidate_all(self) -> None:
-        if self._storage:
+        cleared = bool(self._storage or self._entries)
+        if cleared:
             self._storage.clear()
             self._seed_order.clear()
+            self._entries.clear()
             self._stats.invalidations += 1
             self._log_debug("[FeatureCache][INVALIDATE_ALL] cache_cleared=True")
 
@@ -370,7 +447,8 @@ class FeatureCache:
         return len(self._storage)
 
     def num_cached_entries(self) -> int:
-        return sum(len(seed_store) for seed_store in self._storage.values())
+        legacy = sum(len(seed_store) for seed_store in self._storage.values())
+        return legacy + len(self._entries)
 
     def reset_stats(self) -> None:
         self._stats = CacheStats()

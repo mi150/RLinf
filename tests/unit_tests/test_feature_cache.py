@@ -173,3 +173,89 @@ def test_similarity_functions():
     z = torch.tensor([0.0, 1.0, 0.0])
     assert _compute_cosine_similarity(x, y) > 0.99
     assert _compute_cosine_similarity(x, z) < 0.1
+
+
+def test_similarity_lru_basic_hit():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.99,
+            max_entries=10,
+        )
+    )
+    features = {"x": torch.ones(1, 4)}
+    obs = _make_obs(0)
+    cache.put(seed=1, step=0, features=features, obs=obs)
+    loaded, hit = cache.get(seed=999, step=999, current_obs=obs)
+    assert hit is True
+    assert loaded is not None
+    assert torch.allclose(loaded["x"], features["x"])
+
+
+def test_similarity_lru_miss_on_different_obs():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.99,
+            max_entries=10,
+        )
+    )
+    cache.put(seed=1, step=0, features={"x": torch.ones(1, 4)}, obs=_make_obs(0))
+    _, hit = cache.get(seed=1, step=0, current_obs=_make_obs(100000))
+    assert hit is False
+
+
+def test_similarity_lru_ignores_seed_step():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.99,
+            max_entries=10,
+        )
+    )
+    obs = _make_obs(0)
+    cache.put(seed=1, step=0, features={"x": torch.ones(1, 4)}, obs=obs)
+    loaded, hit = cache.get(seed=42, step=77, current_obs=obs)
+    assert hit is True
+    assert loaded is not None
+
+
+def test_similarity_lru_returns_best_match():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.5,
+            max_entries=10,
+        )
+    )
+    obs_a = _make_obs(0)
+    obs_b = _make_obs(1)
+    obs_far = _make_obs(100000)
+    cache.put(seed=1, step=0, features={"x": torch.full((1, 4), 1.0)}, obs=obs_a)
+    cache.put(seed=2, step=0, features={"x": torch.full((1, 4), 2.0)}, obs=obs_far)
+    loaded, hit = cache.get(seed=99, step=99, current_obs=obs_b)
+    assert hit is True
+    assert loaded is not None
+    assert torch.allclose(loaded["x"], torch.full((1, 4), 1.0))
+
+
+def test_similarity_lru_empty_cache_miss():
+    cache = FeatureCache(
+        FeatureCacheConfig(
+            enabled=True,
+            mode="similarity_lru",
+            similarity_metric="obs_cosine",
+            similarity_threshold=0.5,
+            max_entries=10,
+        )
+    )
+    _, hit = cache.get(seed=1, step=0, current_obs=_make_obs(0))
+    assert hit is False
