@@ -226,6 +226,8 @@ class Cluster:
                 address="auto",
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
+                runtime_env={"env_vars": {"RAY_DEBUG": "0"},
+                             }
             )
         except ConnectionError:
             ray.init(

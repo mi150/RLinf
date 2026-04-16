@@ -83,7 +83,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             ranked_env_metrics_list,
         )
 
-    def get_rollout_metrics(self) -> tuple[dict, list[dict]]:
+    def get_rollout_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
         while True:
             try:
@@ -93,12 +93,19 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 break
 
         if not results:
-            return {}, []
+            return {}, [], []
 
         time_metrics, ranked_time_metrics_list = self._process_ranked_numeric_results(
             results, metric_field="time"
         )
-        return time_metrics, ranked_time_metrics_list
+        rollout_metrics, ranked_rollout_metrics_list = (
+            self._process_ranked_numeric_results(results, metric_field="rollout")
+        )
+        return (
+            {**time_metrics, **rollout_metrics},
+            ranked_time_metrics_list,
+            ranked_rollout_metrics_list,
+        )
 
     def _cleanup_pending_rollout_weight_sync(self, no_wait):
         if self._pending_rollout_weight_sync is None:
@@ -209,7 +216,11 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             env_metrics, env_time_metrics_per_rank, env_metrics_per_rank = (
                 self.get_env_metrics()
             )
-            rollout_metrics, rollout_time_metrics_per_rank = self.get_rollout_metrics()
+            (
+                rollout_metrics,
+                rollout_time_metrics_per_rank,
+                rollout_metrics_per_rank,
+            ) = self.get_rollout_metrics()
 
             self.metric_logger.log(time_metrics, self.global_step)
             self.metric_logger.log(env_metrics, self.global_step)
@@ -246,6 +257,13 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 metrics_list=rollout_time_metrics_per_rank,
                 step=self.global_step,
                 prefix="time/rollout",
+                worker_group_name=self.rollout.worker_group_name,
+                add_prefix=False,
+            )
+            self._log_ranked_metrics(
+                metrics_list=rollout_metrics_per_rank,
+                step=self.global_step,
+                prefix="rollout",
                 worker_group_name=self.rollout.worker_group_name,
                 add_prefix=False,
             )

@@ -26,6 +26,11 @@ from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 
+try:
+    from transformers.cache_utils import DynamicCache
+except Exception:
+    DynamicCache = None
+
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
@@ -803,6 +808,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
 
     @staticmethod
+    def _normalize_kv_cache_for_transformers(past_key_values):
+        """Convert legacy tuple KV cache to modern Transformers cache when needed."""
+        if past_key_values is None:
+            return None
+        if hasattr(past_key_values, "get_seq_length"):
+            return past_key_values
+        if isinstance(past_key_values, tuple) and DynamicCache is not None:
+            try:
+                return DynamicCache.from_legacy_cache(past_key_values)
+            except Exception:
+                return past_key_values
+        return past_key_values
+
+    @staticmethod
     def _reassemble_kv_cache(
         kv_caches: list[tuple[tuple[torch.Tensor, ...], ...]],
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
@@ -971,6 +990,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
             "eager"  # noqa: SLF001
         )
+        past_key_values = self._normalize_kv_cache_for_transformers(past_key_values)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,

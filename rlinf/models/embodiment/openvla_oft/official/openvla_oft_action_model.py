@@ -103,6 +103,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         self.max_prompt_length = config.max_prompt_length
         self.feature_cache = None
+        print(
+            "[FeatureCache][INFO] "
+            f"Feature cache is {'enabled' if self.feature_cache is not None else 'disabled'}."
+        )
 
     def set_processor(self, processor):
         self.processor = processor
@@ -443,7 +447,10 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         # last token is space ` `
         assert torch.all(input_ids[:, -1] == 29871)
         assert torch.all(attention_mask[:, -1] == 1)
-
+        print(
+            "[FeatureCache][REUSE] "
+            f"Use offical OpenVLA OFT action model for prediction. "
+        )
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
         labels[:] = IGNORE_INDEX
@@ -471,6 +478,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
                     seed=int(env_seeds[b].item()),
                     step=int(step_indices[b].item()),
                     current_obs=env_obs,
+                    target_device=input_ids.device,
                     vision_encoder_fn=self.get_vision_features,
                 )
                 if not hit:

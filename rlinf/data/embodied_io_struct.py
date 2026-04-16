@@ -697,13 +697,17 @@ class EmbodiedRolloutResult:
                 all_trajectory.curr_obs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].curr_obs = splited_obs[i]
+                splited_trajectories[i].curr_obs = put_tensor_device(
+                    splited_obs[i], "cpu"
+                )
         if len(all_trajectory.next_obs) > 0:
             splited_obs = split_dict_to_chunk(
                 all_trajectory.next_obs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].next_obs = splited_obs[i]
+                splited_trajectories[i].next_obs = put_tensor_device(
+                    splited_obs[i], "cpu"
+                )
 
         if (
             all_trajectory.forward_inputs is not None
@@ -713,7 +717,9 @@ class EmbodiedRolloutResult:
                 all_trajectory.forward_inputs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
+                splited_trajectories[i].forward_inputs = put_tensor_device(
+                    splited_forward_inputs[i], "cpu"
+                )
 
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
@@ -728,7 +734,7 @@ class EmbodiedRolloutResult:
             elif isinstance(value, torch.Tensor):
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, chunks[i])
+                    setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"

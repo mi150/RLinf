@@ -46,3 +46,68 @@ def dump_report_markdown(report: dict[str, Any], output_path: str) -> None:
         f"- model_action_head_cuda_us: {tp.get('model_action_head_cuda_us', 0.0):.3f}",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def dump_batch_sweep_json(reports: list[dict[str, Any]], output_path: str) -> None:
+    """Write batch-size sweep summary as JSON."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for r in reports:
+        lat = r.get("latency", {})
+        tp = r.get("torch_profile", {})
+        num_envs = r.get("num_envs", 0)
+        infer_s = lat.get("model_infer_seconds", 0.0)
+        infer_count = lat.get("model_infer_count", 1) or 1
+        avg_infer_ms = infer_s / infer_count * 1000.0
+        throughput = num_envs / avg_infer_ms * 1000.0 if avg_infer_ms > 0 else 0.0
+        rows.append({
+            "num_envs": num_envs,
+            "model_infer_seconds_total": infer_s,
+            "model_infer_count": infer_count,
+            "avg_infer_ms_per_call": avg_infer_ms,
+            "throughput_envs_per_sec": throughput,
+            "model_backbone_cuda_us": tp.get("model_backbone_cuda_us", 0.0),
+            "model_action_head_cuda_us": tp.get("model_action_head_cuda_us", 0.0),
+            "model_infer_cuda_us": tp.get("model_infer_cuda_us", 0.0),
+        })
+
+    path.write_text(json.dumps({"batch_sweep": rows}, indent=2), encoding="utf-8")
+
+
+def dump_batch_sweep_markdown(reports: list[dict[str, Any]], output_path: str) -> None:
+    """Write batch-size sweep summary as a Markdown comparison table."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    header = (
+        "| num_envs | avg_infer_ms | throughput (envs/s) "
+        "| backbone_cuda_us | action_head_cuda_us | total_infer_cuda_us |"
+    )
+    sep = "|---|---|---|---|---|---|"
+
+    rows = [header, sep]
+    for r in reports:
+        lat = r.get("latency", {})
+        tp = r.get("torch_profile", {})
+        num_envs = r.get("num_envs", 0)
+        infer_s = lat.get("model_infer_seconds", 0.0)
+        infer_count = lat.get("model_infer_count", 1) or 1
+        avg_ms = infer_s / infer_count * 1000.0
+        throughput = num_envs / avg_ms * 1000.0 if avg_ms > 0 else 0.0
+        rows.append(
+            f"| {num_envs} | {avg_ms:.2f} | {throughput:.1f} "
+            f"| {tp.get('model_backbone_cuda_us', 0.0):.1f} "
+            f"| {tp.get('model_action_head_cuda_us', 0.0):.1f} "
+            f"| {tp.get('model_infer_cuda_us', 0.0):.1f} |"
+        )
+
+    lines = [
+        "# Batch-Size Sweep Report",
+        "",
+        "Model is loaded once; environment is rebuilt for each batch size.",
+        "",
+        *rows,
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")

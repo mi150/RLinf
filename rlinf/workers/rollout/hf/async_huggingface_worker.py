@@ -72,16 +72,60 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             if self._background_weight_sync_active:
                 await self._poll_background_weight_sync()
             await self.wait_if_stale()
+            aggregate_cache_metrics = {
+                "rollout/feature_cache/hits": 0.0,
+                "rollout/feature_cache/same_step_hits": 0.0,
+                "rollout/feature_cache/misses": 0.0,
+                "rollout/feature_cache/invalidations": 0.0,
+                "rollout/feature_cache/cached_seeds": 0.0,
+                "rollout/feature_cache/cached_entries": 0.0,
+                "rollout/feature_cache/enabled": float(
+                    bool(
+                        getattr(self.hf_model, "feature_cache", None) is not None
+                        and self.hf_model.feature_cache.config.enabled
+                    )
+                ),
+            }
             for _ in range(self.rollout_epoch):
                 await self.generate_one_epoch(input_channel, output_channel)
+                cache_metrics = self._collect_feature_cache_metrics(log_to_stdout=True)
+                if cache_metrics:
+                    aggregate_cache_metrics["rollout/feature_cache/hits"] += cache_metrics[
+                        "feature_cache/hits"
+                    ]
+                    aggregate_cache_metrics[
+                        "rollout/feature_cache/same_step_hits"
+                    ] += cache_metrics["feature_cache/same_step_hits"]
+                    aggregate_cache_metrics["rollout/feature_cache/misses"] += cache_metrics[
+                        "feature_cache/misses"
+                    ]
+                    aggregate_cache_metrics[
+                        "rollout/feature_cache/invalidations"
+                    ] += cache_metrics["feature_cache/invalidations"]
+                    aggregate_cache_metrics["rollout/feature_cache/cached_seeds"] = (
+                        cache_metrics["feature_cache/cached_seeds"]
+                    )
+                    aggregate_cache_metrics["rollout/feature_cache/cached_entries"] = (
+                        cache_metrics["feature_cache/cached_entries"]
+                    )
             if self.finished_episodes is not None:
                 self.finished_episodes += self.total_num_train_envs * self.rollout_epoch
             rollout_metrics = self.pop_execution_times()
             rollout_metrics = {
                 f"time/rollout/{k}": v for k, v in rollout_metrics.items()
             }
+            total = (
+                aggregate_cache_metrics["rollout/feature_cache/hits"]
+                + aggregate_cache_metrics["rollout/feature_cache/misses"]
+            )
+            if total > 0:
+                aggregate_cache_metrics["rollout/feature_cache/hit_rate"] = (
+                    100.0 * aggregate_cache_metrics["rollout/feature_cache/hits"] / total
+                )
+            else:
+                aggregate_cache_metrics["rollout/feature_cache/hit_rate"] = 0.0
             metric_channel.put(
-                {"rank": self._rank, "time": rollout_metrics},
+                {"rank": self._rank, "time": rollout_metrics, "rollout": aggregate_cache_metrics},
                 async_op=True,
             )
 
@@ -126,6 +170,12 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
     def _apply_synced_model_weights(self, param_state_dict):
         self.hf_model.load_state_dict(param_state_dict)
+        feature_cache = getattr(self.hf_model, "feature_cache", None)
+        if (
+            feature_cache is not None
+            and feature_cache.config.invalidate_on_weight_update
+        ):
+            feature_cache.invalidate_all()
 
         del param_state_dict
         gc.collect()

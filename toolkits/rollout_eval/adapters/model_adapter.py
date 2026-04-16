@@ -363,38 +363,11 @@ class GenericModelAdapter:
         self, obs_batch: dict[str, Any], mode: str = "eval"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = dict(self.sampling_defaults)
-        with ExitStack() as stack:
-            if self.split_model_stages:
-                language_model = getattr(self.model, "language_model", None)
-                if language_model is not None:
-                    stack.enter_context(
-                        _temporary_profile_wrapper(
-                            language_model,
-                            "forward",
-                            "model.backbone.openvla_oft.language_model.forward",
-                        )
-                    )
-                stack.enter_context(
-                    _temporary_profile_wrapper(
-                        self.model,
-                        "_unnormalize_actions",
-                        "model.action_head.openvla_oft._unnormalize_actions",
-                    )
-                )
-                value_head = getattr(self.model, "value_head", None)
-                if value_head is not None:
-                    stack.enter_context(
-                        _temporary_profile_wrapper(
-                            value_head,
-                            "forward",
-                            "model.action_head.openvla_oft.value_head.forward",
-                        )
-                    )
-            actions, extra = self.model.predict_action_batch(
-                env_obs=obs_batch,
-                mode=mode,
-                **kwargs,
-            )
+        actions, extra = self.model.predict_action_batch(
+            env_obs=obs_batch,
+            mode=mode,
+            **kwargs,
+        )
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
         if not isinstance(actions, torch.Tensor):
@@ -524,6 +497,72 @@ def _validate_model_path_or_raise(model_path: str, model_type: str | None = None
                 f"Model directory missing required config.json: {model_path}"
             )
 
+
+
+@dataclass
+class NullModelAdapter:
+    """Model adapter that returns zero actions without loading any model.
+
+    Useful for profiling environment step performance in isolation.
+    """
+
+    action_dim: int = 7
+    num_action_chunks: int = 1
+
+    def infer(
+        self, obs_batch: dict[str, Any], mode: str = "eval"
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        batch_size = _infer_batch_size_from_obs(obs_batch)
+        if self.num_action_chunks > 1:
+            actions = torch.zeros(batch_size, self.num_action_chunks, self.action_dim)
+        else:
+            actions = torch.zeros(batch_size, self.action_dim)
+        return actions, {}
+
+
+def _infer_batch_size_from_obs(obs_batch: dict[str, Any]) -> int:
+    import numpy as np
+
+    for value in obs_batch.values():
+        if isinstance(value, (torch.Tensor, np.ndarray)) and hasattr(value, "shape"):
+            return int(value.shape[0])
+        if isinstance(value, list) and len(value) > 0:
+            return len(value)
+    return 1
+
+
+def build_null_model_adapter(
+    cfg: DictConfig,
+    action_dim_override: int | None = None,
+    num_action_chunks_override: int | None = None,
+) -> NullModelAdapter:
+    """Build a null model adapter (no model loaded) for env-only profiling.
+
+    Args:
+        cfg: Full RLinf Hydra config (used to infer action shape when not overridden).
+        action_dim_override: Override for action dimension. If None, inferred from config.
+        num_action_chunks_override: Override for number of action chunks.
+
+    Returns:
+        A NullModelAdapter that produces zero actions.
+    """
+    actor_model = cfg.get("actor", {}).get("model", {})
+
+    if action_dim_override is not None:
+        action_dim = action_dim_override
+    else:
+        action_dim = int(actor_model.get("action_dim", 7))
+
+    if num_action_chunks_override is not None:
+        num_action_chunks = num_action_chunks_override
+    else:
+        num_action_chunks = int(actor_model.get("num_action_chunks", 1))
+
+    print(
+        f"[NullModelAdapter] action_dim={action_dim} num_action_chunks={num_action_chunks} "
+        f"(env-only mode, no model loaded)"
+    )
+    return NullModelAdapter(action_dim=action_dim, num_action_chunks=num_action_chunks)
 
 
 def build_model_adapter(

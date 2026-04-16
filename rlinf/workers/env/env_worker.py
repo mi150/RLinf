@@ -50,6 +50,12 @@ class EnvWorker(Worker):
         self.eval_env_list = []
         self._train_env_seeds: list[torch.Tensor] = []
         self._eval_env_seeds: list[torch.Tensor] = []
+        self._train_env_seeds_base: list[torch.Tensor] = []
+        self._rollout_seed_group: int | None = None
+        self._global_step: int = 0
+        self._rollout_seed_update_interval = int(
+            self.cfg.env.train.get("rollout_seed_update_interval_global_steps", 0)
+        )
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
@@ -124,6 +130,8 @@ class EnvWorker(Worker):
                 env_cfg=self.cfg.env.train,
                 num_envs_per_stage=self.train_num_envs_per_stage,
             )
+            self._train_env_seeds_base = [seed.clone() for seed in self._train_env_seeds]
+            self._rollout_seed_group = 0
         if self.enable_eval:
             self.eval_env_list, self._eval_env_seeds = self._setup_env_and_wrappers(
                 env_cls=eval_env_cls,
@@ -133,6 +141,35 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+
+    def _refresh_train_env_seed_keys(self, seed_group: int) -> None:
+        if not self._train_env_seeds_base:
+            return
+        stride = int(self.cfg.env.train.total_num_envs)
+        offset = seed_group * stride
+        self._train_env_seeds = [base + offset for base in self._train_env_seeds_base]
+
+    def set_global_step(self, global_step: int) -> None:
+        self._global_step = int(global_step)
+        if self.only_eval:
+            return
+        if not self.cfg.env.train.get("use_fixed_rollout_seeds", False):
+            return
+        interval = self._rollout_seed_update_interval
+        if interval <= 0:
+            return
+        new_group = self._global_step // interval
+        if self._rollout_seed_group == new_group:
+            return
+        self._rollout_seed_group = new_group
+        self._refresh_train_env_seed_keys(new_group)
+        for i in range(self.stage_num):
+            self.env_list[i].update_reset_state_ids()
+        print(
+            "[FeatureCache][ENV_SEED_ROTATE] "
+            f"global_step={self._global_step} interval={interval} seed_group={new_group}",
+            flush=True,
+        )
 
     def update_env_cfg(self):
         # train env

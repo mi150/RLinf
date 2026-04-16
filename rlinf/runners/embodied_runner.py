@@ -255,6 +255,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step)
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
@@ -273,7 +274,7 @@ class EmbodiedRunner:
                     self.actor.recv_rollout_trajectories(
                         input_channel=self.actor_channel
                     ).wait()
-                    rollout_handle.wait()
+                    rollout_worker_metrics = rollout_handle.wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
@@ -350,6 +351,14 @@ class EmbodiedRunner:
                     actor_rollout_metrics
                 ).items()
             }
+            rollout_cache_metrics = self._aggregate_numeric_metrics(rollout_worker_metrics)
+            if rollout_cache_metrics:
+                rollout_metrics.update(
+                    {
+                        f"rollout/{k}": v
+                        for k, v in rollout_cache_metrics.items()
+                    }
+                )
 
             training_metrics = {
                 f"train/{k}": v

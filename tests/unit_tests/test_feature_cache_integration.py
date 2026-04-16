@@ -83,6 +83,7 @@ def test_two_epoch_rollout_hits_with_fixed_seeds():
     assert model.backbone_calls == first_epoch_backbone_calls
     stats = cache.get_stats()
     assert stats.hits >= 6
+    assert stats.same_step_hits >= 6
 
 
 def test_similarity_gated_mode_with_obs_difference():
