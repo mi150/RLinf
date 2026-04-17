@@ -1,6 +1,10 @@
 # Rollout Eval Experiment Pipeline
 
-渐进式 3 阶段实验管线，用于在 `rollout_eval` 基础上进行固定 seed 基线采集、FeatureCache 性能评估和瓶颈区动作替换验证。
+渐进式 3 阶段实验管线，用于在 `rollout_eval` 基础上进行固定 seed 基线采集和瓶颈区动作替换验证。
+
+兼容性说明:
+- 支持 `baseline` 和 `action_replace`
+- `cache_eval` 仅保留为兼容占位；它会写出 `reports/phase2_cache_eval.json`，其中 `status` 为 `"unsupported"` 并附带原因
 
 ## 快速开始
 
@@ -12,7 +16,6 @@ python -m toolkits.rollout_eval.experiment.run_experiment \
     --phases baseline,action_replace \
     --seeds 42,43,44 \
     --num-runs-per-seed 3 \
-    --cache-mode similarity_gated \
     --bottleneck-k-b auto \
     --record-video \
     --output-dir ./experiment_output
@@ -40,24 +43,21 @@ python -m toolkits.rollout_eval.experiment.run_experiment \
 - `trajectories/seed{N}_run{M}.pkl` — 保存的轨迹数据（供后续阶段使用）
 - `videos/phase1_seed{N}_run{M}.mp4` — 仿真视频
 
-### Phase 2: Feature Cache Evaluation
+### Phase 2: Cache Evaluation
 
-在固定 seed 下测试 FeatureCache 的性能表现。采用两遍法：第一遍填充缓存（全 miss），第二遍测量命中率、延迟节省和动作偏差。
+`cache_eval` 不属于当前无缓存基线的支持范围。该阶段保留用于流水线兼容性：运行时会跳过缓存评估，并写出 `reports/phase2_cache_eval.json`，其中 `status` 为 `"unsupported"`，同时说明 FeatureCache baseline 已移除。
 
 ```bash
 python -m toolkits.rollout_eval.experiment.run_experiment \
     --config-path examples/embodiment/config \
-    --config-name libero_spatial_ppo_gr00t_feature_cache \
+    --config-name libero_spatial_ppo_gr00t \
     --phases cache_eval \
     --seeds 42 \
-    --cache-mode naive \
     --output-dir ./experiment_output
 ```
 
-支持的 cache mode: `naive`, `similarity_gated`, `cross_step_naive`, `cross_step_similarity`, `cross_global_same_step`
-
 输出:
-- `reports/phase2_cache_eval.json` — 命中率、延迟节省百分比、动作 L2 偏差
+- `reports/phase2_cache_eval.json` — `status: "unsupported"`，并记录 `cache_eval` 在无缓存基线中不可用的原因
 
 ### Phase 3: Action Replacement
 
@@ -107,7 +107,7 @@ K_B 检测方式:
 | `--phases` | 逗号分隔的阶段列表 | `baseline` |
 | `--seeds` | 逗号分隔的 seed 列表 | `42` |
 | `--num-runs-per-seed` | 每个 seed 重复运行次数 | `2` |
-| `--cache-mode` | Phase 2 缓存模式 | `None` |
+| `--cache-mode` | 保留参数，用于 `cache_eval` 兼容占位 | `None` |
 | `--bottleneck-k-b` | 静态 K_B 值或 `auto` | `None` |
 | `--action-source` | 动作替换来源 | `pipeline` |
 | `--external-trajectory-dir` | 外部轨迹 pkl 目录 | `None` |
@@ -167,7 +167,7 @@ toolkits/rollout_eval/experiment/
 
 - 包装模式: 所有新适配器包装现有 `GenericEnvAdapter` / `GenericModelAdapter`，不修改已有代码
 - 组合优于继承: `ExperimentConfig` 包含 `EvalRuntimeConfig` 而非继承
-- 复用生产代码: Phase 2 直接使用 `rlinf/models/embodiment/feature_cache.py` 中的 `FeatureCache`
+- 无缓存基线: 文档中的支持范围仅限 `baseline` 和 `action_replace`
 - 阶段独立: 每个阶段可单独运行，也可作为完整管线的一部分
 
 ## 测试
