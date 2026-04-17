@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from unittest.mock import MagicMock
 
 import torch
@@ -15,6 +17,7 @@ from toolkits.rollout_eval.experiment.reporting import (
     dump_cache_report_unsupported,
 )
 from toolkits.rollout_eval.experiment.run_experiment import (
+    main,
     parse_args,
     run_experiment,
 )
@@ -218,6 +221,82 @@ class TestRunExperiment:
         assert payload["phase"] == "cache_eval"
         assert payload["status"] == "unsupported"
         assert "feature cache unavailable" in payload["reason"].lower()
+
+    def test_main_cache_eval_unavailable_skips_adapter_construction(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import toolkits.rollout_eval.config_bridge as config_bridge
+        import toolkits.rollout_eval.experiment.run_experiment as run_experiment_module
+
+        load_cfg = MagicMock(return_value={})
+        build_env_adapter = MagicMock(
+            side_effect=AssertionError("build_env_adapter should not be called")
+        )
+        build_model_adapter = MagicMock(
+            side_effect=AssertionError("build_model_adapter should not be called")
+        )
+
+        fake_run_module = types.ModuleType("toolkits.rollout_eval.run")
+        fake_run_module._load_cfg = load_cfg
+        fake_env_module = types.ModuleType("toolkits.rollout_eval.adapters.env_adapter")
+        fake_env_module.build_env_adapter = build_env_adapter
+        fake_seedable_module = types.ModuleType(
+            "toolkits.rollout_eval.experiment.seedable_env_adapter"
+        )
+        fake_seedable_module.SeedableEnvAdapter = MagicMock()
+        fake_model_module = types.ModuleType("toolkits.rollout_eval.adapters.model_adapter")
+        fake_model_module.build_model_adapter = build_model_adapter
+
+        monkeypatch.setitem(sys.modules, "toolkits.rollout_eval.run", fake_run_module)
+        monkeypatch.setitem(
+            sys.modules,
+            "toolkits.rollout_eval.adapters.env_adapter",
+            fake_env_module,
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "toolkits.rollout_eval.experiment.seedable_env_adapter",
+            fake_seedable_module,
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "toolkits.rollout_eval.adapters.model_adapter",
+            fake_model_module,
+        )
+        monkeypatch.setattr(
+            config_bridge,
+            "build_eval_runtime_config",
+            MagicMock(return_value=_make_runtime(total_steps=3)),
+        )
+        monkeypatch.setattr(
+            run_experiment_module,
+            "_is_feature_cache_available",
+            lambda: False,
+        )
+
+        main(
+            [
+                "--config-path",
+                "/tmp/cfg",
+                "--config-name",
+                "test",
+                "--phases",
+                "cache_eval",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+        build_env_adapter.assert_not_called()
+        build_model_adapter.assert_not_called()
+        cache_report = tmp_path / "reports" / "phase2_cache_eval.json"
+        assert cache_report.exists()
+
+        payload = json.loads(cache_report.read_text())
+        assert payload["phase"] == "cache_eval"
+        assert payload["status"] == "unsupported"
 
     def test_unknown_phase_warns(self, tmp_path, caplog):
         import logging

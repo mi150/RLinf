@@ -47,6 +47,30 @@ def _is_feature_cache_available() -> bool:
     )
 
 
+def _parse_phases(phases_arg: str) -> list[str]:
+    """Parse comma-separated phase names, ignoring empty entries."""
+    return [phase.strip() for phase in phases_arg.split(",") if phase.strip()]
+
+
+def _is_cache_eval_only(phases: list[str]) -> bool:
+    """Return whether requested phases only need cache evaluation."""
+    return bool(phases) and all(phase == "cache_eval" for phase in phases)
+
+
+def _write_cache_eval_unsupported(output_dir: str | Path) -> Path:
+    """Write the centralized unsupported cache_eval report."""
+    from toolkits.rollout_eval.experiment.reporting import (
+        dump_cache_report_unsupported,
+    )
+
+    path = dump_cache_report_unsupported(
+        output_dir=output_dir,
+        reason=_FEATURE_CACHE_UNAVAILABLE_REASON,
+    )
+    logger.warning("Skipping Phase 2 cache_eval: %s", _FEATURE_CACHE_UNAVAILABLE_REASON)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
@@ -112,16 +136,7 @@ def _run_phase_cache_eval(
     )
     from toolkits.rollout_eval.experiment.reporting import (
         dump_cache_report,
-        dump_cache_report_unsupported,
     )
-
-    if not _is_feature_cache_available():
-        dump_cache_report_unsupported(
-            output_dir=cfg.output_dir,
-            reason=_FEATURE_CACHE_UNAVAILABLE_REASON,
-        )
-        logger.warning("Phase 2 unsupported: %s", _FEATURE_CACHE_UNAVAILABLE_REASON)
-        return
 
     cache_config = cfg.cache_config or ExperimentCacheConfig(enabled=True, mode="naive")
     cache_adapter = CacheAwareModelAdapter(model_adapter, cache_config)
@@ -293,18 +308,7 @@ def run_experiment(
             baseline_trajectories = _run_phase_baseline(cfg, env_adapter, model_adapter)
         elif phase == "cache_eval":
             if not _is_feature_cache_available():
-                from toolkits.rollout_eval.experiment.reporting import (
-                    dump_cache_report_unsupported,
-                )
-
-                dump_cache_report_unsupported(
-                    output_dir=cfg.output_dir,
-                    reason=_FEATURE_CACHE_UNAVAILABLE_REASON,
-                )
-                logger.warning(
-                    "Skipping Phase 2 cache_eval: %s",
-                    _FEATURE_CACHE_UNAVAILABLE_REASON,
-                )
+                _write_cache_eval_unsupported(cfg.output_dir)
                 continue
             _run_phase_cache_eval(cfg, env_adapter, model_adapter)
         elif phase == "action_replace":
@@ -362,6 +366,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
+    seeds = [int(s) for s in args.seeds.split(",")]
+    phases = _parse_phases(args.phases)
+
+    if _is_cache_eval_only(phases) and not _is_feature_cache_available():
+        _write_cache_eval_unsupported(args.output_dir)
+        return
 
     # Build Hydra config
     from toolkits.rollout_eval.config_bridge import build_eval_runtime_config
@@ -382,9 +392,6 @@ def main(argv: list[str] | None = None) -> None:
     # Build adapters
     from toolkits.rollout_eval.adapters.env_adapter import build_env_adapter
     from toolkits.rollout_eval.experiment.seedable_env_adapter import SeedableEnvAdapter
-
-    seeds = [int(s) for s in args.seeds.split(",")]
-    phases = [p.strip() for p in args.phases.split(",")]
 
     inner_env = build_env_adapter(hydra_cfg, split="eval")
     env_adapter = SeedableEnvAdapter(inner_env, seeds=seeds)
