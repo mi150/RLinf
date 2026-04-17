@@ -187,6 +187,15 @@ class TestRunExperiment:
             lambda: False,
             raising=False,
         )
+        monkeypatch.setattr(
+            "toolkits.rollout_eval.experiment.run_experiment._run_phase_cache_eval",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError(
+                    "cache eval should be skipped when feature cache is unavailable"
+                )
+            ),
+            raising=False,
+        )
 
         run_experiment(cfg, env, model)
 

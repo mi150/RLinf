@@ -81,16 +81,20 @@ class TestCacheAwareModelAdapter:
         # Should not raise
 
     def test_runtime_cache_unavailable(self, monkeypatch):
+        import toolkits.rollout_eval.experiment.cache_eval as cache_eval_module
+
         inner = _make_mock_inner_model()
+        cfg = FeatureCacheConfig(enabled=True, mode="naive")
 
         monkeypatch.setattr(
-            "toolkits.rollout_eval.experiment.cache_eval._is_feature_cache_runtime_available",
+            cache_eval_module,
+            "_is_feature_cache_runtime_available",
             lambda: False,
             raising=False,
         )
 
         with pytest.raises(RuntimeError, match="feature cache runtime is unavailable"):
-            CacheAwareModelAdapter(inner, cache_config={"enabled": True, "mode": "naive"})
+            cache_eval_module.CacheAwareModelAdapter(inner, cache_config=cfg)
 
 
 # -----------------------------------------------------------------------
