@@ -4,7 +4,7 @@ Usage:
     python -m toolkits.rollout_eval.experiment.run_experiment \
         --config-path /path/to/hydra/config \
         --config-name libero_spatial_ppo_gr00t \
-        --phases baseline,cache_eval,action_replace \
+        --phases baseline,action_replace \
         --seeds 42,43,44 \
         --num-runs-per-seed 3 \
         --output-dir ./experiment_output
@@ -295,7 +295,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--phases", default="baseline", help="Comma-separated phases")
     parser.add_argument("--seeds", default="42", help="Comma-separated seeds")
     parser.add_argument("--num-runs-per-seed", type=int, default=2)
-    parser.add_argument("--cache-mode", default=None, help="Cache mode for Phase 2")
+    parser.add_argument(
+        "--cache-mode",
+        default=None,
+        help="Compatibility/no-op in the no-cache baseline; only used when cache_eval is enabled",
+    )
     parser.add_argument("--bottleneck-k-b", default=None, help="Static K_B or 'auto'")
     parser.add_argument("--action-source", default="pipeline",
                         choices=["pipeline", "cross_run", "external"])

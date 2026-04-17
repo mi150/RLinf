@@ -50,7 +50,7 @@ fi
 
 # python -B -m toolkits.rollout_eval.experiment.run_experiment \
 #     --config-path examples/embodiment/config \
-#     --config-name libero_spatial_ppo_gr00t_feature_cache_similarity \
+#     --config-name libero_spatial_ppo_gr00t \
 #     --phases cache_eval \
 #     --record-video \
 #     --seeds 42 \

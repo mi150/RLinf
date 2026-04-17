@@ -5,11 +5,11 @@
 ## 快速开始
 
 ```bash
-# 完整 3 阶段管线
+# 无缓存基线 + 动作替换管线
 python -m toolkits.rollout_eval.experiment.run_experiment \
     --config-path examples/embodiment/config \
     --config-name libero_spatial_ppo_gr00t \
-    --phases baseline,cache_eval,action_replace \
+    --phases baseline,action_replace \
     --seeds 42,43,44 \
     --num-runs-per-seed 3 \
     --cache-mode similarity_gated \
@@ -155,7 +155,7 @@ toolkits/rollout_eval/experiment/
 ├── types.py                   # 数据类型定义
 ├── seedable_env_adapter.py    # 固定 seed 环境适配器
 ├── recording_loop.py          # 带轨迹录制的 rollout 循环
-├── cache_eval.py              # CacheAwareModelAdapter + 两遍法评估
+├── cache_eval.py              # CacheAwareModelAdapter + no-cache baseline 下的占位/兼容逻辑
 ├── action_replacer.py         # ActionReplacer + OpenLoopReplay 适配器
 ├── trajectory_loader.py       # 外部 pkl 轨迹加载
 ├── bottleneck_detector.py     # K_B 瓶颈检测
