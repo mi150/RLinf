@@ -57,7 +57,6 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
-    env_seeds: Optional[torch.Tensor] = None  # [B], int64
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -89,9 +88,6 @@ class EnvOutput:
             self.intervene_flags.cpu().contiguous()
             if self.intervene_flags is not None
             else None
-        )
-        self.env_seeds = (
-            self.env_seeds.cpu().contiguous() if self.env_seeds is not None else None
         )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
@@ -230,7 +226,6 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
-        merged_env_seeds = _merge_optional_tensor_field("env_seeds")
         # turn to EnvOutput and turn to dict to call post init for tensor processing
         return EnvOutput(
             obs=merged_obs,
@@ -241,7 +236,6 @@ class EnvOutput:
             rewards=merged_rewards,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
-            env_seeds=merged_env_seeds,
         ).to_dict()
 
     def to_dict(self) -> dict[str, Any]:
@@ -259,7 +253,6 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
-        env_output_dict["env_seeds"] = self.env_seeds
 
         return env_output_dict
 
@@ -697,17 +690,13 @@ class EmbodiedRolloutResult:
                 all_trajectory.curr_obs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].curr_obs = put_tensor_device(
-                    splited_obs[i], "cpu"
-                )
+                splited_trajectories[i].curr_obs = splited_obs[i]
         if len(all_trajectory.next_obs) > 0:
             splited_obs = split_dict_to_chunk(
                 all_trajectory.next_obs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].next_obs = put_tensor_device(
-                    splited_obs[i], "cpu"
-                )
+                splited_trajectories[i].next_obs = splited_obs[i]
 
         if (
             all_trajectory.forward_inputs is not None
@@ -717,9 +706,7 @@ class EmbodiedRolloutResult:
                 all_trajectory.forward_inputs, split_size, dim=1
             )
             for i in range(split_size):
-                splited_trajectories[i].forward_inputs = put_tensor_device(
-                    splited_forward_inputs[i], "cpu"
-                )
+                splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
 
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
@@ -734,7 +721,7 @@ class EmbodiedRolloutResult:
             elif isinstance(value, torch.Tensor):
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
+                    setattr(splited_trajectories[i], field_name, chunks[i])
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"
