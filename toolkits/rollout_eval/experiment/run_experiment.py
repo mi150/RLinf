@@ -13,20 +13,38 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import pickle
-import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from toolkits.rollout_eval.experiment.types import (
     EpisodeTrajectory,
+    ExperimentCacheConfig,
     ExperimentConfig,
 )
 
 logger = logging.getLogger(__name__)
+
+_FEATURE_CACHE_MODULE = "rlinf.models.embodiment.feature_cache"
+_FEATURE_CACHE_UNAVAILABLE_REASON = (
+    "Feature cache unavailable: runtime module "
+    f"{_FEATURE_CACHE_MODULE} is not installed"
+)
+
+
+def _is_feature_cache_available() -> bool:
+    """Return whether feature cache runtime support can be imported safely."""
+    try:
+        runtime = importlib.import_module(_FEATURE_CACHE_MODULE)
+    except Exception:
+        return False
+    return all(
+        hasattr(runtime, attr)
+        for attr in ("CacheStats", "FeatureCache", "FeatureCacheConfig")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,14 +106,24 @@ def _run_phase_cache_eval(
     model_adapter: Any,
 ) -> None:
     """Phase 2: Feature cache two-pass evaluation."""
-    from rlinf.models.embodiment.feature_cache import FeatureCacheConfig
     from toolkits.rollout_eval.experiment.cache_eval import (
         CacheAwareModelAdapter,
         run_cache_eval,
     )
-    from toolkits.rollout_eval.experiment.reporting import dump_cache_report
+    from toolkits.rollout_eval.experiment.reporting import (
+        dump_cache_report,
+        dump_cache_report_unsupported,
+    )
 
-    cache_config = cfg.cache_config or FeatureCacheConfig(enabled=True, mode="naive")
+    if not _is_feature_cache_available():
+        dump_cache_report_unsupported(
+            output_dir=cfg.output_dir,
+            reason=_FEATURE_CACHE_UNAVAILABLE_REASON,
+        )
+        logger.warning("Phase 2 unsupported: %s", _FEATURE_CACHE_UNAVAILABLE_REASON)
+        return
+
+    cache_config = cfg.cache_config or ExperimentCacheConfig(enabled=True, mode="naive")
     cache_adapter = CacheAwareModelAdapter(model_adapter, cache_config)
 
     logger.info("Phase 2: cache mode=%s", cache_config.mode)
@@ -122,9 +150,13 @@ def _run_phase_action_replace(
 ) -> None:
     """Phase 3: Action replacement in bottleneck zone."""
     from toolkits.rollout_eval.experiment.action_replacer import run_action_replace_eval
-    from toolkits.rollout_eval.experiment.bottleneck_detector import detect_bottleneck_k_b
+    from toolkits.rollout_eval.experiment.bottleneck_detector import (
+        detect_bottleneck_k_b,
+    )
     from toolkits.rollout_eval.experiment.reporting import dump_action_replace_report
-    from toolkits.rollout_eval.experiment.trajectory_loader import scan_and_pair_trajectories
+    from toolkits.rollout_eval.experiment.trajectory_loader import (
+        scan_and_pair_trajectories,
+    )
 
     # Determine K_B
     k_b_source = "static"
@@ -175,9 +207,12 @@ def _run_phase_action_replace(
 
     if cfg.action_source == "external":
         # Pure open-loop replay — no model inference at all
-        from toolkits.rollout_eval.experiment.action_replacer import OpenLoopReplayAdapter
-        from toolkits.rollout_eval.experiment.recording_loop import run_recording_loop
         import dataclasses
+
+        from toolkits.rollout_eval.experiment.action_replacer import (
+            OpenLoopReplayAdapter,
+        )
+        from toolkits.rollout_eval.experiment.recording_loop import run_recording_loop
 
         replaced: list[EpisodeTrajectory] = []
 
@@ -257,6 +292,20 @@ def run_experiment(
         if phase == "baseline":
             baseline_trajectories = _run_phase_baseline(cfg, env_adapter, model_adapter)
         elif phase == "cache_eval":
+            if not _is_feature_cache_available():
+                from toolkits.rollout_eval.experiment.reporting import (
+                    dump_cache_report_unsupported,
+                )
+
+                dump_cache_report_unsupported(
+                    output_dir=cfg.output_dir,
+                    reason=_FEATURE_CACHE_UNAVAILABLE_REASON,
+                )
+                logger.warning(
+                    "Skipping Phase 2 cache_eval: %s",
+                    _FEATURE_CACHE_UNAVAILABLE_REASON,
+                )
+                continue
             _run_phase_cache_eval(cfg, env_adapter, model_adapter)
         elif phase == "action_replace":
             _run_phase_action_replace(cfg, env_adapter, model_adapter, baseline_trajectories)
@@ -354,8 +403,7 @@ def main(argv: list[str] | None = None) -> None:
     # Build cache config if needed
     cache_config = None
     if args.cache_mode and "cache_eval" in phases:
-        from rlinf.models.embodiment.feature_cache import FeatureCacheConfig
-        cache_config = FeatureCacheConfig(enabled=True, mode=args.cache_mode)
+        cache_config = ExperimentCacheConfig(enabled=True, mode=args.cache_mode)
 
     # K_B
     k_b = None

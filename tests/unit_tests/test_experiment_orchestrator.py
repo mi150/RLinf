@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
-import pytest
 
 from toolkits.rollout_eval.config_bridge import EvalRuntimeConfig
 from toolkits.rollout_eval.experiment.reporting import (
     dump_action_replace_report,
     dump_baseline_report,
     dump_cache_report,
+    dump_cache_report_unsupported,
 )
 from toolkits.rollout_eval.experiment.run_experiment import (
     parse_args,
@@ -27,7 +26,6 @@ from toolkits.rollout_eval.experiment.types import (
     StepRecord,
 )
 from toolkits.rollout_eval.rollout_types import EnvStepResult
-
 
 # -----------------------------------------------------------------------
 # Reporting
@@ -80,6 +78,18 @@ class TestDumpCacheReport:
         data = json.loads(path.read_text())
         assert data["phase"] == "cache_eval"
         assert data["latency_savings_pct"] == 75.0
+
+    def test_writes_unsupported_json(self, tmp_path):
+        path = dump_cache_report_unsupported(
+            output_dir=str(tmp_path),
+            reason="feature cache unavailable",
+        )
+
+        assert path.exists()
+        data = json.loads(path.read_text())
+        assert data["phase"] == "cache_eval"
+        assert data["status"] == "unsupported"
+        assert data["reason"] == "feature cache unavailable"
 
 
 class TestDumpActionReplaceReport:

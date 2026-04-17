@@ -7,9 +7,7 @@ from typing import Any
 
 import torch
 
-from rlinf.models.embodiment.feature_cache import FeatureCacheConfig
 from toolkits.rollout_eval.config_bridge import EvalRuntimeConfig
-
 
 # ---------------------------------------------------------------------------
 # Per-step / per-episode recording
@@ -97,6 +95,21 @@ class CacheEvalResult:
     success_rate_pass2: float
 
 
+@dataclass
+class ExperimentCacheConfig:
+    """Toolkit-level cache config decoupled from runtime cache implementation."""
+
+    enabled: bool = True
+    mode: str = "naive"
+    similarity_metric: str = "obs_ssim"
+    similarity_threshold: float = 0.90
+    invalidate_on_weight_update: bool = True
+    max_cache_seeds: int = -1
+    max_entries: int = 256
+    debug_log: bool = False
+    debug_log_max_events: int = 1000
+
+
 # ---------------------------------------------------------------------------
 # Experiment config
 # ---------------------------------------------------------------------------
@@ -117,7 +130,7 @@ class ExperimentConfig:
     video_fps: int = 30
 
     # Phase 2: Cache
-    cache_config: FeatureCacheConfig | None = None
+    cache_config: ExperimentCacheConfig | None = None
 
     # Phase 3: Action replacement
     bottleneck_k_b: int | None = None

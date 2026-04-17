@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
+from dataclasses import asdict, is_dataclass
+from types import ModuleType
 from typing import Any
 
 import torch
 
-from rlinf.models.embodiment.feature_cache import (
-    CacheStats,
-    FeatureCache,
-    FeatureCacheConfig,
-)
 from toolkits.rollout_eval.adapters.model_adapter import GenericModelAdapter
 from toolkits.rollout_eval.config_bridge import EvalRuntimeConfig
 from toolkits.rollout_eval.experiment.recording_loop import run_recording_loop
@@ -18,7 +16,69 @@ from toolkits.rollout_eval.experiment.seedable_env_adapter import SeedableEnvAda
 from toolkits.rollout_eval.experiment.types import (
     CacheEvalResult,
     EpisodeTrajectory,
+    ExperimentCacheConfig,
 )
+
+_FEATURE_CACHE_MODULE = "rlinf.models.embodiment.feature_cache"
+_FEATURE_CACHE_CONFIG_FIELDS = {
+    "enabled",
+    "mode",
+    "similarity_metric",
+    "similarity_threshold",
+    "invalidate_on_weight_update",
+    "max_cache_seeds",
+    "max_entries",
+    "debug_log",
+    "debug_log_max_events",
+}
+_FEATURE_CACHE_UNAVAILABLE_MESSAGE = (
+    "Feature cache runtime is unavailable: "
+    "feature cache runtime is unavailable in this installation"
+)
+
+
+def _load_feature_cache_runtime() -> ModuleType | None:
+    """Import the runtime feature cache module if it is installed."""
+    try:
+        return importlib.import_module(_FEATURE_CACHE_MODULE)
+    except Exception:
+        return None
+
+
+def _is_feature_cache_runtime_available() -> bool:
+    """Return whether the runtime feature cache implementation can be used."""
+    runtime = _load_feature_cache_runtime()
+    return runtime is not None and all(
+        hasattr(runtime, attr)
+        for attr in ("CacheStats", "FeatureCache", "FeatureCacheConfig")
+    )
+
+
+def _cache_config_kwargs(cache_config: Any) -> dict[str, Any]:
+    """Extract fields accepted by the runtime FeatureCacheConfig."""
+    if is_dataclass(cache_config):
+        data = asdict(cache_config)
+    elif isinstance(cache_config, dict):
+        data = dict(cache_config)
+    else:
+        data = {
+            field_name: getattr(cache_config, field_name)
+            for field_name in _FEATURE_CACHE_CONFIG_FIELDS
+            if hasattr(cache_config, field_name)
+        }
+    return {
+        key: value
+        for key, value in data.items()
+        if key in _FEATURE_CACHE_CONFIG_FIELDS
+    }
+
+
+def _to_runtime_cache_config(runtime: ModuleType, cache_config: Any) -> Any:
+    """Convert toolkit or duck-typed cache config to runtime config."""
+    FeatureCacheConfig = runtime.FeatureCacheConfig
+    if isinstance(cache_config, FeatureCacheConfig):
+        return cache_config
+    return FeatureCacheConfig(**_cache_config_kwargs(cache_config))
 
 
 class CacheAwareModelAdapter:
@@ -31,8 +91,10 @@ class CacheAwareModelAdapter:
     def __init__(
         self,
         inner: GenericModelAdapter,
-        cache_config: FeatureCacheConfig,
+        cache_config: ExperimentCacheConfig | Any,
     ):
+        if not _is_feature_cache_runtime_available():
+            raise RuntimeError(_FEATURE_CACHE_UNAVAILABLE_MESSAGE)
         self.inner = inner
         self.cache_config = cache_config
         self._step_counter = 0
@@ -40,6 +102,11 @@ class CacheAwareModelAdapter:
         self._configure_cache()
 
     def _configure_cache(self) -> None:
+        runtime = _load_feature_cache_runtime()
+        if runtime is None:
+            raise RuntimeError(_FEATURE_CACHE_UNAVAILABLE_MESSAGE)
+        FeatureCache = runtime.FeatureCache
+        self.cache_config = _to_runtime_cache_config(runtime, self.cache_config)
         model = self.inner.model
         model.feature_cache_config = self.cache_config
         if not hasattr(model, "feature_cache") or model.feature_cache is None:
@@ -57,7 +124,7 @@ class CacheAwareModelAdapter:
         self._step_counter += 1
         return self.inner.infer(obs_batch=obs_batch, mode=mode)
 
-    def get_cache_stats(self) -> CacheStats:
+    def get_cache_stats(self) -> Any:
         return self.inner.model.feature_cache.get_stats()
 
     def reset_cache_stats(self) -> None:
@@ -100,8 +167,6 @@ def run_cache_eval(
             pass1_latencies.append(
                 result.latency.model_infer_seconds / result.latency.model_infer_count * 1000
             )
-
-    pass1_stats = model_adapter.get_cache_stats()
 
     # Pass 2: measure cache hits
     model_adapter.reset_cache_stats()

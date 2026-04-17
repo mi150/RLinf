@@ -121,6 +121,22 @@ def dump_cache_report(
     return path
 
 
+def dump_cache_report_unsupported(
+    output_dir: str | Path,
+    reason: str,
+) -> Path:
+    """Write Phase 2 report when cache evaluation cannot run."""
+    report: dict[str, Any] = {
+        "phase": "cache_eval",
+        "status": "unsupported",
+        "reason": reason,
+    }
+
+    path = Path(output_dir) / "reports" / "phase2_cache_eval.json"
+    _write_json(report, path)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: Action replacement
 # ---------------------------------------------------------------------------

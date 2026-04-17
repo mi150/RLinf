@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock
 
-import torch
 import pytest
+import torch
 
-from rlinf.models.embodiment.feature_cache import CacheStats, FeatureCacheConfig
 from toolkits.rollout_eval.experiment.cache_eval import (
     CacheAwareModelAdapter,
     _compute_action_divergence,
     _success_rate,
 )
-from toolkits.rollout_eval.experiment.types import EpisodeTrajectory, StepRecord
-
+from toolkits.rollout_eval.experiment.types import (
+    EpisodeTrajectory,
+    ExperimentCacheConfig,
+    StepRecord,
+)
 
 # -----------------------------------------------------------------------
 # CacheAwareModelAdapter
@@ -31,18 +33,29 @@ def _make_mock_inner_model():
     return inner
 
 
+def _require_feature_cache_runtime() -> None:
+    """Skip cache-positive tests when runtime cache support is absent."""
+    import toolkits.rollout_eval.experiment.cache_eval as cache_eval_module
+
+    if not cache_eval_module._is_feature_cache_runtime_available():
+        pytest.skip("feature cache runtime unavailable")
+
+
 class TestCacheAwareModelAdapter:
     def test_configure_cache(self):
+        _require_feature_cache_runtime()
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
         adapter = CacheAwareModelAdapter(inner, cfg)
 
-        assert inner.model.feature_cache_config is cfg
+        assert adapter.cache_config.mode == cfg.mode
+        assert inner.model.feature_cache_config.mode == cfg.mode
         assert inner.model.feature_cache is not None
 
     def test_set_seed_resets_step(self):
+        _require_feature_cache_runtime()
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
         adapter = CacheAwareModelAdapter(inner, cfg)
 
         adapter.set_seed(42)
@@ -50,8 +63,9 @@ class TestCacheAwareModelAdapter:
         assert adapter._step_counter == 0
 
     def test_infer_increments_step(self):
+        _require_feature_cache_runtime()
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
         adapter = CacheAwareModelAdapter(inner, cfg)
         adapter.set_seed(10)
 
@@ -65,17 +79,19 @@ class TestCacheAwareModelAdapter:
         assert inner.model.current_step == 1
 
     def test_get_cache_stats(self):
+        _require_feature_cache_runtime()
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
         adapter = CacheAwareModelAdapter(inner, cfg)
 
         stats = adapter.get_cache_stats()
-        assert isinstance(stats, CacheStats)
         assert stats.hits == 0
+        assert stats.misses == 0
 
     def test_invalidate_cache(self):
+        _require_feature_cache_runtime()
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
         adapter = CacheAwareModelAdapter(inner, cfg)
         adapter.invalidate_cache()
         # Should not raise
@@ -84,7 +100,7 @@ class TestCacheAwareModelAdapter:
         import toolkits.rollout_eval.experiment.cache_eval as cache_eval_module
 
         inner = _make_mock_inner_model()
-        cfg = FeatureCacheConfig(enabled=True, mode="naive")
+        cfg = ExperimentCacheConfig(enabled=True, mode="naive")
 
         monkeypatch.setattr(
             cache_eval_module,
