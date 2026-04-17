@@ -172,6 +172,34 @@ class TestRunExperiment:
         assert (tmp_path / "reports" / "phase1_baseline.json").exists()
         assert (tmp_path / "experiment_config.json").exists()
 
+    def test_unsupported_when_feature_cache_absent(self, tmp_path, monkeypatch):
+        cfg = ExperimentConfig(
+            eval_runtime=_make_runtime(total_steps=3),
+            phases=["cache_eval", "baseline"],
+            seeds=[42],
+            output_dir=str(tmp_path),
+        )
+        env = _make_mock_env()
+        model = _make_mock_model()
+
+        monkeypatch.setattr(
+            "toolkits.rollout_eval.experiment.run_experiment._is_feature_cache_available",
+            lambda: False,
+            raising=False,
+        )
+
+        run_experiment(cfg, env, model)
+
+        cache_report = tmp_path / "reports" / "phase2_cache_eval.json"
+        baseline_report = tmp_path / "reports" / "phase1_baseline.json"
+        assert cache_report.exists()
+        assert baseline_report.exists()
+
+        payload = json.loads(cache_report.read_text())
+        assert payload["phase"] == "cache_eval"
+        assert payload["status"] == "unsupported"
+        assert "feature cache unavailable" in payload["reason"].lower()
+
     def test_unknown_phase_warns(self, tmp_path, caplog):
         import logging
         cfg = ExperimentConfig(
