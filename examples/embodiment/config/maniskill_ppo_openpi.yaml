@@ -82,13 +82,6 @@ algorithm:
     max_new_token: null
     max_length: 1024
     min_length: 1
-  feature_cache:
-    enabled: false
-    mode: "naive"
-    similarity_metric: "obs_ssim"
-    similarity_threshold: 0.90
-    invalidate_on_weight_update: null
-    max_cache_seeds: -1
 
 env:
   group_name: "EnvGroup"
@@ -98,7 +91,6 @@ env:
     total_num_envs: 320
     auto_reset: True
     use_fixed_reset_state_ids: False
-    use_fixed_rollout_seeds: False
     max_episode_steps: 80 # max episode steps for truncation
     max_steps_per_rollout_epoch: 80
     init_params:

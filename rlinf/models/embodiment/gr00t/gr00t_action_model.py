@@ -479,7 +479,6 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self.action_head = FlowMatchingActionHeadForRLActionPrediction(
             action_head_cfg, rl_head_config, output_action_chunks, self.valid_action_dim
         )
-        self.feature_cache = None
 
     def eval(self):
         self._modality_transform.eval()
@@ -608,13 +607,7 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
             value=0,
         )
 
-        normalized_action, result = self._get_rl_action(
-            normalized_input,
-            mode=mode,
-            env_seeds=kwargs.get("env_seeds", None),
-            step_indices=kwargs.get("step_indices", None),
-            current_obs=env_obs,
-        )
+        normalized_action, result = self._get_rl_action(normalized_input, mode=mode)
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 
         if not is_batch:
@@ -655,134 +648,11 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         self,
         normalized_input: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
-        env_seeds: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
-        current_obs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         # We expand get_action() and replace action head inference with RL inference.
         backbone_inputs, action_inputs = self.prepare_input(normalized_input)
-        backbone_device = next(self.backbone.parameters()).device
-
-        def _slice_obs_one_sample(
-            obs: dict[str, Any] | None, idx: int, total: int
-        ) -> dict[str, Any] | None:
-            if obs is None:
-                return None
-            obs_b: dict[str, Any] = {}
-            for key, value in obs.items():
-                if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == total:
-                    obs_b[key] = value[idx : idx + 1]
-                elif isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == total:
-                    obs_b[key] = value[idx : idx + 1]
-                elif isinstance(value, list) and len(value) == total:
-                    obs_b[key] = value[idx : idx + 1]
-                elif isinstance(value, tuple) and len(value) == total:
-                    obs_b[key] = value[idx : idx + 1]
-                else:
-                    obs_b[key] = value
-            return obs_b
-
-        cache_enabled = (
-            self.feature_cache is not None and self.feature_cache.config.enabled
-        )
-        batch_size = normalized_input["state"].shape[0]
-        cached_entries: list[dict[str, Any] | None] = [None] * batch_size
-        hit_indices: list[int] = []
-        miss_indices: list[int] = []
-        hit_steps: list[int] = []
-        miss_steps: list[int] = []
-        if (
-            cache_enabled
-            and env_seeds is not None
-            and step_indices is not None
-            and env_seeds.shape[0] == batch_size
-            and step_indices.shape[0] == batch_size
-        ):
-            for b in range(batch_size):
-                step_b = int(step_indices[b].item())
-                current_obs_b = _slice_obs_one_sample(current_obs, b, batch_size)
-                cached_data, hit = self.feature_cache.get(
-                    seed=int(env_seeds[b].item()),
-                    step=step_b,
-                    current_obs=current_obs_b,
-                    target_device=backbone_device,
-                    vision_encoder_fn=self.get_vision_features,
-                )
-                if hit:
-                    cached_entries[b] = cached_data
-                    hit_indices.append(b)
-                    hit_steps.append(step_b)
-                else:
-                    miss_indices.append(b)
-                    miss_steps.append(step_b)
-            print(
-                "[FeatureCache][QUERY_RESULT][GR00T] "
-                f"batch_size={batch_size} hit_count={len(hit_indices)} miss_count={len(miss_indices)} "
-                f"hit_steps_preview={hit_steps[:8]} miss_steps_preview={miss_steps[:8]}",
-                flush=True,
-            )
-        elif cache_enabled:
-            miss_indices = list(range(batch_size))
-            if step_indices is not None and step_indices.shape[0] == batch_size:
-                miss_steps = [int(step_indices[i].item()) for i in miss_indices]
-            print(
-                "[FeatureCache][QUERY_RESULT][GR00T] "
-                f"batch_size={batch_size} hit_count=0 miss_count={len(miss_indices)} "
-                f"reason=seed_or_step_missing_or_shape_mismatch "
-                f"miss_steps_preview={miss_steps[:8]}",
-                flush=True,
-            )
-        else:
-            miss_indices = list(range(batch_size))
-
-        final_vl_embs: list[torch.Tensor | None] = [None] * batch_size
-        for b in hit_indices:
-            assert cached_entries[b] is not None
-            final_vl_embs[b] = cached_entries[b]["vl_embs"]
-
-        if miss_indices:
-            miss_index_tensor = torch.as_tensor(
-                miss_indices, dtype=torch.int64, device=normalized_input["state"].device
-            )
-            miss_normalized_input: dict[str, Any] = {}
-            for key, value in normalized_input.items():
-                if key in ["eagle_pixel_values", "eagle_image_sizes"]:
-                    value_reshaped = value.reshape(batch_size, self.image_nums, *value.shape[1:])
-                    miss_normalized_input[key] = value_reshaped.index_select(
-                        0, miss_index_tensor
-                    ).reshape(-1, *value.shape[1:])
-                elif torch.is_tensor(value):
-                    miss_normalized_input[key] = value.index_select(0, miss_index_tensor)
-                else:
-                    miss_normalized_input[key] = value
-
-            miss_backbone_inputs, _ = self.prepare_input(miss_normalized_input)
-            miss_backbone_outputs = self.backbone(miss_backbone_inputs)
-            miss_vl_embs = miss_backbone_outputs.backbone_features
-            for miss_slot, b in enumerate(miss_indices):
-                vl_emb = miss_vl_embs[miss_slot : miss_slot + 1]
-                final_vl_embs[b] = vl_emb
-                if (
-                    cache_enabled
-                    and env_seeds is not None
-                    and step_indices is not None
-                    and env_seeds.shape[0] == batch_size
-                    and step_indices.shape[0] == batch_size
-                ):
-                    self.feature_cache.put(
-                        seed=int(env_seeds[b].item()),
-                        step=int(step_indices[b].item()),
-                        features={"vl_embs": vl_emb},
-                        obs=_slice_obs_one_sample(current_obs, b, batch_size),
-                    )
-            print(
-                "[FeatureCache][PUT_OK][GR00T] "
-                f"saved_entries={len(miss_indices)} "
-                f"miss_steps_preview={miss_steps[:8]}",
-                flush=True,
-            )
-        vl_embs = torch.cat([v for v in final_vl_embs if v is not None], dim=0)
-        backbone_outputs = BatchFeature({"backbone_features": vl_embs})
+        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+        backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs, rlinf_outputs = self.action_head.get_rl_action(
             backbone_outputs, action_inputs, mode=mode
         )
@@ -814,10 +684,6 @@ class GR00T_N1_5_ForRLActionPrediction(GR00T_N1_5, BasePolicy):
         }
 
         return actions, result
-
-    def get_vision_features(self, obs: dict) -> torch.Tensor | None:
-        # GR00T fallback: if backbone has no public vision-only API, let cache fall back.
-        return None
 
     def _get_action_from_normalized_input(
         self, normalized_input: dict[str, Any]

@@ -27,7 +27,6 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.models.embodiment.feature_cache import FeatureCache, FeatureCacheConfig
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
@@ -84,21 +83,12 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
-        self._step_counter_by_seed: dict[int, int] = {}
-        self._warned_missing_env_seeds = False
-        self._rollout_seed_update_interval = int(
-            self.cfg.env.train.get("rollout_seed_update_interval_global_steps", 0)
-        )
-        self._rollout_seed_group: int | None = None
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
-            rollout_model_config.feature_cache = self.cfg.algorithm.get(
-                "feature_cache", None
-            )
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
@@ -122,49 +112,6 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model.eval()
         if self.expert_model is not None:
             self.expert_model.eval()
-
-        feature_cache_cfg = self.cfg.algorithm.get("feature_cache", None)
-        if feature_cache_cfg is not None:
-            invalidate_on_weight_update = feature_cache_cfg.get(
-                "invalidate_on_weight_update", None
-            )
-            if invalidate_on_weight_update is None:
-                invalidate_on_weight_update = not self.cfg.actor.model.get(
-                    "freeze_backbone", False
-                )
-            cache_config = FeatureCacheConfig(
-                enabled=feature_cache_cfg.get("enabled", False),
-                mode=feature_cache_cfg.get("mode", "disabled"),
-                similarity_metric=feature_cache_cfg.get(
-                    "similarity_metric", "obs_ssim"
-                ),
-                similarity_threshold=feature_cache_cfg.get(
-                    "similarity_threshold", 0.90
-                ),
-                invalidate_on_weight_update=invalidate_on_weight_update,
-                max_cache_seeds=feature_cache_cfg.get("max_cache_seeds", -1),
-                max_entries=feature_cache_cfg.get("max_entries", 256),
-                debug_log=feature_cache_cfg.get("debug_log", False),
-                debug_log_max_events=feature_cache_cfg.get(
-                    "debug_log_max_events", 1000
-                ),
-            )
-            self.hf_model.feature_cache = FeatureCache(cache_config)
-            print(
-                "[FeatureCache][CONFIG] "
-                f"enabled={cache_config.enabled} "
-                f"mode={cache_config.mode} "
-                f"similarity_metric={cache_config.similarity_metric} "
-                f"similarity_threshold={cache_config.similarity_threshold} "
-                f"invalidate_on_weight_update={cache_config.invalidate_on_weight_update} "
-                f"max_cache_seeds={cache_config.max_cache_seeds} "
-                f"max_entries={cache_config.max_entries} "
-                f"debug_log={cache_config.debug_log} "
-                f"debug_log_max_events={cache_config.debug_log_max_events}"
-            , flush=True)
-        else:
-            self.hf_model.feature_cache = None
-            print("[FeatureCache][CONFIG] feature_cache_cfg_missing=True", flush=True)
 
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
@@ -293,11 +240,7 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("predict")
     def predict(
-        self,
-        env_obs: dict[str, Any],
-        mode: Literal["train", "eval"] = "train",
-        env_seeds: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
+        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         kwargs = (
             self._train_sampling_params
@@ -339,17 +282,12 @@ class MultiStepRolloutWorker(Worker):
             if use_expert:
                 actions, result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
-                    env_seeds=env_seeds,
-                    step_indices=step_indices,
                     **kwargs,
                 )
                 expert_label_flag = True
             else:
-                print("Using HF model for action prediction.")
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
-                    env_seeds=env_seeds,
-                    step_indices=step_indices,
                     **kwargs,
                 )
 
@@ -362,8 +300,6 @@ class MultiStepRolloutWorker(Worker):
             ):
                 _, expert_result = self.expert_model.predict_action_batch(
                     env_obs=env_obs,
-                    env_seeds=env_seeds,
-                    step_indices=step_indices,
                     **kwargs,
                 )
                 expert_forward_inputs = expert_result["forward_inputs"]
@@ -406,43 +342,10 @@ class MultiStepRolloutWorker(Worker):
             options=self._sync_weight_comm_options,
         ).async_wait()
         self.hf_model.load_state_dict(param_state_dict)
-        feature_cache = getattr(self.hf_model, "feature_cache", None)
-        if (
-            feature_cache is not None
-            and feature_cache.config.invalidate_on_weight_update
-        ):
-            feature_cache.invalidate_all()
 
         del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()
-
-    def _build_step_indices(self, env_seeds: torch.Tensor | None) -> torch.Tensor | None:
-        if env_seeds is None:
-            return None
-        step_indices = []
-        for seed in env_seeds.tolist():
-            step_indices.append(self._step_counter_by_seed.get(int(seed), 0))
-        return torch.as_tensor(step_indices, dtype=torch.int64)
-
-    def _advance_step_indices(self, env_seeds: torch.Tensor | None) -> None:
-        if env_seeds is None:
-            return
-        for seed in env_seeds.tolist():
-            seed_int = int(seed)
-            self._step_counter_by_seed[seed_int] = (
-                self._step_counter_by_seed.get(seed_int, 0) + 1
-            )
-
-    def _reset_done_step_indices(
-        self, env_seeds: torch.Tensor | None, dones: torch.Tensor | None
-    ) -> None:
-        if env_seeds is None or dones is None:
-            return
-        done_mask = dones[:, -1] if dones.dim() > 1 else dones
-        for seed, done in zip(env_seeds.tolist(), done_mask.tolist()):
-            if bool(done):
-                self._step_counter_by_seed[int(seed)] = 0
 
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
@@ -450,43 +353,7 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                env_seeds = env_output.get("env_seeds")
-                if (
-                    not self._warned_missing_env_seeds
-                    and getattr(self.hf_model, "feature_cache", None) is not None
-                    and self.hf_model.feature_cache.config.enabled
-                    and env_seeds is None
-                ):
-                    print(
-                        "Feature cache enabled but env_seeds are missing from env output; "
-                        "cache keys cannot be aligned across steps."
-                    , flush=True)
-                    self._warned_missing_env_seeds = True
-                self._reset_done_step_indices(env_seeds, env_output.get("dones"))
-                step_indices = self._build_step_indices(env_seeds)
-                feature_cache = getattr(self.hf_model, "feature_cache", None)
-                if (
-                    feature_cache is not None
-                    and feature_cache.config.enabled
-                    and env_seeds is not None
-                    and step_indices is not None
-                ):
-                    seeds_preview = env_seeds.tolist()[:8]
-                    steps_preview = step_indices.tolist()[:8]
-                    print(
-                        "[FeatureCache][QUERY_ATTEMPT] "
-                        f"global_step={self.version} "
-                        f"batch={env_seeds.shape[0]} "
-                        f"seeds_preview={seeds_preview} "
-                        f"steps_preview={steps_preview}",
-                        flush=True,
-                    )
-                actions, result = self.predict(
-                    env_output["obs"],
-                    env_seeds=env_seeds,
-                    step_indices=step_indices,
-                )
-                self._advance_step_indices(env_seeds)
+                actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -518,43 +385,7 @@ class MultiStepRolloutWorker(Worker):
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
-            env_seeds = env_output.get("env_seeds")
-            if (
-                not self._warned_missing_env_seeds
-                and getattr(self.hf_model, "feature_cache", None) is not None
-                and self.hf_model.feature_cache.config.enabled
-                and env_seeds is None
-            ):
-                print(
-                    "Feature cache enabled but env_seeds are missing from env output; "
-                    "cache keys cannot be aligned across steps."
-                , flush=True)
-                self._warned_missing_env_seeds = True
-            self._reset_done_step_indices(env_seeds, env_output.get("dones"))
-            step_indices = self._build_step_indices(env_seeds)
-            feature_cache = getattr(self.hf_model, "feature_cache", None)
-            if (
-                feature_cache is not None
-                and feature_cache.config.enabled
-                and env_seeds is not None
-                and step_indices is not None
-            ):
-                seeds_preview = env_seeds.tolist()[:8]
-                steps_preview = step_indices.tolist()[:8]
-                print(
-                    "[FeatureCache][QUERY_ATTEMPT] "
-                    f"global_step={self.version} "
-                    f"batch={env_seeds.shape[0]} "
-                    f"seeds_preview={seeds_preview} "
-                    f"steps_preview={steps_preview}",
-                    flush=True,
-                )
-            actions, result = self.predict(
-                env_output["obs"],
-                env_seeds=env_seeds,
-                step_indices=step_indices,
-            )
-            self._advance_step_indices(env_seeds)
+            actions, result = self.predict(env_output["obs"])
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -573,99 +404,15 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        feature_cache = getattr(self.hf_model, "feature_cache", None)
-        cache_enabled = bool(
-            feature_cache is not None and feature_cache.config.enabled
-        )
-        if cache_enabled and feature_cache.config.mode == "cross_global_same_step":
-            # Enforce per-generate step alignment (step0, step1, ...) across global steps.
-            self._step_counter_by_seed.clear()
-            print(
-                "[FeatureCache][STEP_ALIGN] reset step_counter_by_seed at generate start "
-                "for mode=cross_global_same_step",
-                flush=True,
-            )
-        aggregate_cache_metrics = {
-            "feature_cache/hits": 0.0,
-            "feature_cache/same_step_hits": 0.0,
-            "feature_cache/misses": 0.0,
-            "feature_cache/invalidations": 0.0,
-            "feature_cache/cached_seeds": 0.0,
-            "feature_cache/cached_entries": 0.0,
-            "feature_cache/enabled": 1.0 if cache_enabled else 0.0,
-        }
         for _ in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
             await self.generate_one_epoch(input_channel, output_channel)
-            cache_metrics = self._collect_feature_cache_metrics(log_to_stdout=True)
-            if cache_metrics:
-                aggregate_cache_metrics["feature_cache/hits"] += cache_metrics[
-                    "feature_cache/hits"
-                ]
-                aggregate_cache_metrics["feature_cache/same_step_hits"] += cache_metrics[
-                    "feature_cache/same_step_hits"
-                ]
-                aggregate_cache_metrics["feature_cache/misses"] += cache_metrics[
-                    "feature_cache/misses"
-                ]
-                aggregate_cache_metrics["feature_cache/invalidations"] += cache_metrics[
-                    "feature_cache/invalidations"
-                ]
-                aggregate_cache_metrics["feature_cache/cached_seeds"] = cache_metrics[
-                    "feature_cache/cached_seeds"
-                ]
-                aggregate_cache_metrics["feature_cache/cached_entries"] = cache_metrics[
-                    "feature_cache/cached_entries"
-                ]
 
         if self.enable_offload:
             self.offload_model()
-
-        total = (
-            aggregate_cache_metrics["feature_cache/hits"]
-            + aggregate_cache_metrics["feature_cache/misses"]
-        )
-        aggregate_cache_metrics["feature_cache/hit_rate"] = (
-            100.0 * aggregate_cache_metrics["feature_cache/hits"] / total
-            if total > 0
-            else 0.0
-        )
-        if (
-            not cache_enabled
-            and total == 0
-            and aggregate_cache_metrics["feature_cache/invalidations"] == 0
-        ):
-            return {}
-        return aggregate_cache_metrics
-
-    def _collect_feature_cache_metrics(self, log_to_stdout: bool = False) -> dict[str, float]:
-        feature_cache = getattr(self.hf_model, "feature_cache", None)
-        if feature_cache is None:
-            return {}
-        stats = feature_cache.get_stats()
-        total = stats.hits + stats.misses
-        hit_rate = (100.0 * stats.hits / total) if total > 0 else 0.0
-        if log_to_stdout:
-            print(
-                f"[FeatureCache] hits={stats.hits} same_step_hits={stats.same_step_hits} "
-                f"misses={stats.misses} "
-                f"invalidations={stats.invalidations} hit_rate={hit_rate:.2f}% "
-                f"cached_seeds={feature_cache.num_cached_seeds()} "
-                f"cached_entries={feature_cache.num_cached_entries()}"
-            , flush=True)
-        feature_cache.reset_stats()
-        return {
-            "feature_cache/hits": float(stats.hits),
-            "feature_cache/same_step_hits": float(stats.same_step_hits),
-            "feature_cache/misses": float(stats.misses),
-            "feature_cache/invalidations": float(stats.invalidations),
-            "feature_cache/hit_rate": float(hit_rate),
-            "feature_cache/cached_seeds": float(feature_cache.num_cached_seeds()),
-            "feature_cache/cached_entries": float(feature_cache.num_cached_entries()),
-        }
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
@@ -795,20 +542,8 @@ class MultiStepRolloutWorker(Worker):
                 for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
-        merged_env_seeds = None
-        env_seeds_list = [obs_batch.get("env_seeds", None) for obs_batch in obs_batches]
-        if all(seeds is not None for seeds in env_seeds_list):
-            merged_env_seeds = torch.cat(env_seeds_list, dim=0)  # type: ignore[arg-type]
-        merged_dones = None
-        dones_list = [obs_batch.get("dones", None) for obs_batch in obs_batches]
-        if all(dones is not None for dones in dones_list):
-            merged_dones = torch.cat(dones_list, dim=0)  # type: ignore[arg-type]
-        return {
-            "obs": merged_obs,
-            "final_obs": merged_final_obs,
-            "dones": merged_dones,
-            "env_seeds": merged_env_seeds,
-        }
+
+        return {"obs": merged_obs, "final_obs": merged_final_obs}
 
     def send_chunk_actions(
         self,
@@ -906,29 +641,6 @@ class MultiStepRolloutWorker(Worker):
 
     def set_global_step(self, global_step: int):
         self.version = global_step
-        print(
-            f"[FeatureCache][GLOBAL_STEP] rollout_worker_rank={self._rank} set_global_step={global_step}",
-            flush=True,
-        )
-        if (
-            self.cfg.env.train.get("use_fixed_rollout_seeds", False)
-            and self._rollout_seed_update_interval > 0
-        ):
-            new_seed_group = global_step // self._rollout_seed_update_interval
-            if self._rollout_seed_group is None:
-                self._rollout_seed_group = new_seed_group
-            elif new_seed_group != self._rollout_seed_group:
-                self._rollout_seed_group = new_seed_group
-                self._step_counter_by_seed.clear()
-                feature_cache = getattr(self.hf_model, "feature_cache", None)
-                if feature_cache is not None and feature_cache.config.enabled:
-                    feature_cache.invalidate_all()
-                    print(
-                        "[FeatureCache][ENV_SEED_ROTATE_INVALIDATE] "
-                        f"rollout_worker_rank={self._rank} global_step={global_step} "
-                        f"seed_group={new_seed_group} cache_cleared=True",
-                        flush=True,
-                    )
         if self.finished_episodes is None:
             self.finished_episodes = (
                 self.version * self.total_num_train_envs * self.rollout_epoch

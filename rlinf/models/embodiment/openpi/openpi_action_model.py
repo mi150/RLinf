@@ -26,11 +26,6 @@ from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 
-try:
-    from transformers.cache_utils import DynamicCache
-except Exception:
-    DynamicCache = None
-
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
@@ -136,7 +131,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
-        self.feature_cache = None
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -519,9 +513,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 noise=noise_actions,
                 mode="eval",
                 compute_values=compute_values,
-                env_seeds=kwargs.get("env_seeds", None),
-                step_indices=kwargs.get("step_indices", None),
-                current_obs=env_obs,
             )
 
             # Step 3: Extract actual actions for environment interaction
@@ -538,12 +529,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
-                observation,
-                mode=mode,
-                compute_values=compute_values,
-                env_seeds=kwargs.get("env_seeds", None),
-                step_indices=kwargs.get("step_indices", None),
-                current_obs=env_obs,
+                observation, mode=mode, compute_values=compute_values
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -588,9 +574,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
-        env_seeds: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
-        current_obs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -607,111 +590,22 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self._preprocess_observation(observation, train=False)
         )
 
-        cache_enabled = (
-            self.feature_cache is not None and self.feature_cache.config.enabled
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
         )
-        backbone_device = state.device
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # --- Per-sample cache lookup ---
-        cached_entries: list[dict[str, Any] | None] = [None] * bsize
-        hit_indices: list[int] = []
-        miss_indices: list[int] = []
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        def _slice_obs_one_sample(
-            obs: dict[str, Any] | None, idx: int, total: int
-        ) -> dict[str, Any] | None:
-            if obs is None:
-                return None
-            obs_b: dict[str, Any] = {}
-            for key, value in obs.items():
-                if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == total:
-                    obs_b[key] = value[idx : idx + 1]
-                elif isinstance(value, (list, tuple)) and len(value) == total:
-                    obs_b[key] = value[idx : idx + 1]
-                else:
-                    obs_b[key] = value
-            return obs_b
-
-        if cache_enabled and env_seeds is not None and step_indices is not None:
-            for b in range(bsize):
-                current_obs_b = _slice_obs_one_sample(current_obs, b, bsize)
-                cached_data, hit = self.feature_cache.get(
-                    seed=int(env_seeds[b].item()),
-                    step=int(step_indices[b].item()),
-                    current_obs=current_obs_b,
-                    target_device=backbone_device,
-                    vision_encoder_fn=self.get_vision_features,
-                )
-                if hit:
-                    cached_entries[b] = cached_data
-                    hit_indices.append(b)
-                else:
-                    miss_indices.append(b)
-        else:
-            miss_indices = list(range(bsize))
-
-        if cache_enabled:
-            print(
-                f"[FeatureCache][QUERY_RESULT][OpenPI] "
-                f"batch_size={bsize} hit_count={len(hit_indices)} miss_count={len(miss_indices)}",
-                flush=True,
-            )
-
-        # --- Compute prefix for misses ---
-        if miss_indices:
-            if len(miss_indices) == bsize:
-                miss_images = images
-                miss_img_masks = img_masks
-                miss_lang_tokens = lang_tokens
-                miss_lang_masks = lang_masks
-            else:
-                miss_idx_t = torch.as_tensor(miss_indices, device=device, dtype=torch.int64)
-                miss_images = [img.index_select(0, miss_idx_t) for img in images]
-                miss_img_masks = [m.index_select(0, miss_idx_t) for m in img_masks]
-                miss_lang_tokens = lang_tokens.index_select(0, miss_idx_t)
-                miss_lang_masks = lang_masks.index_select(0, miss_idx_t)
-
-            miss_prefix_embs, miss_prefix_pad_masks, miss_prefix_att_masks = self.embed_prefix(
-                miss_images, miss_img_masks, miss_lang_tokens, miss_lang_masks
-            )
-            miss_prefix_att_2d_masks = make_att_2d_masks(miss_prefix_pad_masks, miss_prefix_att_masks)
-            miss_prefix_position_ids = torch.cumsum(miss_prefix_pad_masks, dim=1) - 1
-            miss_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(miss_prefix_att_2d_masks)
-            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-            (miss_prefix_output, _), miss_past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=miss_prefix_att_2d_masks_4d,
-                position_ids=miss_prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[miss_prefix_embs, None],
-                use_cache=True,
-            )
-
-            # Store per-sample results and populate cache
-            for miss_slot, b in enumerate(miss_indices):
-                entry_kv = self._slice_kv_cache(miss_past_key_values, miss_slot)
-                entry_data = {
-                    "past_key_values": entry_kv,
-                    "prefix_output": miss_prefix_output[miss_slot : miss_slot + 1],
-                    "prefix_pad_masks": miss_prefix_pad_masks[miss_slot : miss_slot + 1],
-                }
-                cached_entries[b] = entry_data
-                if cache_enabled and env_seeds is not None and step_indices is not None:
-                    self.feature_cache.put(
-                        seed=int(env_seeds[b].item()),
-                        step=int(step_indices[b].item()),
-                        features=entry_data,
-                        obs=_slice_obs_one_sample(current_obs, b, bsize),
-                    )
-
-        # --- Reassemble full batch from hits + misses ---
-        all_kv_caches = [cached_entries[b]["past_key_values"] for b in range(bsize)]
-        past_key_values = self._reassemble_kv_cache(all_kv_caches)
-        prefix_output = torch.cat(
-            [cached_entries[b]["prefix_output"] for b in range(bsize)], dim=0
-        )
-        prefix_pad_masks = torch.cat(
-            [cached_entries[b]["prefix_pad_masks"] for b in range(bsize)], dim=0
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
         )
 
         x_t = noise
@@ -798,59 +692,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
-
-    @staticmethod
-    def _slice_kv_cache(
-        kv_cache: tuple[tuple[torch.Tensor, ...], ...], batch_idx: int
-    ) -> tuple[tuple[torch.Tensor, ...], ...]:
-        return tuple(
-            tuple(kv[batch_idx : batch_idx + 1] for kv in layer) for layer in kv_cache
-        )
-
-    @staticmethod
-    def _normalize_kv_cache_for_transformers(past_key_values):
-        """Convert legacy tuple KV cache to modern Transformers cache when needed."""
-        if past_key_values is None:
-            return None
-        if hasattr(past_key_values, "get_seq_length"):
-            return past_key_values
-        if isinstance(past_key_values, tuple) and DynamicCache is not None:
-            try:
-                return DynamicCache.from_legacy_cache(past_key_values)
-            except Exception:
-                return past_key_values
-        return past_key_values
-
-    @staticmethod
-    def _reassemble_kv_cache(
-        kv_caches: list[tuple[tuple[torch.Tensor, ...], ...]],
-    ) -> tuple[tuple[torch.Tensor, ...], ...]:
-        if not kv_caches:
-            return ()
-        n_layers = len(kv_caches[0])
-        return tuple(
-            tuple(
-                torch.cat([kv_cache[layer_idx][kv_idx] for kv_cache in kv_caches], dim=0)
-                for kv_idx in range(len(kv_caches[0][layer_idx]))
-            )
-            for layer_idx in range(n_layers)
-        )
-
-    def get_vision_features(self, obs: dict) -> torch.Tensor | None:
-        try:
-            to_process_obs = self.obs_processor(obs)
-            processed_obs = self.input_transform(to_process_obs, transpose=False)
-            processed_obs = self.precision_processor(processed_obs)
-            observation = _model.Observation.from_dict(processed_obs)
-            images, img_masks, _, _, _ = self._preprocess_observation(
-                observation, train=False
-            )
-            image_embs = self.paligemma_with_expert.paligemma.vision_tower(
-                pixel_values=images, pixel_attention_mask=img_masks
-            )
-            return image_embs
-        except Exception:
-            return None
 
     def sample_mean_var_val(
         self,
@@ -990,7 +831,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = (
             "eager"  # noqa: SLF001
         )
-        past_key_values = self._normalize_kv_cache_for_transformers(past_key_values)
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
