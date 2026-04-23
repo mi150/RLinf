@@ -11,6 +11,7 @@ from typing import Any, Callable, Literal, Protocol
 import torch
 
 from toolkits.rollout_eval.benchmark.metrics import aggregate_case_metrics
+from toolkits.rollout_eval.benchmark.resource_binding import apply_cpu_affinity
 from toolkits.rollout_eval.benchmark.types import CaseMetrics
 
 
@@ -42,6 +43,7 @@ class PipelineRunnerConfig:
     join_timeout_s: float = 3.0
     run_timeout_s: float | None = None
     start_method: Literal["spawn", "fork", "forkserver"] = "spawn"
+    sim_cpu_affinity: tuple[int, ...] | None = None
 
 
 def _validate_config(config: PipelineRunnerConfig) -> None:
@@ -69,8 +71,11 @@ def _sim_worker_main(
     result_queue: mp.Queue,
     stop_event: mp.Event,
     queue_timeout_s: float,
+    cpu_affinity: tuple[int, ...] | None = None,
 ) -> None:
     try:
+        if cpu_affinity:
+            apply_cpu_affinity(cpu_affinity)
         sim = sim_factory()
         observation = sim.reset()
 
@@ -250,6 +255,7 @@ def run_dual_process_pipeline(
             "result_queue": result_queue,
             "stop_event": stop_event,
             "queue_timeout_s": config.queue_timeout_s,
+            "cpu_affinity": config.sim_cpu_affinity,
         },
         name="rollout_eval_sim_worker",
     )

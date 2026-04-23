@@ -5,9 +5,11 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
+import traceback
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
+from queue import Empty
 from typing import Callable
 
 from hydra import compose, initialize_config_dir
@@ -23,7 +25,13 @@ from toolkits.rollout_eval.benchmark.reporting import (
     write_case_report,
     write_summary_reports,
 )
-from toolkits.rollout_eval.benchmark.resource_binding import build_process_env
+from toolkits.rollout_eval.benchmark.resource_binding import (
+    apply_cpu_affinity,
+    build_even_split_cpu_groups,
+    build_process_env,
+    effective_process_affinity,
+    load_cpu_groups_from_yaml,
+)
 from toolkits.rollout_eval.benchmark.scenarios import expand_cases
 from toolkits.rollout_eval.benchmark.single_runner import (
     run_env_only_case,
@@ -39,6 +47,49 @@ from toolkits.rollout_eval.benchmark.types import (
 
 class SkipCase(RuntimeError):
     """Raised when a benchmark case should be marked skipped."""
+
+
+def _resolve_cpu_groups(
+    request: BenchmarkRequest,
+    case: BenchmarkCase,
+    env_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    if case.scenario not in {"env_only_cpu_core", "concurrent_cpu_core"}:
+        return ()
+    if case.cpu_binding_mode == "none":
+        return ()
+    if case.cpu_env_core_groups:
+        return case.cpu_env_core_groups
+    if request.cpu_bind_config:
+        return load_cpu_groups_from_yaml(request.cpu_bind_config, env_count)
+    if not case.cpu_available_cores:
+        raise SkipCase("cpu_core scenario requires --cpu-bind-cores or --cpu-bind-config")
+    return build_even_split_cpu_groups(case.cpu_available_cores, env_count)
+
+
+def _prepare_case_cpu_groups(
+    request: BenchmarkRequest,
+    case: BenchmarkCase,
+) -> BenchmarkCase:
+    if case.scenario not in {"env_only_cpu_core", "concurrent_cpu_core"}:
+        return case
+    if case.cpu_binding_mode == "none":
+        return case
+    if case.cpu_env_core_groups:
+        return case
+
+    cfg = _load_cfg_for_case(request, case)
+    cpu_groups = _resolve_cpu_groups(request, case, int(cfg.env.eval.total_num_envs))
+    return replace(case, cpu_env_core_groups=cpu_groups)
+
+
+def _ensure_cpu_affinity_supported(case: BenchmarkCase) -> None:
+    if (
+        case.scenario.endswith("_cpu_core")
+        and case.cpu_binding_mode != "none"
+        and not hasattr(os, "sched_setaffinity")
+    ):
+        raise SkipCase("CPU affinity is unavailable on this platform")
 
 
 def _load_cfg_for_case(request: BenchmarkRequest, case: BenchmarkCase):
@@ -139,7 +190,9 @@ def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics
     if case.scenario not in {
         "concurrent_mps",
         "concurrent_mig",
+        "concurrent_cpu_core",
         "env_only_mps",
+        "env_only_cpu_core",
         "model_only_mps",
         "env_only_mig",
         "model_only_mig",
@@ -147,10 +200,16 @@ def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics
         raise SkipCase(f"Unsupported scenario: {case.scenario}")
 
     case_env_updates = _build_case_env(case)
+    _ensure_cpu_affinity_supported(case)
 
     with _temporary_environ(case_env_updates):
         if case.scenario.startswith("env_only_"):
             cfg = _load_cfg_for_case(request, case)
+            cpu_groups = _resolve_cpu_groups(
+                request, case, int(cfg.env.eval.total_num_envs)
+            )
+            if case.scenario == "env_only_cpu_core" and cpu_groups:
+                apply_cpu_affinity(effective_process_affinity(cpu_groups))
             env_adapter = build_env_adapter(cfg, split="eval", profile_output_dir=None)
             action_dim_override = None
             try:
@@ -177,15 +236,28 @@ def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics
 
         if case.scenario.startswith("concurrent_"):
             start_method = "fork" if os.name != "nt" else "spawn"
+            cfg = None
+            sim_cpu_affinity = None
+            if case.scenario == "concurrent_cpu_core":
+                cfg = _load_cfg_for_case(request, case)
+                cpu_groups = _resolve_cpu_groups(
+                    request, case, int(cfg.env.eval.total_num_envs)
+                )
+                if cpu_groups:
+                    sim_cpu_affinity = effective_process_affinity(cpu_groups)
 
             def _sim_factory():
-                cfg = _load_cfg_for_case(request, case)
-                env_adapter = build_env_adapter(cfg, split="eval", profile_output_dir=None)
+                local_cfg = cfg or _load_cfg_for_case(request, case)
+                env_adapter = build_env_adapter(
+                    local_cfg, split="eval", profile_output_dir=None
+                )
                 return _PipelineSimAdapter(env_adapter)
 
             def _model_factory():
-                cfg = _load_cfg_for_case(request, case)
-                model_adapter = build_model_adapter(cfg, split_model_stages=False)
+                local_cfg = cfg or _load_cfg_for_case(request, case)
+                model_adapter = build_model_adapter(
+                    local_cfg, split_model_stages=False
+                )
                 return _PipelineModelAdapter(model_adapter)
 
             return run_dual_process_pipeline(
@@ -197,6 +269,7 @@ def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics
                     queue_timeout_s=request.pipeline_queue_timeout_s,
                     run_timeout_s=request.pipeline_run_timeout_s,
                     start_method=start_method,
+                    sim_cpu_affinity=sim_cpu_affinity,
                 ),
             )
 
@@ -235,7 +308,17 @@ def _run_case_worker(
     except SkipCase as exc:
         result_queue.put({"status": "skipped", "skip_reason": str(exc)})
     except Exception as exc:  # noqa: BLE001
-        result_queue.put({"status": "failed", "error_message": str(exc)})
+        error_type = type(exc).__name__
+        error_message = str(exc) or repr(exc)
+        result_queue.put(
+            {
+                "status": "failed",
+                "error_message": (
+                    f"{error_type}: {error_message}\n"
+                    f"{traceback.format_exc()}"
+                ),
+            }
+        )
 
 
 def _default_case_timeout_s(request: BenchmarkRequest) -> float:
@@ -267,17 +350,25 @@ def _execute_case_in_subprocess(request: BenchmarkRequest, case: BenchmarkCase) 
 
     try:
         while time.perf_counter() < deadline:
-            if not result_queue.empty():
-                message = result_queue.get_nowait()
+            timeout = min(0.1, max(0.0, deadline - time.perf_counter()))
+            try:
+                message = result_queue.get(timeout=timeout)
                 break
-            if not process.is_alive() and result_queue.empty():
-                break
-            time.sleep(0.05)
+            except Empty:
+                if not process.is_alive():
+                    break
+                continue
     finally:
         process.join(timeout=1.0)
         if process.is_alive():
             process.terminate()
             process.join(timeout=1.0)
+
+    if message is None:
+        try:
+            message = result_queue.get(timeout=0.2)
+        except Empty:
+            message = None
 
     if message is None:
         if process.exitcode not in (0, None):
@@ -304,37 +395,43 @@ def run_benchmark_orchestrator(
     output_dir = Path(request.output_dir)
     case_records: list[dict] = []
 
-    for case in cases:
-        process_env = _build_case_env(case)
+    for raw_case in cases:
+        case = raw_case
+        process_env = _build_case_env(raw_case)
         status = "pass"
         metrics = None
         error_message = None
         skip_reason = None
 
-        if case_executor is None:
-            result = _execute_case_in_subprocess(request, case)
-            status = str(result.get("status", "failed"))
-            if status == "pass":
-                metrics_payload = result.get("metrics")
-                if isinstance(metrics_payload, dict):
-                    metrics = _metrics_from_dict(metrics_payload)
+        try:
+            case = _prepare_case_cpu_groups(request, raw_case)
+            process_env = _build_case_env(case)
+
+            if case_executor is None:
+                result = _execute_case_in_subprocess(request, case)
+                status = str(result.get("status", "failed"))
+                if status == "pass":
+                    metrics_payload = result.get("metrics")
+                    if isinstance(metrics_payload, dict):
+                        metrics = _metrics_from_dict(metrics_payload)
+                    else:
+                        status = "failed"
+                        error_message = "missing metrics payload from case subprocess"
+                elif status == "skipped":
+                    skip_reason = str(result.get("skip_reason", "skipped"))
                 else:
                     status = "failed"
-                    error_message = "missing metrics payload from case subprocess"
-            elif status == "skipped":
-                skip_reason = str(result.get("skip_reason", "skipped"))
+                    error_message = str(
+                        result.get("error_message", "unknown case subprocess error")
+                    )
             else:
-                status = "failed"
-                error_message = str(result.get("error_message", "unknown case subprocess error"))
-        else:
-            try:
                 metrics = executor(request, case)
-            except SkipCase as exc:
-                status = "skipped"
-                skip_reason = str(exc)
-            except Exception as exc:  # noqa: BLE001
-                status = "failed"
-                error_message = str(exc)
+        except SkipCase as exc:
+            status = "skipped"
+            skip_reason = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            status = "failed"
+            error_message = str(exc)
 
         record = write_case_report(
             output_dir=output_dir,

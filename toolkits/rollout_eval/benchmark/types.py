@@ -34,6 +34,10 @@ class BenchmarkRequest:
     num_envs_override: int | None = None
     pipeline_queue_timeout_s: float = 5.0
     pipeline_run_timeout_s: float | None = None
+    cpu_bind_cores: str | None = None
+    cpu_bind_strategy: str | None = None
+    cpu_bind_config: str | None = None
+    cpu_bind_strict: bool = True
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,9 @@ class BenchmarkCase:
     model_type: str
     mps_sm: int | None = None
     mig_device: str | None = None
+    cpu_binding_mode: str | None = None
+    cpu_available_cores: tuple[int, ...] | None = None
+    cpu_env_core_groups: tuple[tuple[int, ...], ...] | None = None
 
 
 @dataclass(frozen=True)

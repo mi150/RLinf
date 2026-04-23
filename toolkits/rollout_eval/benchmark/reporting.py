@@ -19,9 +19,19 @@ def _dump_json(payload: dict, path: Path) -> None:
 
 
 def _resource_binding(case: BenchmarkCase) -> dict[str, object]:
+    cpu_groups = [list(group) for group in case.cpu_env_core_groups] if case.cpu_env_core_groups else None
+    cpu_effective_affinity = (
+        sorted({cpu for group in case.cpu_env_core_groups for cpu in group})
+        if case.cpu_env_core_groups
+        else None
+    )
     return {
         "mps_sm": case.mps_sm,
         "mig_device": case.mig_device,
+        "cpu_binding_mode": case.cpu_binding_mode,
+        "cpu_available_cores": list(case.cpu_available_cores) if case.cpu_available_cores else None,
+        "cpu_env_core_groups": cpu_groups,
+        "cpu_effective_affinity": cpu_effective_affinity,
     }
 
 
@@ -68,6 +78,7 @@ def write_case_report(
             "pipeline_run_timeout_s": request.pipeline_run_timeout_s,
         },
         "process_env": process_env,
+        "resource": _resource_binding(case),
     }
 
     _dump_json(report, case_dir / "case_report.json")
@@ -100,20 +111,24 @@ def write_summary_reports(*, output_dir: Path, case_records: list[dict]) -> dict
         f"- Failed: {counts['failed']}",
         f"- Skipped: {counts['skipped']}",
         "",
-        "| case_id | scenario | status | env_steps/s | infer/s | pipeline/s | infer_gpu_ms(avg) |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "| case_id | scenario | status | env_steps/s | infer/s | pipeline/s | cpu_mode | cpu_cores | infer_gpu_ms(avg) |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |",
     ]
 
     for record in case_records:
         metrics = record.get("metrics") or {}
+        resource = record.get("resource") or {}
+        cpu_cores = len(resource.get("cpu_effective_affinity") or [])
         lines.append(
-            "| {case_id} | {scenario} | {status} | {env:.6f} | {infer:.6f} | {pipe:.6f} | {gpu:.3f} |".format(
+            "| {case_id} | {scenario} | {status} | {env:.6f} | {infer:.6f} | {pipe:.6f} | {cpu_mode} | {cpu_cores} | {gpu:.3f} |".format(
                 case_id=record.get("case_id", ""),
                 scenario=record.get("scenario", ""),
                 status=record.get("status", ""),
                 env=float(metrics.get("env_steps_per_sec", 0.0)),
                 infer=float(metrics.get("model_infers_per_sec", 0.0)),
                 pipe=float(metrics.get("pipeline_samples_per_sec", 0.0)),
+                cpu_mode=resource.get("cpu_binding_mode") or "",
+                cpu_cores=cpu_cores,
                 gpu=float((metrics.get("model_infer_gpu_time_ms") or {}).get("avg_ms", 0.0)),
             )
         )
