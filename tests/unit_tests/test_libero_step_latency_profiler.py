@@ -618,8 +618,8 @@ def test_profile_task_trial_in_subprocess_timeout_terminates_child(
             calls.append(("terminate", None))
             self.exitcode = -15
 
-        def join(self):
-            calls.append(("join", None))
+        def join(self, timeout=None):
+            calls.append(("join", timeout))
 
     class FakeContext:
         Process = FakeProcess
@@ -646,8 +646,82 @@ def test_profile_task_trial_in_subprocess_timeout_terminates_child(
     assert result.error["stage"] == "subprocess_timeout"
     assert "timed out after 0.01s" in result.error["error"]
     assert ("terminate", None) in calls
-    assert ("join", None) in calls
+    assert ("join", 5.0) in calls
     assert ("recv", None) not in calls
+
+
+def test_profile_task_trial_in_subprocess_timeout_kills_stubborn_child(
+    monkeypatch, tmp_path: Path
+):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(bddl_path)
+    calls = []
+
+    class FakeParentConn:
+        def poll(self, timeout):
+            calls.append(("poll", timeout))
+            return False
+
+        def close(self):
+            calls.append(("parent_close", None))
+
+    class FakeChildConn:
+        def close(self):
+            calls.append(("child_close", None))
+
+    class FakeProcess:
+        exitcode = None
+
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+            self.kill_called = False
+
+        def start(self):
+            calls.append(("start", None))
+
+        def terminate(self):
+            calls.append(("terminate", None))
+
+        def join(self, timeout=None):
+            calls.append(("join", timeout))
+
+        def is_alive(self):
+            calls.append(("is_alive", None))
+            return not self.kill_called
+
+        def kill(self):
+            calls.append(("kill", None))
+            self.kill_called = True
+            self.exitcode = -9
+
+    class FakeContext:
+        Process = FakeProcess
+
+        def Pipe(self, duplex=False):
+            calls.append(("pipe", duplex))
+            return FakeParentConn(), FakeChildConn()
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.mp.get_context",
+        lambda method: FakeContext(),
+    )
+
+    result = profile_task_trial_in_subprocess(
+        config=config,
+        spec=spec,
+        init_state=np.zeros(3),
+        timeout_s=0.01,
+    )
+
+    assert result.error["error_type"] == "SubprocessError"
+    assert result.error["stage"] == "subprocess_timeout"
+    assert "cleanup attempted" in result.error["error"]
+    assert ("terminate", None) in calls
+    assert ("kill", None) in calls
+    assert ("join", 5.0) in calls
 
 
 def test_profile_subprocess_entry_sends_factory_errors(monkeypatch, tmp_path: Path):

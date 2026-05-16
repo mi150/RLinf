@@ -49,6 +49,7 @@ RUNTIME_METADATA_KEYS = [
     "ncam",
 ]
 DEFAULT_SUBPROCESS_TIMEOUT_S: float | None = None
+SUBPROCESS_CLEANUP_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -675,6 +676,19 @@ def _profile_subprocess_entry(
         child_conn.close()
 
 
+def _cleanup_timed_out_subprocess(process: Any) -> None:
+    terminate = getattr(process, "terminate", None)
+    if terminate is not None:
+        terminate()
+    process.join(SUBPROCESS_CLEANUP_TIMEOUT_S)
+    is_alive = getattr(process, "is_alive", None)
+    if is_alive is not None and is_alive():
+        kill = getattr(process, "kill", None)
+        if kill is not None:
+            kill()
+            process.join(SUBPROCESS_CLEANUP_TIMEOUT_S)
+
+
 def profile_task_trial_in_subprocess(
     *,
     config: ProfileConfig,
@@ -694,16 +708,16 @@ def profile_task_trial_in_subprocess(
         child_close()
     try:
         if timeout_s is not None and not parent_conn.poll(timeout_s):
-            terminate = getattr(process, "terminate", None)
-            if terminate is not None:
-                terminate()
-            process.join()
+            _cleanup_timed_out_subprocess(process)
             return ProfileResult(
                 events=[],
                 summary=None,
                 error=_error_record(
                     spec=spec,
-                    message=f"profiling subprocess timed out after {timeout_s}s",
+                    message=(
+                        f"profiling subprocess timed out after {timeout_s}s; "
+                        "cleanup attempted"
+                    ),
                     exc_type="SubprocessError",
                     stage="subprocess_timeout",
                 ),
