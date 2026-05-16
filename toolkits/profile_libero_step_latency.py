@@ -48,6 +48,7 @@ RUNTIME_METADATA_KEYS = [
     "nu",
     "ncam",
 ]
+DEFAULT_SUBPROCESS_TIMEOUT_S: float | None = None
 
 
 @dataclass(frozen=True)
@@ -241,7 +242,7 @@ def _to_jsonable(value: Any) -> Any:
         return {str(key): _to_jsonable(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_to_jsonable(item) for item in value]
-    return str(value)
+    return {"__type__": type(value).__name__, "repr": repr(value)}
 
 
 def _jsonable_config(config: ProfileConfig) -> dict[str, Any]:
@@ -679,6 +680,7 @@ def profile_task_trial_in_subprocess(
     config: ProfileConfig,
     spec: TaskTrialSpec,
     init_state: Any,
+    timeout_s: float | None = DEFAULT_SUBPROCESS_TIMEOUT_S,
 ) -> ProfileResult:
     ctx = mp.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
@@ -691,6 +693,21 @@ def profile_task_trial_in_subprocess(
     if child_close is not None:
         child_close()
     try:
+        if timeout_s is not None and not parent_conn.poll(timeout_s):
+            terminate = getattr(process, "terminate", None)
+            if terminate is not None:
+                terminate()
+            process.join()
+            return ProfileResult(
+                events=[],
+                summary=None,
+                error=_error_record(
+                    spec=spec,
+                    message=f"profiling subprocess timed out after {timeout_s}s",
+                    exc_type="SubprocessError",
+                    stage="subprocess_timeout",
+                ),
+            )
         result = parent_conn.recv()
     except EOFError:
         process.join()

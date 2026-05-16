@@ -365,18 +365,32 @@ def test_profile_task_trial_error_includes_stage_and_traceback(tmp_path: Path):
 
 
 def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
+    class CustomValue:
+        def __repr__(self):
+            return "CustomValue(7)"
+
     event_path = tmp_path / "step_latency_events.jsonl"
     append_jsonl(
         event_path,
         [
             {"event": "a", "value": 1, "path": tmp_path},
-            {"event": "b", "value": np.int64(2), "array": np.asarray([1, 2])},
+            {
+                "event": "b",
+                "value": np.int64(2),
+                "array": np.asarray([1, 2]),
+                "custom": CustomValue(),
+            },
         ],
     )
     records = [json.loads(line) for line in event_path.read_text().splitlines()]
     assert records == [
         {"event": "a", "path": str(tmp_path), "value": 1},
-        {"array": [1, 2], "event": "b", "value": 2},
+        {
+            "array": [1, 2],
+            "custom": {"__type__": "CustomValue", "repr": "CustomValue(7)"},
+            "event": "b",
+            "value": 2,
+        },
     ]
 
     summaries = [
@@ -512,7 +526,7 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
     assert "exited with code 9" in result.error["error"]
 
 
-def test_profile_task_trial_in_subprocess_drains_queue_before_join(
+def test_profile_task_trial_in_subprocess_receives_before_join(
     monkeypatch, tmp_path: Path
 ):
     bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
@@ -563,6 +577,77 @@ def test_profile_task_trial_in_subprocess_drains_queue_before_join(
 
     assert result.error is None
     assert calls.index("recv") < calls.index("join")
+
+
+def test_profile_task_trial_in_subprocess_timeout_terminates_child(
+    monkeypatch, tmp_path: Path
+):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(bddl_path)
+    calls = []
+
+    class FakeParentConn:
+        def poll(self, timeout):
+            calls.append(("poll", timeout))
+            return False
+
+        def recv(self):
+            calls.append(("recv", None))
+            raise AssertionError("recv should not be called after timeout")
+
+        def close(self):
+            calls.append(("parent_close", None))
+
+    class FakeChildConn:
+        def close(self):
+            calls.append(("child_close", None))
+
+    class FakeProcess:
+        exitcode = None
+
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            calls.append(("start", None))
+
+        def terminate(self):
+            calls.append(("terminate", None))
+            self.exitcode = -15
+
+        def join(self):
+            calls.append(("join", None))
+
+    class FakeContext:
+        Process = FakeProcess
+
+        def Pipe(self, duplex=False):
+            calls.append(("pipe", duplex))
+            return FakeParentConn(), FakeChildConn()
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.mp.get_context",
+        lambda method: FakeContext(),
+    )
+
+    result = profile_task_trial_in_subprocess(
+        config=config,
+        spec=spec,
+        init_state=np.zeros(3),
+        timeout_s=0.01,
+    )
+
+    assert result.events == []
+    assert result.summary is None
+    assert result.error["error_type"] == "SubprocessError"
+    assert result.error["stage"] == "subprocess_timeout"
+    assert "timed out after 0.01s" in result.error["error"]
+    assert ("terminate", None) in calls
+    assert ("join", None) in calls
+    assert ("recv", None) not in calls
 
 
 def test_profile_subprocess_entry_sends_factory_errors(monkeypatch, tmp_path: Path):
