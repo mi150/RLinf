@@ -7,6 +7,7 @@ import pytest
 
 from toolkits.profile_libero_step_latency import (
     ProfileConfig,
+    ProfileResult,
     TaskTrialSpec,
     append_jsonl,
     compute_latency_summary,
@@ -473,3 +474,68 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
     assert result.summary is None
     assert result.error["error_type"] == "SubprocessError"
     assert "exited with code 9" in result.error["error"]
+
+
+def test_profile_task_trial_in_subprocess_drains_queue_before_join(
+    monkeypatch, tmp_path: Path
+):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(bddl_path)
+    calls = []
+
+    class FakeQueue:
+        def __init__(self, maxsize=1):
+            self.maxsize = maxsize
+
+        def get(self, timeout=None):
+            calls.append(("get", timeout))
+            return ProfileResult(
+                events=[{"event": "libero_step_latency"}],
+                summary={"step_count": 1},
+                error=None,
+            )
+
+        def get_nowait(self):
+            calls.append(("get_nowait", None))
+            return ProfileResult(
+                events=[{"event": "libero_step_latency"}],
+                summary={"step_count": 1},
+                error=None,
+            )
+
+    class FakeProcess:
+        exitcode = 0
+
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            calls.append(("start", None))
+
+        def join(self):
+            calls.append(("join", None))
+
+    class FakeContext:
+        Queue = FakeQueue
+        Process = FakeProcess
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.mp.get_context",
+        lambda method: FakeContext(),
+    )
+
+    result = profile_task_trial_in_subprocess(
+        config=config,
+        spec=spec,
+        init_state=np.zeros(3),
+    )
+
+    drain_indexes = [
+        index for index, (name, _) in enumerate(calls) if name in {"get", "get_nowait"}
+    ]
+    join_index = next(index for index, (name, _) in enumerate(calls) if name == "join")
+    assert result.error is None
+    assert drain_indexes[0] < join_index

@@ -48,6 +48,7 @@ RUNTIME_METADATA_KEYS = [
     "nu",
     "ncam",
 ]
+SUBPROCESS_RESULT_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -653,6 +654,47 @@ def profile_task_trial_in_subprocess(
         args=(queue, config, spec, init_state),
     )
     process.start()
+    try:
+        result = queue.get(timeout=SUBPROCESS_RESULT_TIMEOUT_S)
+    except Exception:
+        is_alive = getattr(process, "is_alive", lambda: False)
+        if is_alive():
+            terminate = getattr(process, "terminate", None)
+            if terminate is not None:
+                terminate()
+            process.join()
+            return ProfileResult(
+                events=[],
+                summary=None,
+                error=_error_record(
+                    spec=spec,
+                    message="profiling subprocess result timed out",
+                    exc_type="SubprocessError",
+                    stage="subprocess_result_timeout",
+                ),
+            )
+        process.join()
+        if process.exitcode != 0:
+            return ProfileResult(
+                events=[],
+                summary=None,
+                error=_error_record(
+                    spec=spec,
+                    message=f"profiling subprocess exited with code {process.exitcode}",
+                    exc_type="SubprocessError",
+                    stage="subprocess_exit",
+                ),
+            )
+        return ProfileResult(
+            events=[],
+            summary=None,
+            error=_error_record(
+                spec=spec,
+                message="profiling subprocess produced no result",
+                exc_type="SubprocessError",
+                stage="subprocess_result",
+            ),
+        )
     process.join()
     if process.exitcode != 0:
         return ProfileResult(
@@ -665,19 +707,7 @@ def profile_task_trial_in_subprocess(
                 stage="subprocess_exit",
             ),
         )
-    try:
-        return queue.get_nowait()
-    except Exception:
-        return ProfileResult(
-            events=[],
-            summary=None,
-            error=_error_record(
-                spec=spec,
-                message="profiling subprocess produced no result",
-                exc_type="SubprocessError",
-                stage="subprocess_result",
-            ),
-        )
+    return result
 
 
 def run_profile(config: ProfileConfig) -> int:
