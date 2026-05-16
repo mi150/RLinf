@@ -215,7 +215,7 @@ def _infer_scene_type(problem_name: str | None, bddl_path: Path) -> str | None:
 
 
 def _infer_scene_name(bddl_path: Path) -> str | None:
-    match = re.match(r"([A-Z]+_SCENE\d+)", bddl_path.stem)
+    match = re.match(r"([A-Z]+(?:_[A-Z]+)*_SCENE\d+)", bddl_path.stem)
     return match.group(1) if match else None
 
 

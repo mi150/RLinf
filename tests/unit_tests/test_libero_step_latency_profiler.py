@@ -60,14 +60,31 @@ def test_parse_bddl_metadata_counts_sections(tmp_path: Path):
     assert metadata["task_language"] == "turn on the stove and put the frying pan on it"
     assert metadata["scene_type"] == "kitchen"
     assert metadata["scene_name"] == "KITCHEN_SCENE3"
+    assert metadata["region_names"] == ["flat_stove_init_region", "cook_region"]
     assert metadata["num_regions"] == 2
     assert metadata["num_fixtures"] == 2
     assert metadata["fixture_categories"] == ["flat_stove", "kitchen_table"]
     assert metadata["num_objects"] == 2
     assert metadata["object_categories"] == ["chefmate_8_frypan", "moka_pot"]
+    assert metadata["obj_of_interest"] == ["chefmate_8_frypan_1", "flat_stove_1"]
     assert metadata["num_obj_of_interest"] == 2
+    assert metadata["init_predicates"] == ["On", "On"]
     assert metadata["num_init_predicates"] == 2
+    assert metadata["goal_predicates"] == ["Turnon", "On"]
     assert metadata["num_goal_predicates"] == 2
+
+
+def test_parse_bddl_metadata_infers_living_room_scene_name(tmp_path: Path):
+    bddl_path = (
+        tmp_path
+        / "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket.bddl"
+    )
+    bddl_path.write_text(SAMPLE_BDDL)
+
+    metadata = parse_bddl_metadata(bddl_path)
+
+    assert metadata["scene_name"] == "LIVING_ROOM_SCENE2"
+    assert metadata["scene_type"] == "living_room"
 
 
 def test_parse_int_list_accepts_all_and_numbers():
