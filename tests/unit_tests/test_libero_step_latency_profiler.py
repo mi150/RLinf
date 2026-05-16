@@ -45,6 +45,17 @@ def test_select_trial_ids_specific_ids_win():
     ) == [5, 1]
 
 
+def test_select_trial_ids_rejects_specific_ids_out_of_range():
+    with pytest.raises(ValueError, match="out of range"):
+        select_trial_ids(
+            num_trials=10,
+            trials_per_task=2,
+            specific_trial_ids=[10],
+            seed=0,
+            task_id=3,
+        )
+
+
 def test_select_trial_ids_deterministic_prefix_when_under_limit():
     assert select_trial_ids(
         num_trials=3,
