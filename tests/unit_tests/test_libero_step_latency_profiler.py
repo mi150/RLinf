@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -7,13 +8,17 @@ import pytest
 from toolkits.profile_libero_step_latency import (
     ProfileConfig,
     TaskTrialSpec,
+    append_jsonl,
     compute_latency_summary,
     parse_bddl_metadata,
     parse_dummy_action,
     parse_int_list,
     parse_task_ids,
     profile_task_trial,
+    profile_task_trial_in_subprocess,
     select_trial_ids,
+    write_run_config,
+    write_summary_files,
 )
 
 SAMPLE_BDDL = """
@@ -355,3 +360,116 @@ def test_profile_task_trial_error_includes_stage_and_traceback(tmp_path: Path):
     assert result.error["error"] == "factory failed"
     assert result.error["stage"] == "env_factory"
     assert "RuntimeError: factory failed" in result.error["traceback"]
+
+
+def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
+    event_path = tmp_path / "step_latency_events.jsonl"
+    append_jsonl(event_path, [{"event": "a", "value": 1}, {"event": "b", "value": 2}])
+    records = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert records == [{"event": "a", "value": 1}, {"event": "b", "value": 2}]
+
+    summaries = [
+        {"suite_name": "libero_90", "task_id": 0, "step_count": 2, "error": None},
+        {"suite_name": "libero_90", "task_id": 1, "step_count": 2, "error": None},
+    ]
+    write_summary_files(tmp_path, summaries)
+    assert (tmp_path / "step_latency_summary.csv").exists()
+    summary_json = json.loads((tmp_path / "step_latency_summary.json").read_text())
+    assert summary_json == summaries
+
+
+def test_write_run_config_serializes_paths(tmp_path: Path):
+    config = ProfileConfig(
+        suite="libero_90",
+        task_ids="all",
+        trials_per_task=1,
+        specific_trial_ids=None,
+        warmup_steps=1,
+        measure_steps=1,
+        cpu_id=0,
+        cpu_ids=None,
+        camera_height=64,
+        camera_width=64,
+        libero_type="standard",
+        seed=0,
+        output_dir=tmp_path,
+        dummy_action=[0.0] * 7,
+        stop_on_done=False,
+    )
+    write_run_config(tmp_path, config)
+    data = json.loads((tmp_path / "run_config.json").read_text())
+    assert data["output_dir"] == str(tmp_path)
+    assert data["suite"] == "libero_90"
+
+
+def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
+    monkeypatch, tmp_path: Path
+):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = ProfileConfig(
+        suite="libero_90",
+        task_ids="0",
+        trials_per_task=1,
+        specific_trial_ids=None,
+        warmup_steps=0,
+        measure_steps=1,
+        cpu_id=None,
+        cpu_ids=None,
+        camera_height=64,
+        camera_width=64,
+        libero_type="standard",
+        seed=11,
+        output_dir=tmp_path,
+        dummy_action=[0.0] * 7,
+        stop_on_done=False,
+    )
+    spec = TaskTrialSpec(
+        suite_name="libero_90",
+        task_id=0,
+        trial_id=1,
+        task_name="KITCHEN_SCENE3_task",
+        task_language="turn on the stove",
+        bddl_file=str(bddl_path),
+        seed=11,
+    )
+
+    class FakeQueue:
+        def __init__(self, maxsize=1):
+            self.maxsize = maxsize
+
+        def get_nowait(self):
+            raise RuntimeError("empty queue")
+
+    class FakeProcess:
+        exitcode = 9
+
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            return None
+
+        def join(self):
+            return None
+
+    class FakeContext:
+        Queue = FakeQueue
+        Process = FakeProcess
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.mp.get_context",
+        lambda method: FakeContext(),
+    )
+
+    result = profile_task_trial_in_subprocess(
+        config=config,
+        spec=spec,
+        init_state=np.zeros(3),
+    )
+
+    assert result.events == []
+    assert result.summary is None
+    assert result.error["error_type"] == "SubprocessError"
+    assert "exited with code 9" in result.error["error"]

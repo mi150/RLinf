@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import csv
+import json
+import multiprocessing as mp
 import os
 import re
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +137,77 @@ def select_trial_ids(
     return [int(item) for item in selected.tolist()]
 
 
+def _configure_libero_type(libero_type: str) -> None:
+    os.environ["LIBERO_TYPE"] = libero_type
+
+
+def _import_libero_modules(libero_type: str) -> tuple[Any, Any, Any]:
+    _configure_libero_type(libero_type)
+    if libero_type == "pro":
+        from liberopro.liberopro import benchmark, get_libero_path
+        from liberopro.liberopro.envs import OffScreenRenderEnv
+    elif libero_type == "plus":
+        from liberoplus.liberoplus import benchmark, get_libero_path
+        from liberoplus.liberoplus.envs import OffScreenRenderEnv
+    else:
+        from libero.libero import benchmark, get_libero_path
+        from libero.libero.envs import OffScreenRenderEnv
+    return benchmark, get_libero_path, OffScreenRenderEnv
+
+
+def _bddl_path_for_task(get_libero_path: Any, task: Any) -> str:
+    return str(
+        Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    )
+
+
+def build_task_trial_specs(
+    config: ProfileConfig,
+) -> tuple[list[TaskTrialSpec], list[Any]]:
+    benchmark, get_libero_path, _ = _import_libero_modules(config.libero_type)
+    bench = benchmark.get_benchmark(config.suite)()
+    task_ids = parse_task_ids(config.task_ids, num_tasks=bench.get_num_tasks())
+    specs: list[TaskTrialSpec] = []
+    init_states: list[Any] = []
+    for task_id in task_ids:
+        task = bench.get_task(task_id)
+        task_init_states = bench.get_task_init_states(task_id)
+        trial_ids = select_trial_ids(
+            num_trials=len(task_init_states),
+            trials_per_task=config.trials_per_task,
+            specific_trial_ids=config.specific_trial_ids,
+            seed=config.seed,
+            task_id=task_id,
+        )
+        for trial_id in trial_ids:
+            specs.append(
+                TaskTrialSpec(
+                    suite_name=config.suite,
+                    task_id=task_id,
+                    trial_id=trial_id,
+                    task_name=Path(task.bddl_file).stem,
+                    task_language=task.language,
+                    bddl_file=_bddl_path_for_task(get_libero_path, task),
+                    seed=config.seed + task_id * 100000 + trial_id,
+                )
+            )
+            init_states.append(task_init_states[trial_id])
+    return specs, init_states
+
+
+def make_libero_env_factory(config: ProfileConfig, spec: TaskTrialSpec) -> Any:
+    _, _, OffScreenRenderEnv = _import_libero_modules(config.libero_type)
+
+    def factory() -> Any:
+        return OffScreenRenderEnv(
+            bddl_file_name=spec.bddl_file,
+            camera_heights=config.camera_height,
+            camera_widths=config.camera_width,
+        )
+
+    return factory
+
+
 def parse_dummy_action(value: str | None) -> list[float]:
     if value is None:
         return list(DEFAULT_DUMMY_ACTION)
@@ -141,6 +215,44 @@ def parse_dummy_action(value: str | None) -> list[float]:
     if not stripped:
         raise ValueError("empty dummy action")
     return [float(part.strip()) for part in stripped.split(",")]
+
+
+def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _jsonable_config(config: ProfileConfig) -> dict[str, Any]:
+    data = asdict(config)
+    data["output_dir"] = str(config.output_dir)
+    return data
+
+
+def write_run_config(output_dir: Path, config: ProfileConfig) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "run_config.json").write_text(
+        json.dumps(_jsonable_config(config), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def write_summary_files(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "step_latency_summary.json"
+    json_path.write_text(
+        json.dumps(summaries, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    csv_path = output_dir / "step_latency_summary.csv"
+    fieldnames = sorted({key for summary in summaries for key in summary})
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for summary in summaries:
+            writer.writerow(summary)
 
 
 def _balanced_section(text: str, section_name: str) -> str:
@@ -511,3 +623,80 @@ def profile_task_trial(
                 env.close()
             except Exception:
                 pass
+
+
+def _profile_subprocess_entry(
+    queue: Any,
+    config: ProfileConfig,
+    spec: TaskTrialSpec,
+    init_state: Any,
+) -> None:
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=make_libero_env_factory(config, spec),
+        init_state=init_state,
+    )
+    queue.put(result)
+
+
+def profile_task_trial_in_subprocess(
+    *,
+    config: ProfileConfig,
+    spec: TaskTrialSpec,
+    init_state: Any,
+) -> ProfileResult:
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_profile_subprocess_entry,
+        args=(queue, config, spec, init_state),
+    )
+    process.start()
+    process.join()
+    if process.exitcode != 0:
+        return ProfileResult(
+            events=[],
+            summary=None,
+            error=_error_record(
+                spec=spec,
+                message=f"profiling subprocess exited with code {process.exitcode}",
+                exc_type="SubprocessError",
+                stage="subprocess_exit",
+            ),
+        )
+    try:
+        return queue.get_nowait()
+    except Exception:
+        return ProfileResult(
+            events=[],
+            summary=None,
+            error=_error_record(
+                spec=spec,
+                message="profiling subprocess produced no result",
+                exc_type="SubprocessError",
+                stage="subprocess_result",
+            ),
+        )
+
+
+def run_profile(config: ProfileConfig) -> int:
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    write_run_config(config.output_dir, config)
+    events_path = config.output_dir / "step_latency_events.jsonl"
+    errors_path = config.output_dir / "errors.jsonl"
+    specs, init_states = build_task_trial_specs(config)
+    summaries: list[dict[str, Any]] = []
+    for spec, init_state in zip(specs, init_states):
+        result = profile_task_trial_in_subprocess(
+            config=config,
+            spec=spec,
+            init_state=init_state,
+        )
+        append_jsonl(events_path, result.events)
+        if result.summary is not None:
+            summaries.append(result.summary)
+        if result.error is not None:
+            append_jsonl(errors_path, [result.error])
+    write_summary_files(config.output_dir, summaries)
+    return 0
