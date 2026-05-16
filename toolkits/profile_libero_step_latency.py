@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,19 @@ BDDL_SCHEMA_KEYS = [
     "num_init_predicates",
     "goal_predicates",
     "num_goal_predicates",
+]
+RUNTIME_METADATA_KEYS = [
+    "camera_names",
+    "camera_heights",
+    "camera_widths",
+    "renderer",
+    "nbody",
+    "ngeom",
+    "njnt",
+    "nq",
+    "nv",
+    "nu",
+    "ncam",
 ]
 
 
@@ -59,6 +74,13 @@ class TaskTrialSpec:
     task_language: str
     bddl_file: str
     seed: int
+
+
+@dataclass
+class ProfileResult:
+    events: list[dict[str, Any]]
+    summary: dict[str, Any] | None
+    error: dict[str, Any] | None
 
 
 def parse_int_list(value: str, *, allow_all: bool = False) -> list[int] | str:
@@ -297,3 +319,168 @@ def compute_latency_summary(latencies: list[float]) -> dict[str, float | int | N
             None if median == 0.0 or p99 is None else float(p99 / median)
         ),
     }
+
+
+def collect_runtime_metadata(env: Any, config: ProfileConfig) -> dict[str, Any]:
+    model = getattr(getattr(env, "sim", None), "model", None)
+    camera_names = getattr(model, "camera_names", None)
+    metadata = {
+        "camera_names": list(camera_names) if camera_names is not None else None,
+        "camera_heights": config.camera_height,
+        "camera_widths": config.camera_width,
+        "renderer": "mujoco",
+        "nbody": getattr(model, "nbody", None),
+        "ngeom": getattr(model, "ngeom", None),
+        "njnt": getattr(model, "njnt", None),
+        "nq": getattr(model, "nq", None),
+        "nv": getattr(model, "nv", None),
+        "nu": getattr(model, "nu", None),
+        "ncam": getattr(model, "ncam", None),
+    }
+    for key in RUNTIME_METADATA_KEYS:
+        metadata.setdefault(key, None)
+    return metadata
+
+
+def _apply_cpu_affinity(cpu_id: int | None) -> bool:
+    if cpu_id is None:
+        return False
+    if not hasattr(os, "sched_setaffinity"):
+        return False
+    try:
+        os.sched_setaffinity(0, {cpu_id})
+    except OSError:
+        return False
+    return True
+
+
+def _step_env(env: Any, action: list[float]) -> tuple[Any, float, bool, dict[str, Any]]:
+    obs, reward, done, info = env.step(np.asarray(action, dtype=np.float32))
+    if info is None:
+        info = {}
+    return obs, float(reward), bool(done), dict(info)
+
+
+def _event_base(
+    *,
+    config: ProfileConfig,
+    spec: TaskTrialSpec,
+    cpu_affinity_applied: bool,
+    bddl_metadata: dict[str, Any],
+    runtime_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    base = {
+        "suite_name": spec.suite_name,
+        "task_id": spec.task_id,
+        "trial_id": spec.trial_id,
+        "task_name": spec.task_name,
+        "task_language": spec.task_language,
+        "cpu_id": config.cpu_id,
+        "pid": os.getpid(),
+        "seed": spec.seed,
+        "cpu_affinity_applied": cpu_affinity_applied,
+        "bddl_file": spec.bddl_file,
+    }
+    base.update(bddl_metadata)
+    base.update(runtime_metadata)
+    base["task_language"] = spec.task_language or bddl_metadata.get("task_language")
+    return base
+
+
+def _error_record(
+    *,
+    spec: TaskTrialSpec,
+    message: str,
+    exc_type: str,
+) -> dict[str, Any]:
+    return {
+        "event": "error",
+        "suite_name": spec.suite_name,
+        "task_id": spec.task_id,
+        "trial_id": spec.trial_id,
+        "task_name": spec.task_name,
+        "task_language": spec.task_language,
+        "bddl_file": spec.bddl_file,
+        "error_type": exc_type,
+        "error": message,
+    }
+
+
+def profile_task_trial(
+    *,
+    config: ProfileConfig,
+    spec: TaskTrialSpec,
+    env_factory: Any,
+    init_state: Any,
+    clock: Any = time.perf_counter,
+) -> ProfileResult:
+    env = None
+    cpu_affinity_applied = _apply_cpu_affinity(config.cpu_id)
+    try:
+        bddl_metadata = parse_bddl_metadata(spec.bddl_file)
+        env = env_factory()
+        if hasattr(env, "seed"):
+            env.seed(spec.seed)
+        env.reset()
+        if init_state is not None and hasattr(env, "set_init_state"):
+            env.set_init_state(init_state)
+        runtime_metadata = collect_runtime_metadata(env, config)
+        for _ in range(config.warmup_steps):
+            _step_env(env, config.dummy_action)
+        base = _event_base(
+            config=config,
+            spec=spec,
+            cpu_affinity_applied=cpu_affinity_applied,
+            bddl_metadata=bddl_metadata,
+            runtime_metadata=runtime_metadata,
+        )
+        events: list[dict[str, Any]] = []
+        latencies: list[float] = []
+        done_seen_step: int | None = None
+        success_seen = False
+        for step_index in range(config.measure_steps):
+            start = clock()
+            _, reward, done, info = _step_env(env, config.dummy_action)
+            end = clock()
+            latency_s = max(float(end - start), 0.0)
+            success = bool(info.get("success", False))
+            if hasattr(env, "check_success"):
+                success = success or bool(env.check_success())
+            if done and done_seen_step is None:
+                done_seen_step = step_index + 1
+            success_seen = success_seen or success
+            latencies.append(latency_s)
+            event = {
+                "event": "libero_step_latency",
+                **base,
+                "step_index": step_index,
+                "latency_s": latency_s,
+                "reward": reward,
+                "done": done,
+                "success": success,
+                "done_seen_step": done_seen_step,
+            }
+            events.append(event)
+            if done and config.stop_on_done:
+                break
+        summary = {
+            **base,
+            **compute_latency_summary(latencies),
+            "done_seen_step": done_seen_step,
+            "success_seen": success_seen,
+            "error": None,
+        }
+        return ProfileResult(events=events, summary=summary, error=None)
+    except Exception as exc:
+        return ProfileResult(
+            events=[],
+            summary=None,
+            error=_error_record(
+                spec=spec,
+                message=str(exc),
+                exc_type=exc.__class__.__name__,
+            ),
+        )
+    finally:
+        if env is not None and hasattr(env, "close"):
+            env.close()

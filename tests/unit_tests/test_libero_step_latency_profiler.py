@@ -5,11 +5,14 @@ import numpy as np
 import pytest
 
 from toolkits.profile_libero_step_latency import (
+    ProfileConfig,
+    TaskTrialSpec,
     compute_latency_summary,
     parse_bddl_metadata,
     parse_dummy_action,
     parse_int_list,
     parse_task_ids,
+    profile_task_trial,
     select_trial_ids,
 )
 
@@ -183,3 +186,95 @@ def test_compute_latency_summary_empty_latency_list():
     assert summary["step_count"] == 0
     assert summary["mean_latency_s"] is None
     assert summary["tail_ratio_p99_to_median"] is None
+
+
+class FakeModel:
+    nbody = 4
+    ngeom = 5
+    njnt = 2
+    nq = 9
+    nv = 8
+    nu = 7
+    ncam = 2
+    camera_names = ["agentview", "robot0_eye_in_hand"]
+
+
+class FakeSim:
+    model = FakeModel()
+
+
+class FakeEnv:
+    def __init__(self):
+        self.sim = FakeSim()
+        self.steps = 0
+        self.closed = False
+
+    def seed(self, seed):
+        self.seed_value = seed
+
+    def reset(self):
+        return {"obs": 1}
+
+    def set_init_state(self, init_state):
+        self.init_state = init_state
+        return {"obs": 2}
+
+    def step(self, action):
+        self.steps += 1
+        done = self.steps >= 3
+        return {"obs": self.steps}, float(done), done, {"success": done}
+
+    def check_success(self):
+        return self.steps >= 3
+
+    def close(self):
+        self.closed = True
+
+
+def test_profile_task_trial_with_mock_env(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = ProfileConfig(
+        suite="libero_90",
+        task_ids="0",
+        trials_per_task=1,
+        specific_trial_ids=None,
+        warmup_steps=1,
+        measure_steps=3,
+        cpu_id=None,
+        cpu_ids=None,
+        camera_height=64,
+        camera_width=64,
+        libero_type="standard",
+        seed=11,
+        output_dir=tmp_path,
+        dummy_action=[0.0] * 7,
+        stop_on_done=False,
+    )
+    spec = TaskTrialSpec(
+        suite_name="libero_90",
+        task_id=0,
+        trial_id=1,
+        task_name="KITCHEN_SCENE3_task",
+        task_language="turn on the stove",
+        bddl_file=str(bddl_path),
+        seed=11,
+    )
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=lambda: 1.0,
+    )
+
+    assert result.error is None
+    assert len(result.events) == 3
+    assert result.events[0]["event"] == "libero_step_latency"
+    assert result.events[0]["suite_name"] == "libero_90"
+    assert result.events[0]["num_objects"] == 2
+    assert result.events[0]["nbody"] == 4
+    assert result.summary["step_count"] == 3
+    assert result.summary["success_seen"] is True
+    assert result.summary["done_seen_step"] == 2
