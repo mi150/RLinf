@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import multiprocessing as mp
 import os
 import re
 import time
 import traceback
 from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +51,7 @@ RUNTIME_METADATA_KEYS = [
     "nu",
     "ncam",
 ]
-DEFAULT_SUBPROCESS_TIMEOUT_S: float | None = None
+DEFAULT_SUBPROCESS_TIMEOUT_S = 1800.0
 SUBPROCESS_CLEANUP_TIMEOUT_S = 5.0
 
 
@@ -70,6 +72,7 @@ class ProfileConfig:
     output_dir: Path
     dummy_action: list[float]
     stop_on_done: bool
+    subprocess_timeout_s: float | None
 
 
 @dataclass(frozen=True)
@@ -220,24 +223,41 @@ def parse_dummy_action(value: str | None) -> list[float]:
     return [float(part.strip()) for part in stripped.split(",")]
 
 
+def parse_subprocess_timeout_s(value: str | float | int | None) -> float | None:
+    if value is None:
+        return DEFAULT_SUBPROCESS_TIMEOUT_S
+    if isinstance(value, str) and value.strip().lower() in {"none", "null"}:
+        return None
+    timeout_s = float(value)
+    if timeout_s < 0.0:
+        raise ValueError("--subprocess-timeout-s must be > 0, 0, or none")
+    if timeout_s == 0.0:
+        return None
+    return timeout_s
+
+
 def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     if not records:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(_to_jsonable(record), allow_nan=False, sort_keys=True) + "\n"
+            )
 
 
 def _to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None or isinstance(value, str | int | bool):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, np.generic):
+        return _to_jsonable(value.item())
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, np.generic):
-        return value.item()
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _to_jsonable(value.tolist())
     if is_dataclass(value) and not isinstance(value, type):
         return _to_jsonable(asdict(value))
     if isinstance(value, dict):
@@ -255,7 +275,12 @@ def _jsonable_config(config: ProfileConfig) -> dict[str, Any]:
 def write_run_config(output_dir: Path, config: ProfileConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "run_config.json").write_text(
-        json.dumps(_jsonable_config(config), indent=2, sort_keys=True),
+        json.dumps(
+            _jsonable_config(config),
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
 
@@ -265,7 +290,8 @@ def write_summary_files(output_dir: Path, summaries: list[dict[str, Any]]) -> No
     json_path = output_dir / "step_latency_summary.json"
     jsonable_summaries = _to_jsonable(summaries)
     json_path.write_text(
-        json.dumps(jsonable_summaries, indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(jsonable_summaries, allow_nan=False, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     csv_path = output_dir / "step_latency_summary.csv"
     fieldnames = sorted({key for summary in jsonable_summaries for key in summary})
@@ -547,6 +573,29 @@ def _error_record(
     return record
 
 
+def _warning_record(
+    *,
+    spec: TaskTrialSpec,
+    message: str,
+    exc_type: str,
+    stage: str,
+    traceback_text: str | None = None,
+) -> dict[str, Any]:
+    record = _error_record(
+        spec=spec,
+        message=message,
+        exc_type=exc_type,
+        stage=stage,
+        traceback_text=traceback_text,
+    )
+    record["event"] = "warning"
+    return record
+
+
+def _null_metadata(keys: list[str]) -> dict[str, Any]:
+    return dict.fromkeys(keys)
+
+
 def profile_task_trial(
     *,
     config: ProfileConfig,
@@ -560,7 +609,20 @@ def profile_task_trial(
     stage = "apply_cpu_affinity"
     try:
         stage = "parse_bddl_metadata"
-        bddl_metadata = parse_bddl_metadata(spec.bddl_file)
+        warnings: list[dict[str, Any]] = []
+        try:
+            bddl_metadata = parse_bddl_metadata(spec.bddl_file)
+        except Exception as exc:
+            bddl_metadata = _null_metadata(BDDL_SCHEMA_KEYS)
+            warnings.append(
+                _warning_record(
+                    spec=spec,
+                    message=str(exc),
+                    exc_type=exc.__class__.__name__,
+                    stage=stage,
+                    traceback_text=traceback.format_exc(),
+                )
+            )
         stage = "env_factory"
         env = env_factory()
         if hasattr(env, "seed"):
@@ -571,7 +633,19 @@ def profile_task_trial(
             stage = "set_init_state"
             env.set_init_state(init_state)
         stage = "collect_runtime_metadata"
-        runtime_metadata = collect_runtime_metadata(env, config)
+        try:
+            runtime_metadata = collect_runtime_metadata(env, config)
+        except Exception as exc:
+            runtime_metadata = _null_metadata(RUNTIME_METADATA_KEYS)
+            warnings.append(
+                _warning_record(
+                    spec=spec,
+                    message=str(exc),
+                    exc_type=exc.__class__.__name__,
+                    stage=stage,
+                    traceback_text=traceback.format_exc(),
+                )
+            )
         for warmup_step in range(config.warmup_steps):
             stage = f"warmup_step:{warmup_step}"
             _step_env(env, config.dummy_action)
@@ -624,7 +698,11 @@ def profile_task_trial(
             "success_seen": success_seen,
             "error": None,
         }
-        return ProfileResult(events=events, summary=summary, error=None)
+        return ProfileResult(
+            events=events,
+            summary=summary,
+            error=warnings[0] if warnings else None,
+        )
     except Exception as exc:
         return ProfileResult(
             events=[],
@@ -765,11 +843,18 @@ def run_profile(config: ProfileConfig) -> int:
     errors_path = config.output_dir / "errors.jsonl"
     specs, init_states = build_task_trial_specs(config)
     summaries: list[dict[str, Any]] = []
-    for spec, init_state in zip(specs, init_states):
+    for index, (spec, init_state) in enumerate(zip(specs, init_states)):
+        trial_config = config
+        if config.cpu_ids:
+            trial_config = dataclass_replace(
+                config,
+                cpu_id=config.cpu_ids[index % len(config.cpu_ids)],
+            )
         result = profile_task_trial_in_subprocess(
-            config=config,
+            config=trial_config,
             spec=spec,
             init_state=init_state,
+            timeout_s=config.subprocess_timeout_s,
         )
         append_jsonl(events_path, result.events)
         if result.summary is not None:
@@ -790,6 +875,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measure-steps", type=int, default=200)
     parser.add_argument("--cpu-id", type=int, default=None)
     parser.add_argument("--cpu-ids", default=None)
+    parser.add_argument(
+        "--subprocess-timeout-s",
+        default=str(DEFAULT_SUBPROCESS_TIMEOUT_S),
+        help=(
+            "Seconds to wait for each task/trial subprocess. Use 0 or none to disable."
+        ),
+    )
     parser.add_argument("--camera-height", type=int, default=256)
     parser.add_argument("--camera-width", type=int, default=256)
     parser.add_argument(
@@ -811,6 +903,7 @@ def config_from_args(args: argparse.Namespace) -> ProfileConfig:
         else parse_int_list(args.specific_trial_ids, allow_all=False)
     )
     cpu_ids = None if args.cpu_ids is None else parse_int_list(args.cpu_ids)
+    subprocess_timeout_s = parse_subprocess_timeout_s(args.subprocess_timeout_s)
     if args.trials_per_task < 1:
         raise ValueError("--trials-per-task must be >= 1")
     if args.warmup_steps < 0:
@@ -823,6 +916,8 @@ def config_from_args(args: argparse.Namespace) -> ProfileConfig:
         raise ValueError("--camera-width must be > 0")
     if args.cpu_id is not None and args.cpu_id < 0:
         raise ValueError("--cpu-id must be >= 0")
+    if args.cpu_id is not None and cpu_ids is not None:
+        raise ValueError("--cpu-id and --cpu-ids are mutually exclusive")
     if cpu_ids is not None and any(cpu_id < 0 for cpu_id in cpu_ids):
         raise ValueError("--cpu-ids must be >= 0")
     return ProfileConfig(
@@ -841,6 +936,7 @@ def config_from_args(args: argparse.Namespace) -> ProfileConfig:
         output_dir=args.output_dir,
         dummy_action=parse_dummy_action(args.dummy_action),
         stop_on_done=args.stop_on_done,
+        subprocess_timeout_s=subprocess_timeout_s,
     )
 
 

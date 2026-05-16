@@ -78,9 +78,12 @@ Required or primary options:
 - `--warmup-steps`: number of unmeasured steps before recording latency.
 - `--measure-steps`: number of measured steps per task/trial.
 - `--cpu-id`: CPU used for sequential isolated profiling.
-- `--cpu-ids`: optional future-compatible CPU list. The initial implementation
-  may accept it as an alias but should still run sequentially unless parallel
-  mode is explicitly added later.
+- `--cpu-ids`: optional CPU list for sequential runs. Each task/trial
+  subprocess is bound to the next CPU in the list, rotating when needed. It is
+  mutually exclusive with `--cpu-id`.
+- `--subprocess-timeout-s`: timeout for each task/trial subprocess. The default
+  is enabled; use `0` or `none` only when an unbounded profiling subprocess is
+  intentional.
 - `--camera-height` and `--camera-width`: LIBERO camera resolution.
 - `--libero-type`: `standard`, `pro`, or `plus`; default is `standard`.
 - `--seed`: base seed for task/trial selection and environment seeding.
@@ -284,6 +287,7 @@ python toolkits/profile_libero_step_latency.py \
   --warmup-steps 2 \
   --measure-steps 5 \
   --cpu-id 0 \
+  --subprocess-timeout-s 300 \
   --output-dir results/libero_step_latency_smoke
 ```
 

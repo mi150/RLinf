@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -277,6 +278,7 @@ def _profile_config(
         output_dir=tmp_path,
         dummy_action=[0.0] * 7,
         stop_on_done=stop_on_done,
+        subprocess_timeout_s=30.0,
     )
 
 
@@ -310,8 +312,8 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
             "6",
             "--cpu-id",
             "0",
-            "--cpu-ids",
-            "0,1",
+            "--subprocess-timeout-s",
+            "123.5",
             "--camera-height",
             "128",
             "--camera-width",
@@ -331,12 +333,53 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
     assert config.warmup_steps == 5
     assert config.measure_steps == 6
     assert config.cpu_id == 0
-    assert config.cpu_ids == [0, 1]
+    assert config.cpu_ids is None
+    assert config.subprocess_timeout_s == 123.5
     assert config.camera_height == 128
     assert config.camera_width == 96
     assert config.output_dir == tmp_path
     assert config.dummy_action == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
     assert config.stop_on_done is True
+
+
+def test_config_from_args_parses_cpu_ids_and_default_timeout(tmp_path: Path):
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--suite",
+            "libero_90",
+            "--output-dir",
+            str(tmp_path),
+            "--cpu-ids",
+            "0,1",
+        ]
+    )
+
+    config = config_from_args(args)
+
+    assert config.cpu_id is None
+    assert config.cpu_ids == [0, 1]
+    assert config.subprocess_timeout_s is not None
+    assert config.subprocess_timeout_s > 0
+
+
+def test_config_from_args_rejects_cpu_id_with_cpu_ids(tmp_path: Path):
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--suite",
+            "libero_90",
+            "--output-dir",
+            str(tmp_path),
+            "--cpu-id",
+            "0",
+            "--cpu-ids",
+            "1,2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        config_from_args(args)
 
 
 @pytest.mark.parametrize(
@@ -345,6 +388,11 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
         ("--camera-height", "-1", "--camera-height must be > 0"),
         ("--cpu-id", "-1", "--cpu-id must be >= 0"),
         ("--cpu-ids", "0,-1", "--cpu-ids must be >= 0"),
+        (
+            "--subprocess-timeout-s",
+            "-1",
+            "--subprocess-timeout-s must be > 0, 0, or none",
+        ),
     ],
 )
 def test_config_from_args_rejects_invalid_cli_values(
@@ -471,6 +519,59 @@ def test_profile_task_trial_error_includes_stage_and_traceback(tmp_path: Path):
     assert "RuntimeError: factory failed" in result.error["traceback"]
 
 
+def test_profile_task_trial_continues_when_bddl_metadata_fails(tmp_path: Path):
+    missing_bddl_path = tmp_path / "KITCHEN_SCENE3_missing.bddl"
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(missing_bddl_path)
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.error["event"] == "warning"
+    assert result.error["stage"] == "parse_bddl_metadata"
+    assert result.summary["step_count"] == 1
+    assert result.events[0]["scene_type"] is None
+    assert result.events[0]["num_objects"] is None
+    assert result.summary["num_objects"] is None
+
+
+def test_profile_task_trial_continues_when_runtime_metadata_fails(
+    monkeypatch, tmp_path: Path
+):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(bddl_path)
+
+    def raise_runtime_metadata(env, config):
+        raise RuntimeError("runtime metadata failed")
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.collect_runtime_metadata",
+        raise_runtime_metadata,
+    )
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.error["event"] == "warning"
+    assert result.error["stage"] == "collect_runtime_metadata"
+    assert result.summary["step_count"] == 1
+    assert result.events[0]["camera_names"] is None
+    assert result.events[0]["nbody"] is None
+    assert result.summary["nbody"] is None
+
+
 def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
     class CustomValue:
         def __repr__(self):
@@ -480,22 +581,26 @@ def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
     append_jsonl(
         event_path,
         [
-            {"event": "a", "value": 1, "path": tmp_path},
+            {"event": "a", "value": 1, "path": tmp_path, "nan": float("nan")},
             {
                 "event": "b",
                 "value": np.int64(2),
                 "array": np.asarray([1, 2]),
+                "inf": np.float64("inf"),
                 "custom": CustomValue(),
             },
         ],
     )
+    assert "NaN" not in event_path.read_text()
+    assert "Infinity" not in event_path.read_text()
     records = [json.loads(line) for line in event_path.read_text().splitlines()]
     assert records == [
-        {"event": "a", "path": str(tmp_path), "value": 1},
+        {"event": "a", "nan": None, "path": str(tmp_path), "value": 1},
         {
             "array": [1, 2],
             "custom": {"__type__": "CustomValue", "repr": "CustomValue(7)"},
             "event": "b",
+            "inf": None,
             "value": 2,
         },
     ]
@@ -554,11 +659,57 @@ def test_write_run_config_serializes_paths(tmp_path: Path):
         output_dir=tmp_path,
         dummy_action=[0.0] * 7,
         stop_on_done=False,
+        subprocess_timeout_s=30.0,
     )
     write_run_config(tmp_path, config)
     data = json.loads((tmp_path / "run_config.json").read_text())
     assert data["output_dir"] == str(tmp_path)
     assert data["suite"] == "libero_90"
+    assert data["subprocess_timeout_s"] == 30.0
+
+
+def test_run_profile_uses_rotating_cpu_ids_and_timeout(monkeypatch, tmp_path: Path):
+    config = replace(
+        _profile_config(tmp_path, measure_steps=1),
+        cpu_ids=[2, 4],
+        subprocess_timeout_s=12.0,
+    )
+    specs = [
+        _task_trial_spec(tmp_path / f"KITCHEN_SCENE3_task_{index}.bddl")
+        for index in range(3)
+    ]
+    seen_cpu_ids = []
+    seen_timeouts = []
+
+    def fake_build_task_trial_specs(config):
+        return specs, [np.zeros(3), np.zeros(3), np.zeros(3)]
+
+    def fake_profile_task_trial_in_subprocess(
+        *, config, spec, init_state, timeout_s=None
+    ):
+        seen_cpu_ids.append(config.cpu_id)
+        seen_timeouts.append(timeout_s)
+        return ProfileResult(
+            events=[],
+            summary={"task_id": spec.task_id, "trial_id": spec.trial_id},
+            error=None,
+        )
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.build_task_trial_specs",
+        fake_build_task_trial_specs,
+    )
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.profile_task_trial_in_subprocess",
+        fake_profile_task_trial_in_subprocess,
+    )
+
+    from toolkits.profile_libero_step_latency import run_profile
+
+    run_profile(config)
+
+    assert seen_cpu_ids == [2, 4, 2]
+    assert seen_timeouts == [12.0, 12.0, 12.0]
 
 
 def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
@@ -582,6 +733,7 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
         output_dir=tmp_path,
         dummy_action=[0.0] * 7,
         stop_on_done=False,
+        subprocess_timeout_s=30.0,
     )
     spec = TaskTrialSpec(
         suite_name="libero_90",
@@ -594,6 +746,9 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
     )
 
     class FakeParentConn:
+        def poll(self, timeout):
+            return True
+
         def recv(self):
             raise EOFError
 
@@ -643,6 +798,10 @@ def test_profile_task_trial_in_subprocess_receives_before_join(
     calls = []
 
     class FakeParentConn:
+        def poll(self, timeout):
+            calls.append("poll")
+            return True
+
         def recv(self):
             calls.append("recv")
             return ProfileResult(
