@@ -9,6 +9,7 @@ from toolkits.profile_libero_step_latency import (
     ProfileConfig,
     ProfileResult,
     TaskTrialSpec,
+    _profile_subprocess_entry,
     append_jsonl,
     compute_latency_summary,
     parse_bddl_metadata,
@@ -365,18 +366,54 @@ def test_profile_task_trial_error_includes_stage_and_traceback(tmp_path: Path):
 
 def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
     event_path = tmp_path / "step_latency_events.jsonl"
-    append_jsonl(event_path, [{"event": "a", "value": 1}, {"event": "b", "value": 2}])
+    append_jsonl(
+        event_path,
+        [
+            {"event": "a", "value": 1, "path": tmp_path},
+            {"event": "b", "value": np.int64(2), "array": np.asarray([1, 2])},
+        ],
+    )
     records = [json.loads(line) for line in event_path.read_text().splitlines()]
-    assert records == [{"event": "a", "value": 1}, {"event": "b", "value": 2}]
+    assert records == [
+        {"event": "a", "path": str(tmp_path), "value": 1},
+        {"array": [1, 2], "event": "b", "value": 2},
+    ]
 
     summaries = [
-        {"suite_name": "libero_90", "task_id": 0, "step_count": 2, "error": None},
-        {"suite_name": "libero_90", "task_id": 1, "step_count": 2, "error": None},
+        {
+            "suite_name": "libero_90",
+            "task_id": np.int64(0),
+            "step_count": 2,
+            "error": None,
+            "bddl_file": tmp_path / "task0.bddl",
+        },
+        {
+            "suite_name": "libero_90",
+            "task_id": 1,
+            "step_count": 2,
+            "error": None,
+            "latencies": np.asarray([0.1, 0.2]),
+        },
     ]
     write_summary_files(tmp_path, summaries)
     assert (tmp_path / "step_latency_summary.csv").exists()
     summary_json = json.loads((tmp_path / "step_latency_summary.json").read_text())
-    assert summary_json == summaries
+    assert summary_json == [
+        {
+            "bddl_file": str(tmp_path / "task0.bddl"),
+            "error": None,
+            "step_count": 2,
+            "suite_name": "libero_90",
+            "task_id": 0,
+        },
+        {
+            "error": None,
+            "latencies": [0.1, 0.2],
+            "step_count": 2,
+            "suite_name": "libero_90",
+            "task_id": 1,
+        },
+    ]
 
 
 def test_write_run_config_serializes_paths(tmp_path: Path):
@@ -435,12 +472,9 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
         seed=11,
     )
 
-    class FakeQueue:
-        def __init__(self, maxsize=1):
-            self.maxsize = maxsize
-
-        def get_nowait(self):
-            raise RuntimeError("empty queue")
+    class FakeParentConn:
+        def recv(self):
+            raise EOFError
 
     class FakeProcess:
         exitcode = 9
@@ -456,8 +490,10 @@ def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
             return None
 
     class FakeContext:
-        Queue = FakeQueue
         Process = FakeProcess
+
+        def Pipe(self, duplex=False):
+            return FakeParentConn(), object()
 
     monkeypatch.setattr(
         "toolkits.profile_libero_step_latency.mp.get_context",
@@ -485,20 +521,9 @@ def test_profile_task_trial_in_subprocess_drains_queue_before_join(
     spec = _task_trial_spec(bddl_path)
     calls = []
 
-    class FakeQueue:
-        def __init__(self, maxsize=1):
-            self.maxsize = maxsize
-
-        def get(self, timeout=None):
-            calls.append(("get", timeout))
-            return ProfileResult(
-                events=[{"event": "libero_step_latency"}],
-                summary={"step_count": 1},
-                error=None,
-            )
-
-        def get_nowait(self):
-            calls.append(("get_nowait", None))
+    class FakeParentConn:
+        def recv(self):
+            calls.append("recv")
             return ProfileResult(
                 events=[{"event": "libero_step_latency"}],
                 summary={"step_count": 1},
@@ -513,14 +538,17 @@ def test_profile_task_trial_in_subprocess_drains_queue_before_join(
             self.args = args
 
         def start(self):
-            calls.append(("start", None))
+            calls.append("start")
 
         def join(self):
-            calls.append(("join", None))
+            calls.append("join")
 
     class FakeContext:
-        Queue = FakeQueue
         Process = FakeProcess
+
+        def Pipe(self, duplex=False):
+            calls.append(f"pipe:{duplex}")
+            return FakeParentConn(), object()
 
     monkeypatch.setattr(
         "toolkits.profile_libero_step_latency.mp.get_context",
@@ -533,9 +561,44 @@ def test_profile_task_trial_in_subprocess_drains_queue_before_join(
         init_state=np.zeros(3),
     )
 
-    drain_indexes = [
-        index for index, (name, _) in enumerate(calls) if name in {"get", "get_nowait"}
-    ]
-    join_index = next(index for index, (name, _) in enumerate(calls) if name == "join")
     assert result.error is None
-    assert drain_indexes[0] < join_index
+    assert calls.index("recv") < calls.index("join")
+
+
+def test_profile_subprocess_entry_sends_factory_errors(monkeypatch, tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(bddl_path)
+    sent_results = []
+
+    class FakeChildConn:
+        def send(self, result):
+            sent_results.append(result)
+
+        def close(self):
+            return None
+
+    def raise_factory(config, spec):
+        raise RuntimeError("libero import failed")
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.make_libero_env_factory",
+        raise_factory,
+    )
+
+    _profile_subprocess_entry(
+        FakeChildConn(),
+        config=config,
+        spec=spec,
+        init_state=np.zeros(3),
+    )
+
+    assert len(sent_results) == 1
+    result = sent_results[0]
+    assert result.events == []
+    assert result.summary is None
+    assert result.error["error_type"] == "RuntimeError"
+    assert result.error["stage"] == "subprocess_entry"
+    assert "libero import failed" in result.error["error"]
+    assert "RuntimeError: libero import failed" in result.error["traceback"]

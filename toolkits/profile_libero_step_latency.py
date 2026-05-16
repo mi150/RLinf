@@ -9,7 +9,7 @@ import os
 import re
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,6 @@ RUNTIME_METADATA_KEYS = [
     "nu",
     "ncam",
 ]
-SUBPROCESS_RESULT_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -224,13 +223,30 @@ def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
+
+
+def _to_jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if is_dataclass(value) and not isinstance(value, type):
+        return _to_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_to_jsonable(item) for item in value]
+    return str(value)
 
 
 def _jsonable_config(config: ProfileConfig) -> dict[str, Any]:
-    data = asdict(config)
-    data["output_dir"] = str(config.output_dir)
-    return data
+    data = _to_jsonable(config)
+    return dict(data)
 
 
 def write_run_config(output_dir: Path, config: ProfileConfig) -> None:
@@ -244,15 +260,16 @@ def write_run_config(output_dir: Path, config: ProfileConfig) -> None:
 def write_summary_files(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "step_latency_summary.json"
+    jsonable_summaries = _to_jsonable(summaries)
     json_path.write_text(
-        json.dumps(summaries, indent=2, sort_keys=True), encoding="utf-8"
+        json.dumps(jsonable_summaries, indent=2, sort_keys=True), encoding="utf-8"
     )
     csv_path = output_dir / "step_latency_summary.csv"
-    fieldnames = sorted({key for summary in summaries for key in summary})
+    fieldnames = sorted({key for summary in jsonable_summaries for key in summary})
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for summary in summaries:
+        for summary in jsonable_summaries:
             writer.writerow(summary)
 
 
@@ -627,18 +644,34 @@ def profile_task_trial(
 
 
 def _profile_subprocess_entry(
-    queue: Any,
+    child_conn: Any,
     config: ProfileConfig,
     spec: TaskTrialSpec,
     init_state: Any,
 ) -> None:
-    result = profile_task_trial(
-        config=config,
-        spec=spec,
-        env_factory=make_libero_env_factory(config, spec),
-        init_state=init_state,
-    )
-    queue.put(result)
+    try:
+        result = profile_task_trial(
+            config=config,
+            spec=spec,
+            env_factory=make_libero_env_factory(config, spec),
+            init_state=init_state,
+        )
+    except Exception as exc:
+        result = ProfileResult(
+            events=[],
+            summary=None,
+            error=_error_record(
+                spec=spec,
+                message=str(exc),
+                exc_type=exc.__class__.__name__,
+                stage="subprocess_entry",
+                traceback_text=traceback.format_exc(),
+            ),
+        )
+    try:
+        child_conn.send(result)
+    finally:
+        child_conn.close()
 
 
 def profile_task_trial_in_subprocess(
@@ -648,55 +681,38 @@ def profile_task_trial_in_subprocess(
     init_state: Any,
 ) -> ProfileResult:
     ctx = mp.get_context("spawn")
-    queue = ctx.Queue(maxsize=1)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
     process = ctx.Process(
         target=_profile_subprocess_entry,
-        args=(queue, config, spec, init_state),
+        args=(child_conn, config, spec, init_state),
     )
     process.start()
+    child_close = getattr(child_conn, "close", None)
+    if child_close is not None:
+        child_close()
     try:
-        result = queue.get(timeout=SUBPROCESS_RESULT_TIMEOUT_S)
-    except Exception:
-        is_alive = getattr(process, "is_alive", lambda: False)
-        if is_alive():
-            terminate = getattr(process, "terminate", None)
-            if terminate is not None:
-                terminate()
-            process.join()
-            return ProfileResult(
-                events=[],
-                summary=None,
-                error=_error_record(
-                    spec=spec,
-                    message="profiling subprocess result timed out",
-                    exc_type="SubprocessError",
-                    stage="subprocess_result_timeout",
-                ),
-            )
+        result = parent_conn.recv()
+    except EOFError:
         process.join()
-        if process.exitcode != 0:
-            return ProfileResult(
-                events=[],
-                summary=None,
-                error=_error_record(
-                    spec=spec,
-                    message=f"profiling subprocess exited with code {process.exitcode}",
-                    exc_type="SubprocessError",
-                    stage="subprocess_exit",
-                ),
-            )
         return ProfileResult(
             events=[],
             summary=None,
             error=_error_record(
                 spec=spec,
-                message="profiling subprocess produced no result",
+                message=(
+                    "profiling subprocess produced no result "
+                    f"and exited with code {process.exitcode}"
+                ),
                 exc_type="SubprocessError",
                 stage="subprocess_result",
             ),
         )
+    finally:
+        parent_close = getattr(parent_conn, "close", None)
+        if parent_close is not None:
+            parent_close()
     process.join()
-    if process.exitcode != 0:
+    if process.exitcode != 0 and result.error is None:
         return ProfileResult(
             events=[],
             summary=None,
