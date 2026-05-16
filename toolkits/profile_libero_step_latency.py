@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -392,8 +393,10 @@ def _error_record(
     spec: TaskTrialSpec,
     message: str,
     exc_type: str,
+    stage: str | None = None,
+    traceback_text: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "event": "error",
         "suite_name": spec.suite_name,
         "task_id": spec.task_id,
@@ -404,6 +407,11 @@ def _error_record(
         "error_type": exc_type,
         "error": message,
     }
+    if stage is not None:
+        record["stage"] = stage
+    if traceback_text is not None:
+        record["traceback"] = traceback_text
+    return record
 
 
 def profile_task_trial(
@@ -416,17 +424,29 @@ def profile_task_trial(
 ) -> ProfileResult:
     env = None
     cpu_affinity_applied = _apply_cpu_affinity(config.cpu_id)
+    stage = "apply_cpu_affinity"
     try:
+        stage = "parse_bddl_metadata"
         bddl_metadata = parse_bddl_metadata(spec.bddl_file)
+        stage = "env_factory"
         env = env_factory()
         if hasattr(env, "seed"):
             env.seed(spec.seed)
+        stage = "reset"
         env.reset()
         if init_state is not None and hasattr(env, "set_init_state"):
+            stage = "set_init_state"
             env.set_init_state(init_state)
+        stage = "collect_runtime_metadata"
         runtime_metadata = collect_runtime_metadata(env, config)
-        for _ in range(config.warmup_steps):
+        for warmup_step in range(config.warmup_steps):
+            stage = f"warmup_step:{warmup_step}"
             _step_env(env, config.dummy_action)
+        stage = "reset"
+        env.reset()
+        if init_state is not None and hasattr(env, "set_init_state"):
+            stage = "set_init_state"
+            env.set_init_state(init_state)
         base = _event_base(
             config=config,
             spec=spec,
@@ -439,6 +459,7 @@ def profile_task_trial(
         done_seen_step: int | None = None
         success_seen = False
         for step_index in range(config.measure_steps):
+            stage = f"measure_step:{step_index}"
             start = clock()
             _, reward, done, info = _step_env(env, config.dummy_action)
             end = clock()
@@ -447,7 +468,7 @@ def profile_task_trial(
             if hasattr(env, "check_success"):
                 success = success or bool(env.check_success())
             if done and done_seen_step is None:
-                done_seen_step = step_index + 1
+                done_seen_step = step_index
             success_seen = success_seen or success
             latencies.append(latency_s)
             event = {
@@ -479,8 +500,14 @@ def profile_task_trial(
                 spec=spec,
                 message=str(exc),
                 exc_type=exc.__class__.__name__,
+                stage=stage,
+                traceback_text=traceback.format_exc(),
             ),
         )
     finally:
         if env is not None and hasattr(env, "close"):
-            env.close()
+            try:
+                stage = "close"
+                env.close()
+            except Exception:
+                pass

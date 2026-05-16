@@ -213,6 +213,7 @@ class FakeEnv:
         self.seed_value = seed
 
     def reset(self):
+        self.steps = 0
         return {"obs": 1}
 
     def set_init_state(self, init_state):
@@ -231,16 +232,30 @@ class FakeEnv:
         self.closed = True
 
 
-def test_profile_task_trial_with_mock_env(tmp_path: Path):
-    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
-    bddl_path.write_text(SAMPLE_BDDL)
-    config = ProfileConfig(
+class IncrementingClock:
+    def __init__(self, *, step: float):
+        self.value = 0.0
+        self.step = step
+
+    def __call__(self):
+        current = self.value
+        self.value += self.step
+        return current
+
+
+def _profile_config(
+    tmp_path: Path,
+    *,
+    measure_steps: int = 3,
+    stop_on_done: bool = False,
+) -> ProfileConfig:
+    return ProfileConfig(
         suite="libero_90",
         task_ids="0",
         trials_per_task=1,
         specific_trial_ids=None,
         warmup_steps=1,
-        measure_steps=3,
+        measure_steps=measure_steps,
         cpu_id=None,
         cpu_ids=None,
         camera_height=64,
@@ -249,9 +264,12 @@ def test_profile_task_trial_with_mock_env(tmp_path: Path):
         seed=11,
         output_dir=tmp_path,
         dummy_action=[0.0] * 7,
-        stop_on_done=False,
+        stop_on_done=stop_on_done,
     )
-    spec = TaskTrialSpec(
+
+
+def _task_trial_spec(bddl_path: Path) -> TaskTrialSpec:
+    return TaskTrialSpec(
         suite_name="libero_90",
         task_id=0,
         trial_id=1,
@@ -261,12 +279,19 @@ def test_profile_task_trial_with_mock_env(tmp_path: Path):
         seed=11,
     )
 
+
+def test_profile_task_trial_with_mock_env(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path)
+    spec = _task_trial_spec(bddl_path)
+
     result = profile_task_trial(
         config=config,
         spec=spec,
         env_factory=FakeEnv,
         init_state=np.zeros(3),
-        clock=lambda: 1.0,
+        clock=IncrementingClock(step=0.25),
     )
 
     assert result.error is None
@@ -275,6 +300,58 @@ def test_profile_task_trial_with_mock_env(tmp_path: Path):
     assert result.events[0]["suite_name"] == "libero_90"
     assert result.events[0]["num_objects"] == 2
     assert result.events[0]["nbody"] == 4
+    assert result.events[0]["latency_s"] == 0.25
     assert result.summary["step_count"] == 3
+    assert result.summary["mean_latency_s"] == 0.25
+    assert result.summary["median_latency_s"] == 0.25
+    assert result.summary["min_latency_s"] == 0.25
+    assert result.summary["max_latency_s"] == 0.25
     assert result.summary["success_seen"] is True
     assert result.summary["done_seen_step"] == 2
+
+
+def test_profile_task_trial_stop_on_done_stops_measurement(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path, measure_steps=10, stop_on_done=True)
+    spec = _task_trial_spec(bddl_path)
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.error is None
+    assert len(result.events) == 3
+    assert len(result.events) < config.measure_steps
+    assert result.summary["step_count"] == 3
+    assert result.summary["step_count"] < config.measure_steps
+    assert result.summary["done_seen_step"] == 2
+
+
+def test_profile_task_trial_error_includes_stage_and_traceback(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_task.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+    config = _profile_config(tmp_path)
+    spec = _task_trial_spec(bddl_path)
+
+    def raise_env_factory():
+        raise RuntimeError("factory failed")
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=raise_env_factory,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.events == []
+    assert result.summary is None
+    assert result.error["error_type"] == "RuntimeError"
+    assert result.error["error"] == "factory failed"
+    assert result.error["stage"] == "env_factory"
+    assert "RuntimeError: factory failed" in result.error["traceback"]
