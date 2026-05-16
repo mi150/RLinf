@@ -1,15 +1,73 @@
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from toolkits.profile_libero_step_latency import (
     compute_latency_summary,
+    parse_bddl_metadata,
     parse_dummy_action,
     parse_int_list,
     parse_task_ids,
     select_trial_ids,
 )
+
+SAMPLE_BDDL = """
+(define (problem LIBERO_Kitchen_Tabletop_Manipulation)
+  (:domain robosuite)
+  (:language turn on the stove and put the frying pan on it)
+  (:regions
+    (flat_stove_init_region
+      (:target kitchen_table)
+      (:ranges ((-0.21 0.19 -0.19 0.21)))
+    )
+    (cook_region
+      (:target flat_stove_1)
+    )
+  )
+  (:fixtures
+    kitchen_table - kitchen_table
+    flat_stove_1 - flat_stove
+  )
+  (:objects
+    chefmate_8_frypan_1 - chefmate_8_frypan
+    moka_pot_1 - moka_pot
+  )
+  (:obj_of_interest
+    chefmate_8_frypan_1
+    flat_stove_1
+  )
+  (:init
+    (On flat_stove_1 kitchen_table_flat_stove_init_region)
+    (On chefmate_8_frypan_1 kitchen_table_frypan_init_region)
+  )
+  (:goal
+    (And (Turnon flat_stove_1) (On chefmate_8_frypan_1 flat_stove_1_cook_region))
+  )
+)
+"""
+
+
+def test_parse_bddl_metadata_counts_sections(tmp_path: Path):
+    bddl_path = tmp_path / "KITCHEN_SCENE3_turn_on_the_stove.bddl"
+    bddl_path.write_text(SAMPLE_BDDL)
+
+    metadata = parse_bddl_metadata(bddl_path)
+
+    assert metadata["problem_name"] == "LIBERO_Kitchen_Tabletop_Manipulation"
+    assert metadata["domain_name"] == "robosuite"
+    assert metadata["task_language"] == "turn on the stove and put the frying pan on it"
+    assert metadata["scene_type"] == "kitchen"
+    assert metadata["scene_name"] == "KITCHEN_SCENE3"
+    assert metadata["num_regions"] == 2
+    assert metadata["num_fixtures"] == 2
+    assert metadata["fixture_categories"] == ["flat_stove", "kitchen_table"]
+    assert metadata["num_objects"] == 2
+    assert metadata["object_categories"] == ["chefmate_8_frypan", "moka_pot"]
+    assert metadata["num_obj_of_interest"] == 2
+    assert metadata["num_init_predicates"] == 2
+    assert metadata["num_goal_predicates"] == 2
 
 
 def test_parse_int_list_accepts_all_and_numbers():
