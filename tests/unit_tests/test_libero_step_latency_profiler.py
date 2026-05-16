@@ -24,6 +24,9 @@ from toolkits.profile_libero_step_latency import (
     write_run_config,
     write_summary_files,
 )
+from toolkits.profile_libero_step_latency import (
+    main as profile_main,
+)
 
 SAMPLE_BDDL = """
 (define (problem LIBERO_Kitchen_Tabletop_Manipulation)
@@ -322,11 +325,73 @@ def test_config_from_args_parses_cli_values(tmp_path: Path):
     )
     config = config_from_args(args)
     assert config.suite == "libero_90"
+    assert config.task_ids == "0,1"
+    assert config.trials_per_task == 2
     assert config.specific_trial_ids == [3, 4]
+    assert config.warmup_steps == 5
+    assert config.measure_steps == 6
+    assert config.cpu_id == 0
     assert config.cpu_ids == [0, 1]
     assert config.camera_height == 128
     assert config.camera_width == 96
+    assert config.output_dir == tmp_path
+    assert config.dummy_action == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
     assert config.stop_on_done is True
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--camera-height", "-1", "--camera-height must be > 0"),
+        ("--cpu-id", "-1", "--cpu-id must be >= 0"),
+        ("--cpu-ids", "0,-1", "--cpu-ids must be >= 0"),
+    ],
+)
+def test_config_from_args_rejects_invalid_cli_values(
+    tmp_path: Path, flag: str, value: str, message: str
+):
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--suite",
+            "libero_90",
+            "--output-dir",
+            str(tmp_path),
+            flag,
+            value,
+        ]
+    )
+
+    with pytest.raises(ValueError, match=message):
+        config_from_args(args)
+
+
+def test_main_reports_startup_errors_without_traceback(
+    monkeypatch, capsys, tmp_path: Path
+):
+    def raise_import_error(config):
+        raise ImportError("missing libero")
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.run_profile",
+        raise_import_error,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        profile_main(
+            [
+                "--suite",
+                "libero_90",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 1
+    assert "missing libero" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
 
 
 def test_profile_task_trial_with_mock_env(tmp_path: Path):

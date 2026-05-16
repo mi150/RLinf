@@ -817,6 +817,14 @@ def config_from_args(args: argparse.Namespace) -> ProfileConfig:
         raise ValueError("--warmup-steps must be >= 0")
     if args.measure_steps < 1:
         raise ValueError("--measure-steps must be >= 1")
+    if args.camera_height <= 0:
+        raise ValueError("--camera-height must be > 0")
+    if args.camera_width <= 0:
+        raise ValueError("--camera-width must be > 0")
+    if args.cpu_id is not None and args.cpu_id < 0:
+        raise ValueError("--cpu-id must be >= 0")
+    if cpu_ids is not None and any(cpu_id < 0 for cpu_id in cpu_ids):
+        raise ValueError("--cpu-ids must be >= 0")
     return ProfileConfig(
         suite=args.suite,
         task_ids=args.task_ids,
@@ -843,7 +851,10 @@ def main(argv: list[str] | None = None) -> int:
         config = config_from_args(args)
     except ValueError as exc:
         parser.error(str(exc))
-    return run_profile(config)
+    try:
+        return run_profile(config)
+    except (ImportError, OSError, ValueError, RuntimeError) as exc:
+        parser.exit(1, f"error: {exc}\n")
 
 
 if __name__ == "__main__":
