@@ -11,7 +11,7 @@ import os
 import re
 import time
 import traceback
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
@@ -91,6 +91,7 @@ class ProfileResult:
     events: list[dict[str, Any]]
     summary: dict[str, Any] | None
     error: dict[str, Any] | None
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 def parse_int_list(value: str, *, allow_all: bool = False) -> list[int] | str:
@@ -701,7 +702,8 @@ def profile_task_trial(
         return ProfileResult(
             events=events,
             summary=summary,
-            error=warnings[0] if warnings else None,
+            error=None,
+            warnings=warnings,
         )
     except Exception as exc:
         return ProfileResult(
@@ -861,6 +863,7 @@ def run_profile(config: ProfileConfig) -> int:
             summaries.append(result.summary)
         if result.error is not None:
             append_jsonl(errors_path, [result.error])
+        append_jsonl(errors_path, result.warnings)
     write_summary_files(config.output_dir, summaries)
     return 0
 

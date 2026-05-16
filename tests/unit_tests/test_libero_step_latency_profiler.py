@@ -532,8 +532,10 @@ def test_profile_task_trial_continues_when_bddl_metadata_fails(tmp_path: Path):
         clock=IncrementingClock(step=0.25),
     )
 
-    assert result.error["event"] == "warning"
-    assert result.error["stage"] == "parse_bddl_metadata"
+    assert result.error is None
+    assert len(result.warnings) == 1
+    assert result.warnings[0]["event"] == "warning"
+    assert result.warnings[0]["stage"] == "parse_bddl_metadata"
     assert result.summary["step_count"] == 1
     assert result.events[0]["scene_type"] is None
     assert result.events[0]["num_objects"] is None
@@ -564,12 +566,47 @@ def test_profile_task_trial_continues_when_runtime_metadata_fails(
         clock=IncrementingClock(step=0.25),
     )
 
-    assert result.error["event"] == "warning"
-    assert result.error["stage"] == "collect_runtime_metadata"
+    assert result.error is None
+    assert len(result.warnings) == 1
+    assert result.warnings[0]["event"] == "warning"
+    assert result.warnings[0]["stage"] == "collect_runtime_metadata"
     assert result.summary["step_count"] == 1
     assert result.events[0]["camera_names"] is None
     assert result.events[0]["nbody"] is None
     assert result.summary["nbody"] is None
+
+
+def test_profile_task_trial_returns_all_best_effort_warnings(
+    monkeypatch, tmp_path: Path
+):
+    missing_bddl_path = tmp_path / "KITCHEN_SCENE3_missing.bddl"
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(missing_bddl_path)
+
+    def raise_runtime_metadata(env, config):
+        raise RuntimeError("runtime metadata failed")
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.collect_runtime_metadata",
+        raise_runtime_metadata,
+    )
+
+    result = profile_task_trial(
+        config=config,
+        spec=spec,
+        env_factory=FakeEnv,
+        init_state=np.zeros(3),
+        clock=IncrementingClock(step=0.25),
+    )
+
+    assert result.error is None
+    assert [warning["stage"] for warning in result.warnings] == [
+        "parse_bddl_metadata",
+        "collect_runtime_metadata",
+    ]
+    assert [warning["event"] for warning in result.warnings] == ["warning", "warning"]
+    assert result.summary["step_count"] == 1
+    assert len(result.events) == 1
 
 
 def test_output_writers_create_jsonl_csv_json(tmp_path: Path):
@@ -710,6 +747,49 @@ def test_run_profile_uses_rotating_cpu_ids_and_timeout(monkeypatch, tmp_path: Pa
 
     assert seen_cpu_ids == [2, 4, 2]
     assert seen_timeouts == [12.0, 12.0, 12.0]
+
+
+def test_run_profile_writes_all_result_warnings(monkeypatch, tmp_path: Path):
+    config = _profile_config(tmp_path, measure_steps=1)
+    spec = _task_trial_spec(tmp_path / "KITCHEN_SCENE3_task.bddl")
+
+    def fake_build_task_trial_specs(config):
+        return [spec], [np.zeros(3)]
+
+    def fake_profile_task_trial_in_subprocess(
+        *, config, spec, init_state, timeout_s=None
+    ):
+        return ProfileResult(
+            events=[],
+            summary={"task_id": spec.task_id, "trial_id": spec.trial_id},
+            error=None,
+            warnings=[
+                {"event": "warning", "stage": "parse_bddl_metadata"},
+                {"event": "warning", "stage": "collect_runtime_metadata"},
+            ],
+        )
+
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.build_task_trial_specs",
+        fake_build_task_trial_specs,
+    )
+    monkeypatch.setattr(
+        "toolkits.profile_libero_step_latency.profile_task_trial_in_subprocess",
+        fake_profile_task_trial_in_subprocess,
+    )
+
+    from toolkits.profile_libero_step_latency import run_profile
+
+    run_profile(config)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "errors.jsonl").read_text().splitlines()
+    ]
+    assert [record["stage"] for record in records] == [
+        "parse_bddl_metadata",
+        "collect_runtime_metadata",
+    ]
 
 
 def test_profile_task_trial_in_subprocess_reports_nonzero_exit(
