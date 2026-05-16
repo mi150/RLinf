@@ -272,6 +272,28 @@ CI.
   material metadata only when it is available through simple static or runtime
   inspection.
 
+## Manual Validation Command
+
+After installing LIBERO dependencies, a small manual run can be started with:
+
+```bash
+python toolkits/profile_libero_step_latency.py \
+  --suite libero_spatial \
+  --task-ids 0 \
+  --trials-per-task 1 \
+  --warmup-steps 2 \
+  --measure-steps 5 \
+  --cpu-id 0 \
+  --output-dir results/libero_step_latency_smoke
+```
+
+Expected output files:
+
+- `results/libero_step_latency_smoke/step_latency_events.jsonl`
+- `results/libero_step_latency_smoke/step_latency_summary.csv`
+- `results/libero_step_latency_smoke/step_latency_summary.json`
+- `results/libero_step_latency_smoke/run_config.json`
+
 ## Success Criteria
 
 The implementation is complete when:

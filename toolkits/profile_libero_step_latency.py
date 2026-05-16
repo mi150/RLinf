@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import multiprocessing as mp
@@ -777,3 +778,73 @@ def run_profile(config: ProfileConfig) -> int:
             append_jsonl(errors_path, [result.error])
     write_summary_files(config.output_dir, summaries)
     return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", required=True)
+    parser.add_argument("--task-ids", default="all")
+    parser.add_argument("--trials-per-task", type=int, default=1)
+    parser.add_argument("--specific-trial-ids", default=None)
+    parser.add_argument("--warmup-steps", type=int, default=20)
+    parser.add_argument("--measure-steps", type=int, default=200)
+    parser.add_argument("--cpu-id", type=int, default=None)
+    parser.add_argument("--cpu-ids", default=None)
+    parser.add_argument("--camera-height", type=int, default=256)
+    parser.add_argument("--camera-width", type=int, default=256)
+    parser.add_argument(
+        "--libero-type",
+        choices=["standard", "pro", "plus"],
+        default="standard",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--dummy-action", default=None)
+    parser.add_argument("--stop-on-done", action="store_true")
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> ProfileConfig:
+    specific_trial_ids = (
+        None
+        if args.specific_trial_ids is None
+        else parse_int_list(args.specific_trial_ids, allow_all=False)
+    )
+    cpu_ids = None if args.cpu_ids is None else parse_int_list(args.cpu_ids)
+    if args.trials_per_task < 1:
+        raise ValueError("--trials-per-task must be >= 1")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be >= 0")
+    if args.measure_steps < 1:
+        raise ValueError("--measure-steps must be >= 1")
+    return ProfileConfig(
+        suite=args.suite,
+        task_ids=args.task_ids,
+        trials_per_task=args.trials_per_task,
+        specific_trial_ids=specific_trial_ids,
+        warmup_steps=args.warmup_steps,
+        measure_steps=args.measure_steps,
+        cpu_id=args.cpu_id,
+        cpu_ids=cpu_ids,
+        camera_height=args.camera_height,
+        camera_width=args.camera_width,
+        libero_type=args.libero_type,
+        seed=args.seed,
+        output_dir=args.output_dir,
+        dummy_action=parse_dummy_action(args.dummy_action),
+        stop_on_done=args.stop_on_done,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    try:
+        config = config_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return run_profile(config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

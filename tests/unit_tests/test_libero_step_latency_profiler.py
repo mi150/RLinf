@@ -11,7 +11,9 @@ from toolkits.profile_libero_step_latency import (
     TaskTrialSpec,
     _profile_subprocess_entry,
     append_jsonl,
+    build_arg_parser,
     compute_latency_summary,
+    config_from_args,
     parse_bddl_metadata,
     parse_dummy_action,
     parse_int_list,
@@ -285,6 +287,46 @@ def _task_trial_spec(bddl_path: Path) -> TaskTrialSpec:
         bddl_file=str(bddl_path),
         seed=11,
     )
+
+
+def test_config_from_args_parses_cli_values(tmp_path: Path):
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--suite",
+            "libero_90",
+            "--task-ids",
+            "0,1",
+            "--trials-per-task",
+            "2",
+            "--specific-trial-ids",
+            "3,4",
+            "--warmup-steps",
+            "5",
+            "--measure-steps",
+            "6",
+            "--cpu-id",
+            "0",
+            "--cpu-ids",
+            "0,1",
+            "--camera-height",
+            "128",
+            "--camera-width",
+            "96",
+            "--output-dir",
+            str(tmp_path),
+            "--dummy-action",
+            "0,0,0,0,0,0,-1",
+            "--stop-on-done",
+        ]
+    )
+    config = config_from_args(args)
+    assert config.suite == "libero_90"
+    assert config.specific_trial_ids == [3, 4]
+    assert config.cpu_ids == [0, 1]
+    assert config.camera_height == 128
+    assert config.camera_width == 96
+    assert config.stop_on_done is True
 
 
 def test_profile_task_trial_with_mock_env(tmp_path: Path):
