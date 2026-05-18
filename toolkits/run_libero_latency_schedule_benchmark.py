@@ -121,6 +121,21 @@ class ScheduleItem:
     side: str = "baseline"
 
 
+@dataclass(frozen=True)
+class StepEvent:
+    schedule_name: str
+    round_index: int
+    core_index: int
+    cpu_id: int
+    task_id: int
+    task_name: str
+    task_step_index: int
+    latency_s: float
+    round_wall_time_s: float
+    idle_time_s: float
+    cpu_affinity_applied: bool
+
+
 def _require_cpu_ids(cpu_ids: list[int]) -> None:
     if not cpu_ids:
         raise ValueError("cpu_ids must not be empty")
@@ -210,3 +225,139 @@ def build_trapezoid_pipeline_plan(
         order_offset=len(long_items),
     )
     return long_items + short_items
+
+
+def _items_by_core(plan: list[ScheduleItem]) -> dict[int, list[ScheduleItem]]:
+    grouped: dict[int, list[ScheduleItem]] = {}
+    for item in sorted(plan, key=lambda value: (value.core_index, value.order_index)):
+        grouped.setdefault(item.core_index, []).append(item)
+    return grouped
+
+
+def _next_item_for_core(
+    items: list[ScheduleItem],
+    per_task_counts: dict[int, int],
+    *,
+    steps_per_env: int,
+    cursor: int,
+) -> tuple[ScheduleItem | None, int]:
+    if not items:
+        return None, cursor
+    for offset in range(len(items)):
+        index = (cursor + offset) % len(items)
+        item = items[index]
+        if per_task_counts.get(item.task.task_id, 0) < steps_per_env:
+            return item, (index + 1) % len(items)
+    return None, cursor
+
+
+def run_schedule_with_step_function(
+    plan: list[ScheduleItem],
+    *,
+    steps_per_env: int,
+    step_fn: Any,
+    cpu_affinity_by_core: dict[int, bool] | None = None,
+) -> list[StepEvent]:
+    if steps_per_env < 1:
+        raise ValueError("steps_per_env must be >= 1")
+    grouped = _items_by_core(plan)
+    per_task_counts = {item.task.task_id: 0 for item in plan}
+    cursors = {core_index: 0 for core_index in grouped}
+    events: list[StepEvent] = []
+    round_index = 0
+    while any(count < steps_per_env for count in per_task_counts.values()):
+        round_results = []
+        for core_index, items in grouped.items():
+            item, next_cursor = _next_item_for_core(
+                items,
+                per_task_counts,
+                steps_per_env=steps_per_env,
+                cursor=cursors[core_index],
+            )
+            cursors[core_index] = next_cursor
+            if item is None:
+                continue
+            task_step_index = per_task_counts[item.task.task_id]
+            latency_s = float(step_fn(item, task_step_index))
+            per_task_counts[item.task.task_id] = task_step_index + 1
+            round_results.append((item, task_step_index, max(latency_s, 0.0)))
+        if not round_results:
+            break
+        round_wall_time_s = max(latency for _, _, latency in round_results)
+        for item, task_step_index, latency_s in round_results:
+            affinity = True
+            if cpu_affinity_by_core is not None:
+                affinity = bool(cpu_affinity_by_core.get(item.core_index, True))
+            events.append(
+                StepEvent(
+                    schedule_name=item.schedule_name,
+                    round_index=round_index,
+                    core_index=item.core_index,
+                    cpu_id=item.cpu_id,
+                    task_id=item.task.task_id,
+                    task_name=item.task.task_name,
+                    task_step_index=task_step_index,
+                    latency_s=latency_s,
+                    round_wall_time_s=round_wall_time_s,
+                    idle_time_s=max(round_wall_time_s - latency_s, 0.0),
+                    cpu_affinity_applied=affinity,
+                )
+            )
+        round_index += 1
+    return events
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=np.float64), percentile))
+
+
+def compute_schedule_summary(
+    schedule_name: str,
+    events: list[StepEvent],
+    *,
+    failed: bool = False,
+) -> dict[str, Any]:
+    if failed:
+        status = "failed"
+    elif any(not event.cpu_affinity_applied for event in events):
+        status = "degraded"
+    else:
+        status = "completed"
+    if not events:
+        return {
+            "schedule_name": schedule_name,
+            "status": status,
+            "total_steps": 0,
+            "makespan_s": 0.0,
+            "steps_per_second": 0.0,
+            "mean_core_idle_ratio": None,
+            "cpu_affinity_success_rate": None,
+        }
+    round_wall_times = {
+        event.round_index: event.round_wall_time_s for event in events
+    }
+    makespan_s = float(sum(round_wall_times.values()))
+    latencies = [event.latency_s for event in events]
+    idle_ratios = [
+        0.0 if event.round_wall_time_s == 0.0 else event.idle_time_s / event.round_wall_time_s
+        for event in events
+    ]
+    affinity_rate = sum(1 for event in events if event.cpu_affinity_applied) / len(events)
+    return {
+        "schedule_name": schedule_name,
+        "status": status,
+        "total_steps": len(events),
+        "makespan_s": makespan_s,
+        "steps_per_second": 0.0 if makespan_s == 0.0 else len(events) / makespan_s,
+        "mean_step_latency_s": float(np.mean(np.asarray(latencies))),
+        "median_step_latency_s": float(np.median(np.asarray(latencies))),
+        "p90_step_latency_s": _percentile(latencies, 90),
+        "p95_step_latency_s": _percentile(latencies, 95),
+        "p99_step_latency_s": _percentile(latencies, 99),
+        "mean_core_idle_ratio": float(np.mean(np.asarray(idle_ratios))),
+        "p90_round_idle_ratio": _percentile(idle_ratios, 90),
+        "p99_round_idle_ratio": _percentile(idle_ratios, 99),
+        "cpu_affinity_success_rate": float(affinity_rate),
+    }

@@ -5,13 +5,16 @@ import numpy as np
 import pytest
 
 from toolkits.run_libero_latency_schedule_benchmark import (
+    StepEvent,
     TaskRecord,
+    compute_schedule_summary,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
     estimate_latency_scores,
     load_task_records,
     sample_task_records,
+    run_schedule_with_step_function,
 )
 
 
@@ -213,3 +216,84 @@ def test_trapezoid_pipeline_rejects_odd_task_count():
 
     with pytest.raises(ValueError, match="even"):
         build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+
+
+def test_run_schedule_with_step_function_completes_equal_steps_per_task():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+    latency_by_task = {1: 0.01, 2: 0.02, 3: 0.03, 4: 0.04}
+
+    events = run_schedule_with_step_function(
+        plan,
+        steps_per_env=2,
+        step_fn=lambda item, step_index: latency_by_task[item.task.task_id],
+    )
+
+    assert len(events) == 8
+    counts = {}
+    for event in events:
+        counts[event.task_id] = counts.get(event.task_id, 0) + 1
+    assert counts == {1: 2, 2: 2, 3: 2, 4: 2}
+    assert all(event.round_wall_time_s >= event.latency_s for event in events)
+
+
+def test_compute_schedule_summary_reports_throughput_and_idle():
+    events = [
+        StepEvent(
+            schedule_name="s",
+            round_index=0,
+            core_index=0,
+            cpu_id=0,
+            task_id=1,
+            task_name="a",
+            task_step_index=0,
+            latency_s=0.01,
+            round_wall_time_s=0.02,
+            idle_time_s=0.01,
+            cpu_affinity_applied=True,
+        ),
+        StepEvent(
+            schedule_name="s",
+            round_index=0,
+            core_index=1,
+            cpu_id=1,
+            task_id=2,
+            task_name="b",
+            task_step_index=0,
+            latency_s=0.02,
+            round_wall_time_s=0.02,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+        ),
+    ]
+
+    summary = compute_schedule_summary("s", events)
+
+    assert summary["schedule_name"] == "s"
+    assert summary["status"] == "completed"
+    assert summary["total_steps"] == 2
+    assert summary["makespan_s"] == 0.02
+    assert summary["steps_per_second"] == 100.0
+    assert summary["mean_core_idle_ratio"] == 0.25
+    assert summary["cpu_affinity_success_rate"] == 1.0
+
+
+def test_compute_schedule_summary_marks_degraded_affinity():
+    event = StepEvent(
+        schedule_name="s",
+        round_index=0,
+        core_index=0,
+        cpu_id=0,
+        task_id=1,
+        task_name="a",
+        task_step_index=0,
+        latency_s=0.01,
+        round_wall_time_s=0.01,
+        idle_time_s=0.0,
+        cpu_affinity_applied=False,
+    )
+
+    summary = compute_schedule_summary("s", [event])
+
+    assert summary["status"] == "degraded"
+    assert summary["cpu_affinity_success_rate"] == 0.0
