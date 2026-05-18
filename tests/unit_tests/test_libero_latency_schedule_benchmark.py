@@ -670,3 +670,106 @@ def test_main_fake_mode_writes_outputs(tmp_path: Path):
         "task_id_baseline",
         "trapezoid_pipeline",
     }
+
+
+def _base_main_args(csv_path: Path, output_dir: Path) -> list[str]:
+    return [
+        "--task-csv",
+        str(csv_path),
+        "--num-envs",
+        "2",
+        "--cpu-ids",
+        "0,1",
+        "--steps-per-env",
+        "2",
+        "--output-dir",
+        str(output_dir),
+    ]
+
+
+@pytest.mark.parametrize("cpu_ids", ["-1,0", "0,0"])
+def test_main_rejects_invalid_cpu_ids(tmp_path: Path, cpu_ids: str):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    args = _base_main_args(csv_path, tmp_path / "out")
+    args[args.index("--cpu-ids") + 1] = cpu_ids
+    args.append("--fake-latency-from-csv")
+
+    with pytest.raises(SystemExit):
+        main(args)
+
+
+def test_main_fake_mode_ignores_invalid_dummy_action_and_clears_stale_errors(
+    tmp_path: Path,
+):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    errors_path = output_dir / "errors.jsonl"
+    errors_path.write_text('{"old": true}\n', encoding="utf-8")
+
+    exit_code = main(
+        [
+            *_base_main_args(csv_path, output_dir),
+            "--dummy-action",
+            "bad",
+            "--fake-latency-from-csv",
+        ]
+    )
+
+    assert exit_code == 0
+    assert not errors_path.exists()
+
+
+def test_main_real_mode_rejects_invalid_dummy_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("env factory should not be created for invalid CLI input")
+
+    monkeypatch.setattr(
+        "toolkits.run_libero_latency_schedule_benchmark.make_libero_env_factory",
+        fail_if_called,
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                *_base_main_args(csv_path, tmp_path / "out"),
+                "--dummy-action",
+                "bad",
+            ]
+        )
+
+
+def test_main_random_repeats_are_named_and_run_config_is_json_safe(tmp_path: Path):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+
+    exit_code = main(
+        [
+            *_base_main_args(csv_path, output_dir),
+            "--random-baseline-repeats",
+            "2",
+            "--fake-latency-from-csv",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "schedule_plan_random_baseline_0.csv").exists()
+    assert (output_dir / "schedule_plan_random_baseline_1.csv").exists()
+    summaries = json.loads((output_dir / "schedule_summary.json").read_text())
+    assert {item["schedule_name"] for item in summaries} >= {
+        "random_baseline_0",
+        "random_baseline_1",
+    }
+    run_config = json.loads((output_dir / "run_config.json").read_text())
+    assert run_config["task_csv"] == str(csv_path)
+    assert run_config["output_dir"] == str(output_dir)
+    assert run_config["cpu_ids"] == [0, 1]

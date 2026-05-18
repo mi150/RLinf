@@ -11,7 +11,7 @@ import queue
 import random
 import time
 import traceback
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -907,8 +907,25 @@ def parse_int_list(value: str) -> list[int]:
     return [int(item) for item in items]
 
 
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return _to_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_to_jsonable(value), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def write_selected_tasks(path: Path, records: list[TaskRecord]) -> None:
@@ -963,7 +980,7 @@ def write_schedule_plan(path: Path, plan: list[ScheduleItem]) -> None:
 def write_step_events(path: Path, events: list[StepEvent]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for event in events:
-            handle.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+            handle.write(json.dumps(_to_jsonable(event), sort_keys=True) + "\n")
 
 
 def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
@@ -1019,7 +1036,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _dummy_action_from_arg(value: str) -> list[float]:
-    return [float(item.strip()) for item in value.split(",") if item.strip()]
+    try:
+        action = [float(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("--dummy-action must be a comma-separated list of floats") from exc
+    if not action:
+        raise ValueError("--dummy-action must not be empty")
+    return action
 
 
 def _fake_step_fn(item: ScheduleItem, step_index: int) -> float:
@@ -1029,9 +1052,22 @@ def _fake_step_fn(item: ScheduleItem, step_index: int) -> float:
 
 def _parse_cpu_ids_or_exit(parser: argparse.ArgumentParser, value: str) -> list[int]:
     try:
-        return parse_int_list(value)
+        cpu_ids = parse_int_list(value)
     except ValueError as exc:
         parser.error(f"--cpu-ids: {exc}")
+    invalid_cpu_ids = [cpu_id for cpu_id in cpu_ids if cpu_id < 0]
+    if invalid_cpu_ids:
+        parser.error(f"--cpu-ids must be >= 0: {invalid_cpu_ids[0]}")
+    if len(set(cpu_ids)) != len(cpu_ids):
+        parser.error("--cpu-ids must not contain duplicates")
+    return cpu_ids
+
+
+def _dummy_action_or_exit(parser: argparse.ArgumentParser, value: str) -> list[float]:
+    try:
+        return _dummy_action_from_arg(value)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def _validate_cli_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -1056,6 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
     cpu_ids = _parse_cpu_ids_or_exit(parser, args.cpu_ids)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    errors_path = output_dir / "errors.jsonl"
+    errors_path.unlink(missing_ok=True)
     records = estimate_latency_scores(
         sample_task_records(
             load_task_records(args.task_csv),
@@ -1063,10 +1101,8 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
         )
     )
-    dummy_action = _dummy_action_from_arg(args.dummy_action)
     run_config = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
+        key: _to_jsonable(value) for key, value in vars(args).items()
     }
     run_config["cpu_ids"] = cpu_ids
     write_json(output_dir / "run_config.json", run_config)
@@ -1091,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
             step_fn=_fake_step_fn,
         )
     else:
+        dummy_action = _dummy_action_or_exit(parser, args.dummy_action)
         env_factory = make_libero_env_factory(
             suite=args.suite,
             camera_height=args.camera_height,
@@ -1129,9 +1166,9 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output_dir / "schedule_summary.json", summaries)
     write_comparison_report(output_dir / "comparison_report.md", summaries)
     if errors:
-        with (output_dir / "errors.jsonl").open("w", encoding="utf-8") as handle:
+        with errors_path.open("w", encoding="utf-8") as handle:
             for error in errors:
-                handle.write(json.dumps(error, sort_keys=True) + "\n")
+                handle.write(json.dumps(_to_jsonable(error), sort_keys=True) + "\n")
     return 0
 
 
