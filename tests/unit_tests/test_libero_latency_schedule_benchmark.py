@@ -972,6 +972,13 @@ def test_main_random_repeats_are_named_and_run_config_is_json_safe(tmp_path: Pat
         "random_baseline_0",
         "random_baseline_1",
     }
+    summary_by_name = {item["schedule_name"]: item for item in summaries}
+    assert summary_by_name["trapezoid_pipeline"][
+        "speedup_vs_task_id_baseline"
+    ] is not None
+    assert summary_by_name["trapezoid_pipeline"][
+        "bubble_reduction_vs_task_id_baseline"
+    ] is not None
     run_config = json.loads((output_dir / "run_config.json").read_text())
     assert run_config["task_csv"] == str(csv_path)
     assert run_config["output_dir"] == str(output_dir)
