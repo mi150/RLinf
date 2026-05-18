@@ -116,6 +116,7 @@ def estimate_latency_scores(
 TASK_ID_BASELINE = "task_id_baseline"
 RANDOM_BASELINE = "random_baseline"
 TRAPEZOID_PIPELINE = "trapezoid_pipeline"
+PHASE_SHIFTED_TRAPEZOID = "phase_shifted_trapezoid"
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,46 @@ def build_trapezoid_pipeline_plan(
         order_offset=len(long_items),
     )
     return long_items + short_items
+
+
+def build_phase_shifted_trapezoid_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+) -> list[ScheduleItem]:
+    plan = build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids)
+    long_items_by_core = {
+        item.core_index: item
+        for item in plan
+        if item.side == "long" and item.layer_index == 0
+    }
+    sorted_long_cores = sorted(
+        long_items_by_core,
+        key=lambda core_index: (
+            -long_items_by_core[core_index].task.estimated_latency_score,
+            long_items_by_core[core_index].task.task_id,
+            core_index,
+        ),
+    )
+    short_first_count = 0 if len(sorted_long_cores) == 1 else len(sorted_long_cores) // 2
+    short_first_cores = set(sorted_long_cores[:short_first_count])
+    shifted = []
+    for item in plan:
+        schedule_name = PHASE_SHIFTED_TRAPEZOID
+        if item.core_index not in short_first_cores:
+            order_index = item.order_index
+        elif item.side == "long":
+            order_index = item.order_index + len(plan)
+        else:
+            order_index = item.order_index - len(plan)
+        shifted.append(
+            replace(
+                item,
+                schedule_name=schedule_name,
+                order_index=order_index,
+            )
+        )
+    return sorted(shifted, key=lambda item: item.order_index)
 
 
 def _items_by_core(plan: list[ScheduleItem]) -> dict[int, list[ScheduleItem]]:
@@ -1439,6 +1480,7 @@ def main(argv: list[str] | None = None) -> int:
     plans: list[list[ScheduleItem]] = [
         build_task_id_baseline_plan(records, cpu_ids=cpu_ids),
         build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids),
+        build_phase_shifted_trapezoid_plan(records, cpu_ids=cpu_ids),
     ]
     for repeat in range(args.random_baseline_repeats):
         plans.append(

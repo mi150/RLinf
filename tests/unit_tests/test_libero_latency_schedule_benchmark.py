@@ -12,6 +12,7 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     StepEvent,
     TaskRecord,
     apply_cpu_affinity,
+    build_phase_shifted_trapezoid_plan,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
@@ -206,6 +207,75 @@ def _records_for_schedule() -> list[TaskRecord]:
     ]
 
 
+def _records_for_four_core_phase_shift() -> list[TaskRecord]:
+    return [
+        TaskRecord(
+            task_id=10,
+            task_name="long_100",
+            mean_latency_ms=100.0,
+            njnt=100,
+            ngeom=100,
+            estimated_latency_score=100.0,
+        ),
+        TaskRecord(
+            task_id=11,
+            task_name="long_90",
+            mean_latency_ms=90.0,
+            njnt=90,
+            ngeom=90,
+            estimated_latency_score=90.0,
+        ),
+        TaskRecord(
+            task_id=12,
+            task_name="long_80",
+            mean_latency_ms=80.0,
+            njnt=80,
+            ngeom=80,
+            estimated_latency_score=80.0,
+        ),
+        TaskRecord(
+            task_id=13,
+            task_name="long_70",
+            mean_latency_ms=70.0,
+            njnt=70,
+            ngeom=70,
+            estimated_latency_score=70.0,
+        ),
+        TaskRecord(
+            task_id=14,
+            task_name="short_60",
+            mean_latency_ms=60.0,
+            njnt=60,
+            ngeom=60,
+            estimated_latency_score=60.0,
+        ),
+        TaskRecord(
+            task_id=15,
+            task_name="short_50",
+            mean_latency_ms=50.0,
+            njnt=50,
+            ngeom=50,
+            estimated_latency_score=50.0,
+        ),
+        TaskRecord(
+            task_id=16,
+            task_name="short_40",
+            mean_latency_ms=40.0,
+            njnt=40,
+            ngeom=40,
+            estimated_latency_score=40.0,
+        ),
+        TaskRecord(
+            task_id=17,
+            task_name="short_30",
+            mean_latency_ms=30.0,
+            njnt=30,
+            ngeom=30,
+            estimated_latency_score=30.0,
+        ),
+    ]
+
+
 class FakeProcessEnv:
     def __init__(self, latency_s: float):
         self.latency_s = latency_s
@@ -328,6 +398,71 @@ def test_trapezoid_pipeline_rejects_odd_task_count():
 
     with pytest.raises(ValueError, match="even"):
         build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+
+
+def test_phase_shifted_trapezoid_staggers_long_and_short_rounds_by_core():
+    records = _records_for_four_core_phase_shift()
+    trapezoid_plan = build_trapezoid_pipeline_plan(records, cpu_ids=[20, 21, 22, 23])
+    plan = build_phase_shifted_trapezoid_plan(records, cpu_ids=[20, 21, 22, 23])
+    side_by_task = {item.task.task_id: item.side for item in plan}
+
+    long_items = [item for item in plan if item.side == "long"]
+    short_items = [item for item in plan if item.side == "short"]
+    long_by_core = {item.core_index: item for item in long_items}
+    short_by_core = {item.core_index: item for item in short_items}
+
+    assert {
+        core_index: (long_by_core[core_index].task.task_id, short_by_core[core_index].task.task_id)
+        for core_index in sorted(long_by_core)
+    } == {
+        0: (10, 17),
+        1: (11, 16),
+        2: (12, 15),
+        3: (13, 14),
+    }
+    assert {
+        (item.task.task_id, item.core_index, item.cpu_id, item.layer_index, item.side)
+        for item in plan
+    } == {
+        (item.task.task_id, item.core_index, item.cpu_id, item.layer_index, item.side)
+        for item in trapezoid_plan
+    }
+
+    events = run_schedule_with_step_function(
+        plan,
+        steps_per_env=1,
+        step_fn=lambda item, step_index: item.task.estimated_latency_score / 1000.0,
+    )
+    trapezoid_events = run_schedule_with_step_function(
+        trapezoid_plan,
+        steps_per_env=1,
+        step_fn=lambda item, step_index: item.task.estimated_latency_score / 1000.0,
+    )
+    round0_sides = {
+        event.core_index: side_by_task[event.task_id]
+        for event in events
+        if event.round_index == 0
+    }
+    round0_task_ids = {event.task_id for event in events if event.round_index == 0}
+    phase_round_wall_times = {
+        round_index: max(event.latency_s for event in events if event.round_index == round_index)
+        for round_index in [0, 1]
+    }
+    trapezoid_round_wall_times = {
+        round_index: max(
+            event.latency_s
+            for event in trapezoid_events
+            if event.round_index == round_index
+        )
+        for round_index in [0, 1]
+    }
+
+    assert round0_sides == {0: "short", 1: "short", 2: "long", 3: "long"}
+    assert not {10, 11}.issubset(round0_task_ids)
+    assert abs(phase_round_wall_times[0] - phase_round_wall_times[1]) < abs(
+        trapezoid_round_wall_times[0] - trapezoid_round_wall_times[1]
+    )
+    assert {item.schedule_name for item in plan} == {"phase_shifted_trapezoid"}
 
 
 def test_run_schedule_with_step_function_completes_equal_steps_per_task():
