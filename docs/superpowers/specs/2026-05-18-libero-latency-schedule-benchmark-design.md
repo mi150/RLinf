@@ -42,8 +42,9 @@ Each run samples tasks without replacement from this CSV:
 - The command runs one selected `num_envs` value at a time.
 
 The benchmark also accepts normal LIBERO execution settings such as suite,
-trial selection, camera size, warmup steps, dummy action, CPU core list, and
-steps per environment.
+camera size, warmup steps, dummy action, CPU core list, and steps per
+environment. The current CLI fixes real LIBERO execution to one trial/init
+state per selected task and does not expose trial selection.
 
 ## Latency Estimation
 
@@ -177,7 +178,7 @@ tasks stayed on the same core.
 
 ## Example Commands
 
-Unit-test smoke mode:
+Fake-latency CLI smoke mode:
 
 ```bash
 python toolkits/run_libero_latency_schedule_benchmark.py \
