@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 
 from toolkits.run_libero_latency_schedule_benchmark import (
-    ScheduleItem,
     TaskRecord,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
@@ -167,18 +166,45 @@ def test_random_baseline_is_seeded_and_static():
     second = build_random_baseline_plan(_records_for_schedule(), cpu_ids=[0, 1], seed=7)
 
     assert [item.task.task_id for item in first] == [item.task.task_id for item in second]
+    assert [item.task.task_id for item in first] == [2, 1, 4, 3]
+    assert [(item.core_index, item.cpu_id, item.layer_index) for item in first] == [
+        (0, 0, 0),
+        (1, 1, 0),
+        (0, 0, 1),
+        (1, 1, 1),
+    ]
     assert {item.schedule_name for item in first} == {"random_baseline"}
 
 
 def test_trapezoid_pipeline_keeps_long_short_pairs_on_same_core():
-    plan = build_trapezoid_pipeline_plan(_records_for_schedule(), cpu_ids=[0, 1])
+    plan = build_trapezoid_pipeline_plan(_records_for_schedule(), cpu_ids=[20, 21])
 
     long_items = [item for item in plan if item.side == "long"]
     short_items = [item for item in plan if item.side == "short"]
-    assert [item.task.task_id for item in long_items] == [4, 3]
-    assert [item.task.task_id for item in short_items] == [1, 2]
-    assert [item.core_index for item in long_items] == [0, 1]
-    assert [item.core_index for item in short_items] == [0, 1]
+    long_by_core = {item.core_index: item for item in long_items}
+    short_by_core = {item.core_index: item for item in short_items}
+
+    assert {
+        core_index: (long_by_core[core_index].task.task_id, short_by_core[core_index].task.task_id)
+        for core_index in sorted(long_by_core)
+    } == {
+        0: (4, 1),
+        1: (3, 2),
+    }
+    assert [
+        (item.core_index, item.cpu_id, item.layer_index, item.order_index)
+        for item in long_items
+    ] == [
+        (0, 20, 0, 0),
+        (1, 21, 0, 1),
+    ]
+    assert [
+        (item.core_index, item.cpu_id, item.layer_index, item.order_index)
+        for item in short_items
+    ] == [
+        (0, 20, 0, 2),
+        (1, 21, 0, 3),
+    ]
     assert {item.schedule_name for item in plan} == {"trapezoid_pipeline"}
 
 
