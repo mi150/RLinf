@@ -527,6 +527,7 @@ def test_run_schedule_with_process_workers_timeout_includes_diagnostics():
         env_factory=sleeping_process_env_factory,
         dummy_action=[0.0] * 7,
         subprocess_timeout_s=0.01,
+        startup_timeout_s=10.0,
     )
 
     assert result.events == []
@@ -724,7 +725,7 @@ def test_compute_comparison_metrics_compares_and_aggregates_random():
     assert comparison["trapezoid_pipeline"]["speedup_vs_task_id_baseline"] == 1.5
     assert (
         comparison["trapezoid_pipeline"]["bubble_reduction_vs_task_id_baseline"]
-        == 0.75
+        == pytest.approx(0.75)
     )
     assert comparison["random_baseline_0"]["speedup_vs_task_id_baseline"] == 0.8
     random_aggregate = metrics["random_aggregate"]
