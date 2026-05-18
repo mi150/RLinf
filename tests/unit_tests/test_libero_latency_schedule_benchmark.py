@@ -9,12 +9,15 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     ScheduleItem,
     StepEvent,
     TaskRecord,
+    apply_cpu_affinity,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
+    build_worker_plans,
     compute_schedule_summary,
     estimate_latency_scores,
     load_task_records,
+    run_schedule_with_process_workers,
     run_schedule_with_step_function,
     sample_task_records,
 )
@@ -153,6 +156,30 @@ def _records_for_schedule() -> list[TaskRecord]:
     ]
 
 
+class FakeProcessEnv:
+    def __init__(self, latency_s: float):
+        self.latency_s = latency_s
+
+    def step(self, action):
+        del action
+        return {}, 0.0, False, {}
+
+
+class FailingProcessEnv:
+    def step(self, action):
+        del action
+        raise RuntimeError("process step failed")
+
+
+def fake_process_env_factory(item: ScheduleItem):
+    return FakeProcessEnv(latency_s=item.task.mean_latency_ms / 1000.0)
+
+
+def failing_process_env_factory(item: ScheduleItem):
+    del item
+    return FailingProcessEnv()
+
+
 def test_task_id_baseline_assigns_sorted_tasks_to_core_columns():
     plan = build_task_id_baseline_plan(_records_for_schedule(), cpu_ids=[10, 11])
 
@@ -276,6 +303,67 @@ def test_run_schedule_with_step_function_rejects_invalid_latency_values():
         )
 
 
+def test_build_worker_plans_groups_items_by_core():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[10, 11])
+
+    worker_plans = build_worker_plans(plan)
+
+    assert sorted(worker_plans) == [0, 1]
+    assert [item.cpu_id for item in worker_plans[0]] == [10, 10]
+    assert [item.cpu_id for item in worker_plans[1]] == [11, 11]
+
+
+def test_run_schedule_with_process_workers_completes_equal_steps_per_task():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=fake_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.errors == []
+    assert len(result.events) == 4
+    assert {event.task_id for event in result.events} == {1, 2, 3, 4}
+    assert all(event.round_wall_time_s >= event.latency_s for event in result.events)
+
+
+def test_run_schedule_with_process_workers_reports_step_error_context():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=failing_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.events == []
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error["event"] == "error"
+    assert error["core_index"] == 0
+    assert error["cpu_id"] == 0
+    assert error["task_id"] == 1
+    assert error["task_name"] == "t1"
+    assert error["task_step_index"] == 0
+    assert error["error_type"] == "RuntimeError"
+    assert "process step failed" in error["error"]
+    assert "Traceback" in error["traceback"]
+
+
+def test_apply_cpu_affinity_returns_false_when_affinity_unavailable(monkeypatch):
+    monkeypatch.delattr("os.sched_setaffinity", raising=False)
+
+    assert apply_cpu_affinity(0) is False
+
+
 def test_compute_schedule_summary_reports_throughput_and_idle():
     events = [
         StepEvent(
@@ -393,6 +481,24 @@ def test_benchmark_runner_uses_injected_step_function_for_unit_tests():
     runner = BenchmarkRunner(
         steps_per_env=1,
         step_fn=lambda item, step_index: 0.01 * item.task.task_id,
+    )
+
+    result = runner.run("task_id_baseline", plan)
+
+    assert result.summary["schedule_name"] == "task_id_baseline"
+    assert result.summary["total_steps"] == 4
+    assert len(result.events) == 4
+    assert result.errors == []
+
+
+def test_benchmark_runner_uses_process_workers_without_step_function():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+    runner = BenchmarkRunner(
+        steps_per_env=1,
+        env_factory=fake_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
     )
 
     result = runner.run("task_id_baseline", plan)
