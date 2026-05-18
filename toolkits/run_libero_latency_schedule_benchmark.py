@@ -103,3 +103,110 @@ def estimate_latency_scores(
         score = weight_jnt * jnt_score + weight_geom * geom_score
         scored.append(replace(record, estimated_latency_score=float(score)))
     return scored
+
+
+TASK_ID_BASELINE = "task_id_baseline"
+RANDOM_BASELINE = "random_baseline"
+TRAPEZOID_PIPELINE = "trapezoid_pipeline"
+
+
+@dataclass(frozen=True)
+class ScheduleItem:
+    schedule_name: str
+    task: TaskRecord
+    core_index: int
+    cpu_id: int
+    layer_index: int
+    order_index: int
+    side: str = "baseline"
+
+
+def _require_cpu_ids(cpu_ids: list[int]) -> None:
+    if not cpu_ids:
+        raise ValueError("cpu_ids must not be empty")
+
+
+def _layered_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+    schedule_name: str,
+    side: str = "baseline",
+    order_offset: int = 0,
+) -> list[ScheduleItem]:
+    _require_cpu_ids(cpu_ids)
+    items = []
+    for index, record in enumerate(records):
+        core_index = index % len(cpu_ids)
+        layer_index = index // len(cpu_ids)
+        items.append(
+            ScheduleItem(
+                schedule_name=schedule_name,
+                task=record,
+                core_index=core_index,
+                cpu_id=cpu_ids[core_index],
+                layer_index=layer_index,
+                order_index=order_offset + index,
+                side=side,
+            )
+        )
+    return items
+
+
+def build_task_id_baseline_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+) -> list[ScheduleItem]:
+    ordered = sorted(records, key=lambda record: record.task_id)
+    return _layered_plan(
+        ordered,
+        cpu_ids=cpu_ids,
+        schedule_name=TASK_ID_BASELINE,
+    )
+
+
+def build_random_baseline_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+    seed: int,
+) -> list[ScheduleItem]:
+    ordered = list(records)
+    random.Random(seed).shuffle(ordered)
+    return _layered_plan(
+        ordered,
+        cpu_ids=cpu_ids,
+        schedule_name=RANDOM_BASELINE,
+    )
+
+
+def build_trapezoid_pipeline_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+) -> list[ScheduleItem]:
+    _require_cpu_ids(cpu_ids)
+    if len(records) % 2 != 0:
+        raise ValueError("trapezoid_pipeline requires an even number of tasks")
+    ordered = sorted(
+        records,
+        key=lambda record: (-record.estimated_latency_score, record.task_id),
+    )
+    split = len(ordered) // 2
+    long_half = ordered[:split]
+    short_half = list(reversed(ordered[split:]))
+    long_items = _layered_plan(
+        long_half,
+        cpu_ids=cpu_ids,
+        schedule_name=TRAPEZOID_PIPELINE,
+        side="long",
+    )
+    short_items = _layered_plan(
+        short_half,
+        cpu_ids=cpu_ids,
+        schedule_name=TRAPEZOID_PIPELINE,
+        side="short",
+        order_offset=len(long_items),
+    )
+    return long_items + short_items

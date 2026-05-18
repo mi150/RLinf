@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 
 from toolkits.run_libero_latency_schedule_benchmark import (
+    ScheduleItem,
     TaskRecord,
+    build_random_baseline_plan,
+    build_task_id_baseline_plan,
+    build_trapezoid_pipeline_plan,
     estimate_latency_scores,
     load_task_records,
     sample_task_records,
@@ -106,3 +110,80 @@ def test_estimate_latency_scores_uses_z_scored_njnt_and_ngeom():
         [record.estimated_latency_score for record in scored],
         expected,
     )
+
+
+def _records_for_schedule() -> list[TaskRecord]:
+    return [
+        TaskRecord(
+            task_id=4,
+            task_name="t4",
+            mean_latency_ms=4.0,
+            njnt=14,
+            ngeom=140,
+            estimated_latency_score=4.0,
+        ),
+        TaskRecord(
+            task_id=1,
+            task_name="t1",
+            mean_latency_ms=1.0,
+            njnt=11,
+            ngeom=110,
+            estimated_latency_score=1.0,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="t3",
+            mean_latency_ms=3.0,
+            njnt=13,
+            ngeom=130,
+            estimated_latency_score=3.0,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="t2",
+            mean_latency_ms=2.0,
+            njnt=12,
+            ngeom=120,
+            estimated_latency_score=2.0,
+        ),
+    ]
+
+
+def test_task_id_baseline_assigns_sorted_tasks_to_core_columns():
+    plan = build_task_id_baseline_plan(_records_for_schedule(), cpu_ids=[10, 11])
+
+    assert [item.task.task_id for item in plan] == [1, 2, 3, 4]
+    assert [(item.core_index, item.cpu_id, item.layer_index) for item in plan] == [
+        (0, 10, 0),
+        (1, 11, 0),
+        (0, 10, 1),
+        (1, 11, 1),
+    ]
+    assert {item.schedule_name for item in plan} == {"task_id_baseline"}
+
+
+def test_random_baseline_is_seeded_and_static():
+    first = build_random_baseline_plan(_records_for_schedule(), cpu_ids=[0, 1], seed=7)
+    second = build_random_baseline_plan(_records_for_schedule(), cpu_ids=[0, 1], seed=7)
+
+    assert [item.task.task_id for item in first] == [item.task.task_id for item in second]
+    assert {item.schedule_name for item in first} == {"random_baseline"}
+
+
+def test_trapezoid_pipeline_keeps_long_short_pairs_on_same_core():
+    plan = build_trapezoid_pipeline_plan(_records_for_schedule(), cpu_ids=[0, 1])
+
+    long_items = [item for item in plan if item.side == "long"]
+    short_items = [item for item in plan if item.side == "short"]
+    assert [item.task.task_id for item in long_items] == [4, 3]
+    assert [item.task.task_id for item in short_items] == [1, 2]
+    assert [item.core_index for item in long_items] == [0, 1]
+    assert [item.core_index for item in short_items] == [0, 1]
+    assert {item.schedule_name for item in plan} == {"trapezoid_pipeline"}
+
+
+def test_trapezoid_pipeline_rejects_odd_task_count():
+    records = _records_for_schedule()[:3]
+
+    with pytest.raises(ValueError, match="even"):
+        build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
