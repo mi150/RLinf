@@ -251,6 +251,9 @@ def _validate_schedule_inputs(plan: list[ScheduleItem], *, steps_per_env: int) -
         raise ValueError("plan must not be empty")
     if steps_per_env < 1:
         raise ValueError("steps_per_env must be >= 1")
+    invalid_cpu_ids = [item.cpu_id for item in plan if item.cpu_id < 0]
+    if invalid_cpu_ids:
+        raise ValueError(f"cpu_id must be >= 0: {invalid_cpu_ids[0]}")
     task_ids = [item.task.task_id for item in plan]
     if len(set(task_ids)) != len(task_ids):
         raise ValueError("duplicate task_id in schedule plan")
@@ -261,7 +264,7 @@ def apply_cpu_affinity(cpu_id: int | None) -> bool:
         return False
     try:
         os.sched_setaffinity(0, {cpu_id})
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 
@@ -322,17 +325,21 @@ def _worker_loop(
 ) -> None:
     del steps_per_env
     cpu_id = items[0].cpu_id if items else None
-    affinity_applied = apply_cpu_affinity(cpu_id)
+    affinity_applied = False
     envs: dict[int, Any] = {}
     task_counts = {item.task.task_id: 0 for item in items}
     current_item: ScheduleItem | None = None
     current_step_index: int | None = None
+    current_phase = "affinity"
     try:
+        affinity_applied = apply_cpu_affinity(cpu_id)
+        current_phase = "env_init"
         for item in items:
             current_item = item
             if item.task.task_id not in envs:
                 envs[item.task.task_id] = env_factory(item)
         current_item = None
+        current_phase = "command_wait"
         while True:
             command = command_queue.get()
             if command == "stop":
@@ -342,6 +349,7 @@ def _worker_loop(
             env = envs[item.task.task_id]
             task_step_index = task_counts[item.task.task_id]
             current_step_index = task_step_index
+            current_phase = "step"
             start = time.perf_counter()
             env.step(np.asarray(dummy_action, dtype=np.float32))
             latency_s = max(float(time.perf_counter() - start), 0.0)
@@ -361,9 +369,11 @@ def _worker_loop(
             )
             current_item = None
             current_step_index = None
+            current_phase = "command_wait"
     except Exception as exc:
         error = {
             "event": "error",
+            "phase": current_phase,
             "core_index": core_index,
             "cpu_id": cpu_id,
             "error_type": exc.__class__.__name__,
@@ -384,6 +394,45 @@ def _worker_loop(
             close = getattr(env, "close", None)
             if close is not None:
                 close()
+
+
+def _command_diagnostic(command: tuple[int, ScheduleItem]) -> dict[str, Any]:
+    core_index, item = command
+    return {
+        "core_index": core_index,
+        "cpu_id": item.cpu_id,
+        "task_id": item.task.task_id,
+        "task_name": item.task.task_name,
+    }
+
+
+def _process_exitcode_diagnostics(
+    processes: list[tuple[int, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "pid": process.pid,
+            "core_index": core_index,
+            "exitcode": process.exitcode,
+            "is_alive": process.is_alive(),
+        }
+        for core_index, process in processes
+    ]
+
+
+def _close_mp_queue(mp_queue: Any) -> None:
+    close = getattr(mp_queue, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass
+    join_thread = getattr(mp_queue, "join_thread", None)
+    if join_thread is not None:
+        try:
+            join_thread()
+        except Exception:
+            pass
 
 
 def _coerce_worker_latency(raw_result: dict[str, Any], *, schedule_name: str) -> float:
@@ -434,7 +483,7 @@ def run_schedule_with_process_workers(
     ctx = mp_context or mp.get_context("spawn")
     result_queue = ctx.Queue()
     command_queues: dict[int, Any] = {}
-    processes = []
+    processes: list[tuple[int, Any]] = []
     events: list[StepEvent] = []
     try:
         for core_index, items in sorted(grouped.items()):
@@ -453,7 +502,7 @@ def run_schedule_with_process_workers(
                 },
             )
             process.start()
-            processes.append(process)
+            processes.append((core_index, process))
 
         round_index = 0
         while any(count < steps_per_env for count in per_task_counts.values()):
@@ -469,6 +518,10 @@ def run_schedule_with_process_workers(
                 command_queues[core_index].put((round_index, item))
 
             round_results = []
+            pending_commands_by_core = {
+                core_index: _command_diagnostic((core_index, item))
+                for core_index, item in commands
+            }
             deadline = time.monotonic() + subprocess_timeout_s
             for _ in commands:
                 remaining_s = max(deadline - time.monotonic(), 0.0)
@@ -482,6 +535,8 @@ def run_schedule_with_process_workers(
                                 "event": "timeout",
                                 "schedule_name": schedule_name,
                                 "round_index": round_index,
+                                "pending_commands": list(pending_commands_by_core.values()),
+                                "process_exitcodes": _process_exitcode_diagnostics(processes),
                                 "error_type": "TimeoutError",
                                 "error": (
                                     "timed out waiting for process worker result "
@@ -507,6 +562,7 @@ def run_schedule_with_process_workers(
                         ],
                     )
                 round_results.append(result)
+                pending_commands_by_core.pop(int(result["core_index"]), None)
 
             try:
                 round_wall_time_s = max(
@@ -540,12 +596,18 @@ def run_schedule_with_process_workers(
         return ProcessRunResult(events=events, errors=[])
     finally:
         for command_queue in command_queues.values():
-            command_queue.put("stop")
-        for process in processes:
+            try:
+                command_queue.put("stop")
+            except Exception:
+                pass
+        for _, process in processes:
             process.join(timeout=1.0)
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1.0)
+        for command_queue in command_queues.values():
+            _close_mp_queue(command_queue)
+        _close_mp_queue(result_queue)
 
 
 def run_schedule_with_step_function(

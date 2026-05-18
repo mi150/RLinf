@@ -1,4 +1,5 @@
 import csv
+import time
 from pathlib import Path
 
 import numpy as np
@@ -171,6 +172,16 @@ class FailingProcessEnv:
         raise RuntimeError("process step failed")
 
 
+class SleepingProcessEnv:
+    def __init__(self, sleep_s: float):
+        self.sleep_s = sleep_s
+
+    def step(self, action):
+        del action
+        time.sleep(self.sleep_s)
+        return {}, 0.0, False, {}
+
+
 def fake_process_env_factory(item: ScheduleItem):
     return FakeProcessEnv(latency_s=item.task.mean_latency_ms / 1000.0)
 
@@ -178,6 +189,15 @@ def fake_process_env_factory(item: ScheduleItem):
 def failing_process_env_factory(item: ScheduleItem):
     del item
     return FailingProcessEnv()
+
+
+def failing_process_env_init_factory(item: ScheduleItem):
+    raise RuntimeError(f"env init failed for task {item.task.task_id}")
+
+
+def sleeping_process_env_factory(item: ScheduleItem):
+    del item
+    return SleepingProcessEnv(sleep_s=0.2)
 
 
 def test_task_id_baseline_assigns_sorted_tasks_to_core_columns():
@@ -356,6 +376,93 @@ def test_run_schedule_with_process_workers_reports_step_error_context():
     assert error["error_type"] == "RuntimeError"
     assert "process step failed" in error["error"]
     assert "Traceback" in error["traceback"]
+
+
+def test_run_schedule_with_process_workers_reports_env_init_error_context():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=failing_process_env_init_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+    )
+
+    assert result.events == []
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error["event"] == "error"
+    assert error["phase"] == "env_init"
+    assert error["core_index"] == 0
+    assert error["cpu_id"] == 0
+    assert error["task_id"] == 1
+    assert error["task_name"] == "t1"
+    assert error["task_step_index"] is None
+    assert error["error_type"] == "RuntimeError"
+    assert "env init failed for task 1" in error["error"]
+    assert "Traceback" in error["traceback"]
+
+
+def test_run_schedule_with_process_workers_timeout_includes_diagnostics():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=sleeping_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=0.01,
+    )
+
+    assert result.events == []
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error["event"] == "timeout"
+    assert error["schedule_name"] == "task_id_baseline"
+    assert error["round_index"] == 0
+    assert error["pending_commands"]
+    assert {
+        "core_index",
+        "cpu_id",
+        "task_id",
+        "task_name",
+    } <= set(error["pending_commands"][0])
+    assert error["process_exitcodes"]
+    assert {
+        "pid",
+        "core_index",
+        "exitcode",
+        "is_alive",
+    } <= set(error["process_exitcodes"][0])
+
+
+def test_run_schedule_with_process_workers_rejects_empty_plan():
+    with pytest.raises(ValueError, match="plan must not be empty"):
+        run_schedule_with_process_workers(
+            [],
+            steps_per_env=1,
+            env_factory=fake_process_env_factory,
+            dummy_action=[0.0] * 7,
+            subprocess_timeout_s=10.0,
+        )
+
+
+def test_run_schedule_with_process_workers_rejects_duplicate_task_ids():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+    duplicate_plan = plan + [plan[0]]
+
+    with pytest.raises(ValueError, match="duplicate task_id"):
+        run_schedule_with_process_workers(
+            duplicate_plan,
+            steps_per_env=1,
+            env_factory=fake_process_env_factory,
+            dummy_action=[0.0] * 7,
+            subprocess_timeout_s=10.0,
+        )
 
 
 def test_apply_cpu_affinity_returns_false_when_affinity_unavailable(monkeypatch):
