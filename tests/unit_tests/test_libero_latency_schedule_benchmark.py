@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 
 from toolkits.run_libero_latency_schedule_benchmark import (
+    BenchmarkRunner,
+    ScheduleItem,
     StepEvent,
     TaskRecord,
     build_random_baseline_plan,
@@ -383,3 +385,37 @@ def test_compute_schedule_summary_includes_missing_core_idle():
 
     assert summary["makespan_s"] == 0.05
     assert summary["mean_core_idle_ratio"] == pytest.approx(0.375)
+
+
+def test_benchmark_runner_uses_injected_step_function_for_unit_tests():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+    runner = BenchmarkRunner(
+        steps_per_env=1,
+        step_fn=lambda item, step_index: 0.01 * item.task.task_id,
+    )
+
+    result = runner.run("task_id_baseline", plan)
+
+    assert result.summary["schedule_name"] == "task_id_baseline"
+    assert result.summary["total_steps"] == 4
+    assert len(result.events) == 4
+    assert result.errors == []
+
+
+def test_benchmark_runner_reports_failed_schedule_from_step_exception():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    def fail_on_task(item: ScheduleItem, step_index: int) -> float:
+        if item.task.task_id == 2:
+            raise RuntimeError("step failed")
+        return 0.01
+
+    runner = BenchmarkRunner(steps_per_env=1, step_fn=fail_on_task)
+
+    result = runner.run("task_id_baseline", plan)
+
+    assert result.summary["status"] == "failed"
+    assert result.errors
+    assert "step failed" in result.errors[0]["error"]

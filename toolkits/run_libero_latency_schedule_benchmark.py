@@ -391,3 +391,54 @@ def compute_schedule_summary(
         "p99_round_idle_ratio": _percentile(idle_ratios, 99),
         "cpu_affinity_success_rate": float(affinity_rate),
     }
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    schedule_name: str
+    events: list[StepEvent]
+    summary: dict[str, Any]
+    errors: list[dict[str, Any]]
+
+
+class BenchmarkRunner:
+    def __init__(
+        self,
+        *,
+        steps_per_env: int,
+        step_fn: Any | None = None,
+    ) -> None:
+        self.steps_per_env = steps_per_env
+        self.step_fn = step_fn
+
+    def run(self, schedule_name: str, plan: list[ScheduleItem]) -> BenchmarkResult:
+        if self.step_fn is None:
+            raise RuntimeError("step_fn is required until process worker support is added in task 5")
+        try:
+            events = run_schedule_with_step_function(
+                plan,
+                steps_per_env=self.steps_per_env,
+                step_fn=self.step_fn,
+            )
+            summary = compute_schedule_summary(schedule_name, events)
+            return BenchmarkResult(
+                schedule_name=schedule_name,
+                events=events,
+                summary=summary,
+                errors=[],
+            )
+        except Exception as exc:
+            summary = compute_schedule_summary(schedule_name, [], failed=True)
+            return BenchmarkResult(
+                schedule_name=schedule_name,
+                events=[],
+                summary=summary,
+                errors=[
+                    {
+                        "event": "error",
+                        "schedule_name": schedule_name,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    }
+                ],
+            )
