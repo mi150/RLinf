@@ -175,6 +175,32 @@ task, latency, round wall time, idle time, and CPU affinity status.
 includes the mapping evidence needed to verify that corresponding long and short
 tasks stayed on the same core.
 
+## Example Commands
+
+Unit-test smoke mode:
+
+```bash
+python toolkits/run_libero_latency_schedule_benchmark.py \
+  --task-csv results/libero90_step_latency_all_tasks_10steps/task_latency_ranked.csv \
+  --num-envs 32 \
+  --cpu-ids 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --steps-per-env 10 \
+  --output-dir results/libero90_latency_schedule_smoke \
+  --fake-latency-from-csv
+```
+
+Real LIBERO benchmark:
+
+```bash
+python toolkits/run_libero_latency_schedule_benchmark.py \
+  --task-csv results/libero90_step_latency_all_tasks_10steps/task_latency_ranked.csv \
+  --num-envs 64 \
+  --cpu-ids 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31 \
+  --steps-per-env 100 \
+  --warmup-steps 20 \
+  --output-dir results/libero90_latency_schedule_real
+```
+
 ## Error Handling
 
 Worker initialization failure, environment creation failure, step exceptions,
