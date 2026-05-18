@@ -1,7 +1,7 @@
 import csv
-import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from toolkits.run_libero_latency_schedule_benchmark import (
@@ -90,15 +90,19 @@ def test_sample_task_records_rejects_oversized_request(tmp_path: Path):
 
 def test_estimate_latency_scores_uses_z_scored_njnt_and_ngeom():
     records = [
-        TaskRecord(task_id=0, task_name="low", mean_latency_ms=1.0, njnt=10, ngeom=100),
-        TaskRecord(task_id=1, task_name="high", mean_latency_ms=2.0, njnt=20, ngeom=200),
+        TaskRecord(task_id=0, task_name="low_jnt", mean_latency_ms=1.0, njnt=10, ngeom=300),
+        TaskRecord(task_id=1, task_name="mid", mean_latency_ms=2.0, njnt=20, ngeom=100),
+        TaskRecord(task_id=2, task_name="high_jnt", mean_latency_ms=3.0, njnt=30, ngeom=200),
     ]
 
-    scored = estimate_latency_scores(records, weight_jnt=0.45, weight_geom=0.55)
+    scored = estimate_latency_scores(records, weight_jnt=0.25, weight_geom=0.75)
 
-    assert scored[1].estimated_latency_score > scored[0].estimated_latency_score
-    assert math.isclose(
-        sum(record.estimated_latency_score for record in scored),
-        0.0,
-        abs_tol=1e-12,
+    njnt = np.asarray([record.njnt for record in records], dtype=np.float64)
+    ngeom = np.asarray([record.ngeom for record in records], dtype=np.float64)
+    expected = 0.25 * ((njnt - np.mean(njnt)) / np.std(njnt)) + 0.75 * (
+        (ngeom - np.mean(ngeom)) / np.std(ngeom)
+    )
+    np.testing.assert_allclose(
+        [record.estimated_latency_score for record in scored],
+        expected,
     )
