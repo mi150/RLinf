@@ -338,10 +338,19 @@ def _worker_loop(
         current_phase = "env_init"
         for item in items:
             current_item = item
+            current_step_index = task_counts[item.task.task_id]
             if item.task.task_id not in envs:
                 envs[item.task.task_id] = env_factory(item)
         current_item = None
         current_phase = "command_wait"
+        result_queue.put(
+            {
+                "event": "ready",
+                "core_index": core_index,
+                "cpu_id": cpu_id,
+                "cpu_affinity_applied": affinity_applied,
+            }
+        )
         while True:
             command = command_queue.get()
             if command == "stop":
@@ -468,6 +477,36 @@ def _worker_latency_error(exc: Exception, *, schedule_name: str) -> dict[str, An
     }
 
 
+def _worker_startup_diagnostic(core_index: int, items: list[ScheduleItem]) -> dict[str, Any]:
+    return {
+        "core_index": core_index,
+        "cpu_id": items[0].cpu_id if items else None,
+        "task_ids": [item.task.task_id for item in items],
+        "task_names": [item.task.task_name for item in items],
+    }
+
+
+def _startup_timeout_error(
+    *,
+    schedule_name: str,
+    pending_workers: list[dict[str, Any]],
+    processes: list[tuple[int, Any]],
+    startup_timeout_s: float,
+) -> dict[str, Any]:
+    return {
+        "event": "timeout",
+        "phase": "startup",
+        "schedule_name": schedule_name,
+        "pending_workers": pending_workers,
+        "process_exitcodes": _process_exitcode_diagnostics(processes),
+        "error_type": "TimeoutError",
+        "error": (
+            "timed out waiting for process worker startup "
+            f"after {startup_timeout_s:.3f}s"
+        ),
+    }
+
+
 def run_schedule_with_process_workers(
     plan: list[ScheduleItem],
     *,
@@ -475,6 +514,7 @@ def run_schedule_with_process_workers(
     env_factory: Any,
     dummy_action: list[float],
     subprocess_timeout_s: float = 300.0,
+    startup_timeout_s: float | None = None,
     mp_context: Any | None = None,
 ) -> ProcessRunResult:
     _validate_schedule_inputs(plan, steps_per_env=steps_per_env)
@@ -487,6 +527,7 @@ def run_schedule_with_process_workers(
     command_queues: dict[int, Any] = {}
     processes: list[tuple[int, Any]] = []
     events: list[StepEvent] = []
+    startup_timeout_s = subprocess_timeout_s if startup_timeout_s is None else startup_timeout_s
     try:
         for core_index, items in sorted(grouped.items()):
             command_queue = ctx.Queue()
@@ -505,6 +546,68 @@ def run_schedule_with_process_workers(
             )
             process.start()
             processes.append((core_index, process))
+
+        ready_cores: set[int] = set()
+        startup_pending_workers = [
+            _worker_startup_diagnostic(core_index, items)
+            for core_index, items in sorted(grouped.items())
+        ]
+        startup_deadline = time.monotonic() + startup_timeout_s
+        while len(ready_cores) < len(grouped):
+            remaining_s = max(startup_deadline - time.monotonic(), 0.0)
+            if remaining_s <= 0.0:
+                return ProcessRunResult(
+                    events=events,
+                    errors=[
+                        _startup_timeout_error(
+                            schedule_name=schedule_name,
+                            pending_workers=[
+                                worker
+                                for worker in startup_pending_workers
+                                if worker["core_index"] not in ready_cores
+                            ],
+                            processes=processes,
+                            startup_timeout_s=startup_timeout_s,
+                        )
+                    ],
+                )
+            try:
+                result = result_queue.get(timeout=remaining_s)
+            except queue.Empty:
+                return ProcessRunResult(
+                    events=events,
+                    errors=[
+                        _startup_timeout_error(
+                            schedule_name=schedule_name,
+                            pending_workers=[
+                                worker
+                                for worker in startup_pending_workers
+                                if worker["core_index"] not in ready_cores
+                            ],
+                            processes=processes,
+                            startup_timeout_s=startup_timeout_s,
+                        )
+                    ],
+                )
+            event_type = result.get("event")
+            if event_type == "ready":
+                ready_cores.add(int(result["core_index"]))
+                continue
+            if event_type == "error":
+                result.setdefault("schedule_name", schedule_name)
+                return ProcessRunResult(events=events, errors=[result])
+            return ProcessRunResult(
+                events=events,
+                errors=[
+                    {
+                        "event": "error",
+                        "phase": "startup",
+                        "schedule_name": schedule_name,
+                        "error_type": "ValueError",
+                        "error": f"unexpected worker result during startup: {result!r}",
+                    }
+                ],
+            )
 
         round_index = 0
         while any(count < steps_per_env for count in per_task_counts.values()):
@@ -845,12 +948,14 @@ class BenchmarkRunner:
         env_factory: Any | None = None,
         dummy_action: list[float] | None = None,
         subprocess_timeout_s: float = 300.0,
+        startup_timeout_s: float | None = None,
     ) -> None:
         self.steps_per_env = steps_per_env
         self.step_fn = step_fn
         self.env_factory = env_factory
         self.dummy_action = dummy_action
         self.subprocess_timeout_s = subprocess_timeout_s
+        self.startup_timeout_s = startup_timeout_s
 
     def run(self, schedule_name: str, plan: list[ScheduleItem]) -> BenchmarkResult:
         try:
@@ -872,6 +977,7 @@ class BenchmarkRunner:
                     env_factory=self.env_factory,
                     dummy_action=self.dummy_action,
                     subprocess_timeout_s=self.subprocess_timeout_s,
+                    startup_timeout_s=self.startup_timeout_s,
                 )
                 events = process_result.events
                 errors = process_result.errors
@@ -929,7 +1035,7 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def write_selected_tasks(path: Path, records: list[TaskRecord]) -> None:
-    fieldnames = [
+    fixed_fieldnames = [
         "task_id",
         "task_name",
         "mean_latency_ms",
@@ -937,11 +1043,15 @@ def write_selected_tasks(path: Path, records: list[TaskRecord]) -> None:
         "ngeom",
         "estimated_latency_score",
     ]
+    optional_fieldnames = sorted({key for record in records for key in record.extra})
+    fieldnames = fixed_fieldnames + optional_fieldnames
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
-            writer.writerow({key: getattr(record, key) for key in fieldnames})
+            row = {key: getattr(record, key) for key in fixed_fieldnames}
+            row.update({key: record.extra.get(key, "") for key in optional_fieldnames})
+            writer.writerow(row)
 
 
 def write_schedule_plan(path: Path, plan: list[ScheduleItem]) -> None:
@@ -991,8 +1101,175 @@ def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
         writer.writerows(summaries)
 
 
-def write_comparison_report(path: Path, summaries: list[dict[str, Any]]) -> None:
-    lines = ["# LIBERO Latency Schedule Benchmark", ""]
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator == 0.0:
+        return None
+    return numerator / denominator
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(result):
+        return None
+    return result
+
+
+def _is_random_baseline_name(schedule_name: str) -> bool:
+    return schedule_name == RANDOM_BASELINE or schedule_name.startswith(
+        f"{RANDOM_BASELINE}_"
+    )
+
+
+def compute_comparison_metrics(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    baseline = next(
+        (
+            summary
+            for summary in summaries
+            if summary.get("schedule_name") == TASK_ID_BASELINE
+        ),
+        None,
+    )
+    baseline_sps = _as_optional_float(
+        baseline.get("steps_per_second") if baseline is not None else None
+    )
+    baseline_idle = _as_optional_float(
+        baseline.get("mean_core_idle_ratio") if baseline is not None else None
+    )
+    baseline_comparison: dict[str, dict[str, float | None]] = {}
+    for summary in summaries:
+        schedule_name = str(summary.get("schedule_name", ""))
+        if schedule_name == TASK_ID_BASELINE:
+            continue
+        steps_per_second = _as_optional_float(summary.get("steps_per_second"))
+        idle_ratio = _as_optional_float(summary.get("mean_core_idle_ratio"))
+        bubble_reduction = None
+        if (
+            baseline_idle is not None
+            and baseline_idle != 0.0
+            and idle_ratio is not None
+        ):
+            bubble_reduction = (baseline_idle - idle_ratio) / baseline_idle
+        baseline_comparison[schedule_name] = {
+            "speedup_vs_task_id_baseline": _safe_ratio(
+                steps_per_second,
+                baseline_sps,
+            ),
+            "bubble_reduction_vs_task_id_baseline": bubble_reduction,
+        }
+
+    random_summaries = [
+        summary
+        for summary in summaries
+        if _is_random_baseline_name(str(summary.get("schedule_name", "")))
+    ]
+    random_steps_per_second = [
+        value
+        for value in (
+            _as_optional_float(summary.get("steps_per_second"))
+            for summary in random_summaries
+        )
+        if value is not None
+    ]
+    random_idle_ratios = [
+        value
+        for value in (
+            _as_optional_float(summary.get("mean_core_idle_ratio"))
+            for summary in random_summaries
+        )
+        if value is not None
+    ]
+    random_aggregate = None
+    if random_summaries:
+        random_aggregate = {
+            "count": len(random_summaries),
+            "mean_steps_per_second": (
+                float(np.mean(np.asarray(random_steps_per_second)))
+                if random_steps_per_second
+                else None
+            ),
+            "median_steps_per_second": (
+                float(np.median(np.asarray(random_steps_per_second)))
+                if random_steps_per_second
+                else None
+            ),
+            "best_steps_per_second": (
+                max(random_steps_per_second) if random_steps_per_second else None
+            ),
+            "worst_steps_per_second": (
+                min(random_steps_per_second) if random_steps_per_second else None
+            ),
+            "mean_core_idle_ratio": (
+                float(np.mean(np.asarray(random_idle_ratios)))
+                if random_idle_ratios
+                else None
+            ),
+        }
+    return {
+        "baseline_comparison": baseline_comparison,
+        "random_aggregate": random_aggregate,
+    }
+
+
+def add_comparison_metrics_to_summaries(summaries: list[dict[str, Any]]) -> None:
+    comparison = compute_comparison_metrics(summaries)["baseline_comparison"]
+    for summary in summaries:
+        schedule_metrics = comparison.get(str(summary.get("schedule_name", "")))
+        if schedule_metrics is None:
+            continue
+        summary.update(schedule_metrics)
+
+
+def _format_optional_float(value: Any) -> str:
+    number = _as_optional_float(value)
+    if number is None:
+        return ""
+    return f"{number:.6f}"
+
+
+def _task_ids_for_side(items: list[ScheduleItem], side: str) -> str:
+    task_ids = [
+        str(item.task.task_id)
+        for item in sorted(items, key=lambda value: value.order_index)
+        if item.side == side
+    ]
+    return ", ".join(task_ids)
+
+
+def _append_trapezoid_mapping_evidence(
+    lines: list[str],
+    plans: dict[str, list[ScheduleItem]] | None,
+) -> None:
+    if not plans or TRAPEZOID_PIPELINE not in plans:
+        return
+    lines.extend(["", "## Trapezoid Mapping Evidence", ""])
+    lines.append("| core_index | cpu_id | long task ids | short task ids |")
+    lines.append("|---:|---:|---|---|")
+    grouped = _items_by_core(plans[TRAPEZOID_PIPELINE])
+    for core_index, items in sorted(grouped.items()):
+        cpu_id = items[0].cpu_id if items else ""
+        lines.append(
+            "| {core_index} | {cpu_id} | {long_tasks} | {short_tasks} |".format(
+                core_index=core_index,
+                cpu_id=cpu_id,
+                long_tasks=_task_ids_for_side(items, "long"),
+                short_tasks=_task_ids_for_side(items, "short"),
+            )
+        )
+
+
+def write_comparison_report(
+    path: Path,
+    summaries: list[dict[str, Any]],
+    *,
+    plans: dict[str, list[ScheduleItem]] | None = None,
+) -> None:
+    metrics = compute_comparison_metrics(summaries)
+    lines = ["# LIBERO Latency Schedule Benchmark", "", "## Raw Schedule Metrics", ""]
     lines.append("| schedule | status | steps/sec | idle ratio |")
     lines.append("|---|---:|---:|---:|")
     for summary in summaries:
@@ -1004,6 +1281,54 @@ def write_comparison_report(path: Path, summaries: list[dict[str, Any]]) -> None
                 idle=summary.get("mean_core_idle_ratio"),
             )
         )
+    lines.extend(["", "## Baseline Comparison", ""])
+    lines.append(
+        "| schedule | speedup_vs_task_id_baseline | "
+        "bubble_reduction_vs_task_id_baseline |"
+    )
+    lines.append("|---|---:|---:|")
+    for schedule_name, values in metrics["baseline_comparison"].items():
+        lines.append(
+            "| {schedule} | {speedup} | {bubble} |".format(
+                schedule=schedule_name,
+                speedup=_format_optional_float(
+                    values.get("speedup_vs_task_id_baseline")
+                ),
+                bubble=_format_optional_float(
+                    values.get("bubble_reduction_vs_task_id_baseline")
+                ),
+            )
+        )
+    random_aggregate = metrics["random_aggregate"]
+    if random_aggregate is not None:
+        lines.extend(["", "## Random Baseline Aggregate", ""])
+        lines.append(
+            "| count | mean steps/sec | median steps/sec | best steps/sec | "
+            "worst steps/sec | mean idle ratio |"
+        )
+        lines.append("|---:|---:|---:|---:|---:|---:|")
+        lines.append(
+            "| {count} | {mean_sps} | {median_sps} | {best_sps} | {worst_sps} | "
+            "{mean_idle} |".format(
+                count=random_aggregate["count"],
+                mean_sps=_format_optional_float(
+                    random_aggregate["mean_steps_per_second"]
+                ),
+                median_sps=_format_optional_float(
+                    random_aggregate["median_steps_per_second"]
+                ),
+                best_sps=_format_optional_float(
+                    random_aggregate["best_steps_per_second"]
+                ),
+                worst_sps=_format_optional_float(
+                    random_aggregate["worst_steps_per_second"]
+                ),
+                mean_idle=_format_optional_float(
+                    random_aggregate["mean_core_idle_ratio"]
+                ),
+            )
+        )
+    _append_trapezoid_mapping_evidence(lines, plans)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1026,6 +1351,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--subprocess-timeout-s", type=float, default=300.0)
+    parser.add_argument("--startup-timeout-s", type=float, default=None)
     parser.add_argument("--dummy-action", default="0,0,0,0,0,0,-1")
     parser.add_argument(
         "--fake-latency-from-csv",
@@ -1083,6 +1409,8 @@ def _validate_cli_args(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("--warmup-steps must be >= 0")
     if args.subprocess_timeout_s <= 0.0:
         parser.error("--subprocess-timeout-s must be > 0")
+    if args.startup_timeout_s is not None and args.startup_timeout_s <= 0.0:
+        parser.error("--startup-timeout-s must be > 0")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1108,7 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output_dir / "run_config.json", run_config)
     write_selected_tasks(output_dir / "selected_tasks.csv", records)
 
-    plans = [
+    plans: list[list[ScheduleItem]] = [
         build_task_id_baseline_plan(records, cpu_ids=cpu_ids),
         build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids),
     ]
@@ -1142,10 +1470,12 @@ def main(argv: list[str] | None = None) -> int:
             env_factory=env_factory,
             dummy_action=dummy_action,
             subprocess_timeout_s=args.subprocess_timeout_s,
+            startup_timeout_s=args.startup_timeout_s,
         )
 
     summaries = []
     errors = []
+    plans_by_name: dict[str, list[ScheduleItem]] = {}
     for plan in plans:
         schedule_name = plan[0].schedule_name
         if schedule_name == RANDOM_BASELINE and args.random_baseline_repeats > 1:
@@ -1156,15 +1486,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             schedule_name = f"{RANDOM_BASELINE}_{random_index}"
             plan = [replace(item, schedule_name=schedule_name) for item in plan]
+        plans_by_name[schedule_name] = plan
         write_schedule_plan(output_dir / f"schedule_plan_{schedule_name}.csv", plan)
         result = runner.run(schedule_name, plan)
         write_step_events(output_dir / f"step_events_{schedule_name}.jsonl", result.events)
         summaries.append(result.summary)
         errors.extend(result.errors)
 
+    add_comparison_metrics_to_summaries(summaries)
     write_summary_csv(output_dir / "schedule_summary.csv", summaries)
     write_json(output_dir / "schedule_summary.json", summaries)
-    write_comparison_report(output_dir / "comparison_report.md", summaries)
+    write_comparison_report(
+        output_dir / "comparison_report.md",
+        summaries,
+        plans=plans_by_name,
+    )
     if errors:
         with errors_path.open("w", encoding="utf-8") as handle:
             for error in errors:

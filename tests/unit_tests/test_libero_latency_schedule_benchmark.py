@@ -16,6 +16,7 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
     build_worker_plans,
+    compute_comparison_metrics,
     compute_schedule_summary,
     estimate_latency_scores,
     load_task_records,
@@ -23,6 +24,8 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     run_schedule_with_process_workers,
     run_schedule_with_step_function,
     sample_task_records,
+    write_comparison_report,
+    write_selected_tasks,
 )
 
 
@@ -79,6 +82,50 @@ def test_load_task_records_rejects_missing_required_columns(tmp_path: Path):
 
     with pytest.raises(ValueError, match="missing required columns"):
         load_task_records(csv_path)
+
+
+def test_write_selected_tasks_preserves_sorted_optional_columns(tmp_path: Path):
+    path = tmp_path / "selected_tasks.csv"
+    records = [
+        TaskRecord(
+            task_id=1,
+            task_name="a",
+            mean_latency_ms=1.0,
+            njnt=2,
+            ngeom=3,
+            estimated_latency_score=0.5,
+            extra={"scene_type": "kitchen", "suite": "libero_10"},
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="b",
+            mean_latency_ms=4.0,
+            njnt=5,
+            ngeom=6,
+            estimated_latency_score=0.6,
+            extra={"difficulty": "hard"},
+        ),
+    ]
+
+    write_selected_tasks(path, records)
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0].keys() == {
+        "task_id",
+        "task_name",
+        "mean_latency_ms",
+        "njnt",
+        "ngeom",
+        "estimated_latency_score",
+        "difficulty",
+        "scene_type",
+        "suite",
+    }
+    assert rows[0]["scene_type"] == "kitchen"
+    assert rows[0]["suite"] == "libero_10"
+    assert rows[0]["difficulty"] == ""
+    assert rows[1]["difficulty"] == "hard"
 
 
 def test_sample_task_records_is_seeded_without_replacement(tmp_path: Path):
@@ -184,6 +231,15 @@ class SleepingProcessEnv:
         return {}, 0.0, False, {}
 
 
+class SlowInitProcessEnv:
+    def __init__(self, sleep_s: float):
+        time.sleep(sleep_s)
+
+    def step(self, action):
+        del action
+        return {}, 0.0, False, {}
+
+
 def fake_process_env_factory(item: ScheduleItem):
     return FakeProcessEnv(latency_s=item.task.mean_latency_ms / 1000.0)
 
@@ -200,6 +256,11 @@ def failing_process_env_init_factory(item: ScheduleItem):
 def sleeping_process_env_factory(item: ScheduleItem):
     del item
     return SleepingProcessEnv(sleep_s=0.2)
+
+
+def slow_init_process_env_factory(item: ScheduleItem):
+    del item
+    return SlowInitProcessEnv(sleep_s=0.2)
 
 
 def test_task_id_baseline_assigns_sorted_tasks_to_core_columns():
@@ -401,10 +462,59 @@ def test_run_schedule_with_process_workers_reports_env_init_error_context():
     assert error["cpu_id"] == 0
     assert error["task_id"] == 1
     assert error["task_name"] == "t1"
-    assert error["task_step_index"] is None
+    assert error["task_step_index"] == 0
     assert error["error_type"] == "RuntimeError"
     assert "env init failed for task 1" in error["error"]
     assert "Traceback" in error["traceback"]
+
+
+def test_run_schedule_with_process_workers_waits_for_startup_before_step_timeout():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=slow_init_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=0.01,
+        startup_timeout_s=1.0,
+    )
+
+    assert result.errors == []
+    assert len(result.events) == 4
+    assert {event.task_id for event in result.events} == {1, 2, 3, 4}
+
+
+def test_run_schedule_with_process_workers_reports_startup_timeout_diagnostics():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    result = run_schedule_with_process_workers(
+        plan,
+        steps_per_env=1,
+        env_factory=slow_init_process_env_factory,
+        dummy_action=[0.0] * 7,
+        subprocess_timeout_s=10.0,
+        startup_timeout_s=0.01,
+    )
+
+    assert result.events == []
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error["event"] == "timeout"
+    assert error["phase"] == "startup"
+    assert error["schedule_name"] == "task_id_baseline"
+    assert error["pending_workers"]
+    assert {
+        "core_index",
+        "cpu_id",
+        "task_ids",
+        "task_names",
+    } <= set(error["pending_workers"][0])
+    assert error["process_exitcodes"]
+    assert error["error_type"] == "TimeoutError"
+    assert "startup" in error["error"]
 
 
 def test_run_schedule_with_process_workers_timeout_includes_diagnostics():
@@ -582,6 +692,99 @@ def test_compute_schedule_summary_includes_missing_core_idle():
 
     assert summary["makespan_s"] == 0.05
     assert summary["mean_core_idle_ratio"] == pytest.approx(0.375)
+
+
+def test_compute_comparison_metrics_compares_and_aggregates_random():
+    summaries = [
+        {
+            "schedule_name": "task_id_baseline",
+            "steps_per_second": 10.0,
+            "mean_core_idle_ratio": 0.4,
+        },
+        {
+            "schedule_name": "trapezoid_pipeline",
+            "steps_per_second": 15.0,
+            "mean_core_idle_ratio": 0.1,
+        },
+        {
+            "schedule_name": "random_baseline_0",
+            "steps_per_second": 8.0,
+            "mean_core_idle_ratio": 0.5,
+        },
+        {
+            "schedule_name": "random_baseline_1",
+            "steps_per_second": 12.0,
+            "mean_core_idle_ratio": 0.3,
+        },
+    ]
+
+    metrics = compute_comparison_metrics(summaries)
+
+    comparison = metrics["baseline_comparison"]
+    assert comparison["trapezoid_pipeline"]["speedup_vs_task_id_baseline"] == 1.5
+    assert (
+        comparison["trapezoid_pipeline"]["bubble_reduction_vs_task_id_baseline"]
+        == 0.75
+    )
+    assert comparison["random_baseline_0"]["speedup_vs_task_id_baseline"] == 0.8
+    random_aggregate = metrics["random_aggregate"]
+    assert random_aggregate == {
+        "count": 2,
+        "mean_steps_per_second": 10.0,
+        "median_steps_per_second": 10.0,
+        "best_steps_per_second": 12.0,
+        "worst_steps_per_second": 8.0,
+        "mean_core_idle_ratio": 0.4,
+    }
+
+
+def test_write_comparison_report_includes_comparison_random_and_mapping_evidence(
+    tmp_path: Path,
+):
+    report_path = tmp_path / "comparison_report.md"
+    records = _records_for_schedule()
+    trapezoid_plan = build_trapezoid_pipeline_plan(records, cpu_ids=[20, 21])
+    summaries = [
+        {
+            "schedule_name": "task_id_baseline",
+            "status": "completed",
+            "steps_per_second": 10.0,
+            "mean_core_idle_ratio": 0.4,
+        },
+        {
+            "schedule_name": "trapezoid_pipeline",
+            "status": "completed",
+            "steps_per_second": 15.0,
+            "mean_core_idle_ratio": 0.1,
+        },
+        {
+            "schedule_name": "random_baseline",
+            "status": "completed",
+            "steps_per_second": 8.0,
+            "mean_core_idle_ratio": 0.5,
+        },
+    ]
+
+    write_comparison_report(
+        report_path,
+        summaries,
+        plans={"trapezoid_pipeline": trapezoid_plan},
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "## Baseline Comparison" in report
+    assert "speedup_vs_task_id_baseline" in report
+    assert "bubble_reduction_vs_task_id_baseline" in report
+    assert "| trapezoid_pipeline | 1.500000 | 0.750000 |" in report
+    assert "## Random Baseline Aggregate" in report
+    assert (
+        "| count | mean steps/sec | median steps/sec | best steps/sec | "
+        "worst steps/sec | mean idle ratio |"
+    ) in report
+    assert "## Trapezoid Mapping Evidence" in report
+    assert "| core_index | cpu_id | long task ids | short task ids |" in report
+    assert "| 0 | 20 | 4 | 1 |" in report
+    assert "| 1 | 21 | 3 | 2 |" in report
 
 
 def test_benchmark_runner_uses_injected_step_function_for_unit_tests():
