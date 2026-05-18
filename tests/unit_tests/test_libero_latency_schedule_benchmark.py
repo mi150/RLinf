@@ -1,4 +1,5 @@
 import csv
+import json
 import time
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     compute_schedule_summary,
     estimate_latency_scores,
     load_task_records,
+    main,
     run_schedule_with_process_workers,
     run_schedule_with_step_function,
     sample_task_records,
@@ -632,3 +634,39 @@ def test_benchmark_runner_reports_failed_schedule_from_step_exception():
     assert result.summary["status"] == "failed"
     assert result.errors
     assert "step failed" in result.errors[0]["error"]
+
+
+def test_main_fake_mode_writes_outputs(tmp_path: Path):
+    csv_path = tmp_path / "tasks.csv"
+    _write_task_csv(csv_path)
+    output_dir = tmp_path / "out"
+
+    exit_code = main(
+        [
+            "--task-csv",
+            str(csv_path),
+            "--num-envs",
+            "2",
+            "--cpu-ids",
+            "0,1",
+            "--steps-per-env",
+            "2",
+            "--output-dir",
+            str(output_dir),
+            "--fake-latency-from-csv",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (output_dir / "run_config.json").exists()
+    assert (output_dir / "selected_tasks.csv").exists()
+    assert (output_dir / "schedule_plan_task_id_baseline.csv").exists()
+    assert (output_dir / "step_events_task_id_baseline.jsonl").exists()
+    assert (output_dir / "schedule_summary.csv").exists()
+    assert (output_dir / "schedule_summary.json").exists()
+    assert (output_dir / "comparison_report.md").exists()
+    summaries = json.loads((output_dir / "schedule_summary.json").read_text())
+    assert {item["schedule_name"] for item in summaries} >= {
+        "task_id_baseline",
+        "trapezoid_pipeline",
+    }

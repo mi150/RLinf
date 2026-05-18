@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
+import json
 import multiprocessing as mp
 import os
 import queue
 import random
 import time
 import traceback
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -896,3 +898,242 @@ class BenchmarkRunner:
                     }
                 ],
             )
+
+
+def parse_int_list(value: str) -> list[int]:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise ValueError("integer list must not be empty")
+    return [int(item) for item in items]
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_selected_tasks(path: Path, records: list[TaskRecord]) -> None:
+    fieldnames = [
+        "task_id",
+        "task_name",
+        "mean_latency_ms",
+        "njnt",
+        "ngeom",
+        "estimated_latency_score",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow({key: getattr(record, key) for key in fieldnames})
+
+
+def write_schedule_plan(path: Path, plan: list[ScheduleItem]) -> None:
+    fieldnames = [
+        "schedule_name",
+        "order_index",
+        "core_index",
+        "cpu_id",
+        "layer_index",
+        "side",
+        "task_id",
+        "task_name",
+        "estimated_latency_score",
+        "mean_latency_ms",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in plan:
+            writer.writerow(
+                {
+                    "schedule_name": item.schedule_name,
+                    "order_index": item.order_index,
+                    "core_index": item.core_index,
+                    "cpu_id": item.cpu_id,
+                    "layer_index": item.layer_index,
+                    "side": item.side,
+                    "task_id": item.task.task_id,
+                    "task_name": item.task.task_name,
+                    "estimated_latency_score": item.task.estimated_latency_score,
+                    "mean_latency_ms": item.task.mean_latency_ms,
+                }
+            )
+
+
+def write_step_events(path: Path, events: list[StepEvent]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+
+
+def write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
+    fieldnames = sorted({key for summary in summaries for key in summary})
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summaries)
+
+
+def write_comparison_report(path: Path, summaries: list[dict[str, Any]]) -> None:
+    lines = ["# LIBERO Latency Schedule Benchmark", ""]
+    lines.append("| schedule | status | steps/sec | idle ratio |")
+    lines.append("|---|---:|---:|---:|")
+    for summary in summaries:
+        lines.append(
+            "| {schedule} | {status} | {sps:.6f} | {idle} |".format(
+                schedule=summary["schedule_name"],
+                status=summary["status"],
+                sps=float(summary.get("steps_per_second") or 0.0),
+                idle=summary.get("mean_core_idle_ratio"),
+            )
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task-csv", type=Path, required=True)
+    parser.add_argument("--num-envs", type=int, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cpu-ids", required=True)
+    parser.add_argument("--steps-per-env", type=int, default=100)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--random-baseline-repeats", type=int, default=1)
+    parser.add_argument("--suite", default="libero_90")
+    parser.add_argument("--camera-height", type=int, default=256)
+    parser.add_argument("--camera-width", type=int, default=256)
+    parser.add_argument(
+        "--libero-type",
+        choices=["standard", "pro", "plus"],
+        default="standard",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=20)
+    parser.add_argument("--subprocess-timeout-s", type=float, default=300.0)
+    parser.add_argument("--dummy-action", default="0,0,0,0,0,0,-1")
+    parser.add_argument(
+        "--fake-latency-from-csv",
+        action="store_true",
+        help="Use CSV mean_latency_ms as fake latency for unit/local smoke tests.",
+    )
+    return parser
+
+
+def _dummy_action_from_arg(value: str) -> list[float]:
+    return [float(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _fake_step_fn(item: ScheduleItem, step_index: int) -> float:
+    del step_index
+    return item.task.mean_latency_ms / 1000.0
+
+
+def _parse_cpu_ids_or_exit(parser: argparse.ArgumentParser, value: str) -> list[int]:
+    try:
+        return parse_int_list(value)
+    except ValueError as exc:
+        parser.error(f"--cpu-ids: {exc}")
+
+
+def _validate_cli_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.num_envs < 1:
+        parser.error("--num-envs must be >= 1")
+    if args.num_envs % 2 != 0:
+        parser.error("--num-envs must be even for trapezoid_pipeline")
+    if args.steps_per_env < 1:
+        parser.error("--steps-per-env must be >= 1")
+    if args.random_baseline_repeats < 0:
+        parser.error("--random-baseline-repeats must be >= 0")
+    if args.warmup_steps < 0:
+        parser.error("--warmup-steps must be >= 0")
+    if args.subprocess_timeout_s <= 0.0:
+        parser.error("--subprocess-timeout-s must be > 0")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    _validate_cli_args(parser, args)
+    cpu_ids = _parse_cpu_ids_or_exit(parser, args.cpu_ids)
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    records = estimate_latency_scores(
+        sample_task_records(
+            load_task_records(args.task_csv),
+            num_envs=args.num_envs,
+            seed=args.seed,
+        )
+    )
+    dummy_action = _dummy_action_from_arg(args.dummy_action)
+    run_config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    run_config["cpu_ids"] = cpu_ids
+    write_json(output_dir / "run_config.json", run_config)
+    write_selected_tasks(output_dir / "selected_tasks.csv", records)
+
+    plans = [
+        build_task_id_baseline_plan(records, cpu_ids=cpu_ids),
+        build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids),
+    ]
+    for repeat in range(args.random_baseline_repeats):
+        plans.append(
+            build_random_baseline_plan(
+                records,
+                cpu_ids=cpu_ids,
+                seed=args.seed + repeat + 1,
+            )
+        )
+
+    if args.fake_latency_from_csv:
+        runner = BenchmarkRunner(
+            steps_per_env=args.steps_per_env,
+            step_fn=_fake_step_fn,
+        )
+    else:
+        env_factory = make_libero_env_factory(
+            suite=args.suite,
+            camera_height=args.camera_height,
+            camera_width=args.camera_width,
+            libero_type=args.libero_type,
+            seed=args.seed,
+            warmup_steps=args.warmup_steps,
+            dummy_action=dummy_action,
+        )
+        runner = BenchmarkRunner(
+            steps_per_env=args.steps_per_env,
+            env_factory=env_factory,
+            dummy_action=dummy_action,
+            subprocess_timeout_s=args.subprocess_timeout_s,
+        )
+
+    summaries = []
+    errors = []
+    for plan in plans:
+        schedule_name = plan[0].schedule_name
+        if schedule_name == RANDOM_BASELINE and args.random_baseline_repeats > 1:
+            random_index = sum(
+                1
+                for summary in summaries
+                if summary["schedule_name"].startswith(RANDOM_BASELINE)
+            )
+            schedule_name = f"{RANDOM_BASELINE}_{random_index}"
+            plan = [replace(item, schedule_name=schedule_name) for item in plan]
+        write_schedule_plan(output_dir / f"schedule_plan_{schedule_name}.csv", plan)
+        result = runner.run(schedule_name, plan)
+        write_step_events(output_dir / f"step_events_{schedule_name}.jsonl", result.events)
+        summaries.append(result.summary)
+        errors.extend(result.errors)
+
+    write_summary_csv(output_dir / "schedule_summary.csv", summaries)
+    write_json(output_dir / "schedule_summary.json", summaries)
+    write_comparison_report(output_dir / "comparison_report.md", summaries)
+    if errors:
+        with (output_dir / "errors.jsonl").open("w", encoding="utf-8") as handle:
+            for error in errors:
+                handle.write(json.dumps(error, sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
