@@ -7,14 +7,14 @@ import pytest
 from toolkits.run_libero_latency_schedule_benchmark import (
     StepEvent,
     TaskRecord,
-    compute_schedule_summary,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
     build_trapezoid_pipeline_plan,
+    compute_schedule_summary,
     estimate_latency_scores,
     load_task_records,
-    sample_task_records,
     run_schedule_with_step_function,
+    sample_task_records,
 )
 
 
@@ -237,6 +237,43 @@ def test_run_schedule_with_step_function_completes_equal_steps_per_task():
     assert all(event.round_wall_time_s >= event.latency_s for event in events)
 
 
+def test_run_schedule_with_step_function_rejects_empty_plan():
+    with pytest.raises(ValueError, match="plan must not be empty"):
+        run_schedule_with_step_function([], steps_per_env=1, step_fn=lambda item, step_index: 0.0)
+
+
+def test_run_schedule_with_step_function_rejects_duplicate_task_ids():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+    duplicate_plan = plan + [plan[0]]
+
+    with pytest.raises(ValueError, match="duplicate task_id"):
+        run_schedule_with_step_function(
+            duplicate_plan,
+            steps_per_env=1,
+            step_fn=lambda item, step_index: 0.0,
+        )
+
+
+def test_run_schedule_with_step_function_rejects_invalid_latency_values():
+    records = _records_for_schedule()
+    plan = build_task_id_baseline_plan(records, cpu_ids=[0, 1])
+
+    with pytest.raises(ValueError, match="invalid latency"):
+        run_schedule_with_step_function(
+            plan,
+            steps_per_env=1,
+            step_fn=lambda item, step_index: -0.1 if item.task.task_id == 1 else 0.0,
+        )
+
+    with pytest.raises(ValueError, match="invalid latency"):
+        run_schedule_with_step_function(
+            plan,
+            steps_per_env=1,
+            step_fn=lambda item, step_index: float("nan") if item.task.task_id == 1 else 0.0,
+        )
+
+
 def test_compute_schedule_summary_reports_throughput_and_idle():
     events = [
         StepEvent(
@@ -297,3 +334,52 @@ def test_compute_schedule_summary_marks_degraded_affinity():
 
     assert summary["status"] == "degraded"
     assert summary["cpu_affinity_success_rate"] == 0.0
+
+
+def test_compute_schedule_summary_includes_missing_core_idle():
+    events = [
+        StepEvent(
+            schedule_name="s",
+            round_index=0,
+            core_index=0,
+            cpu_id=0,
+            task_id=1,
+            task_name="a",
+            task_step_index=0,
+            latency_s=0.01,
+            round_wall_time_s=0.02,
+            idle_time_s=0.01,
+            cpu_affinity_applied=True,
+        ),
+        StepEvent(
+            schedule_name="s",
+            round_index=0,
+            core_index=1,
+            cpu_id=1,
+            task_id=2,
+            task_name="b",
+            task_step_index=0,
+            latency_s=0.02,
+            round_wall_time_s=0.02,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+        ),
+        StepEvent(
+            schedule_name="s",
+            round_index=1,
+            core_index=0,
+            cpu_id=0,
+            task_id=1,
+            task_name="a",
+            task_step_index=1,
+            latency_s=0.03,
+            round_wall_time_s=0.03,
+            idle_time_s=0.0,
+            cpu_affinity_applied=True,
+        ),
+    ]
+
+    summary = compute_schedule_summary("s", events)
+
+    assert summary["makespan_s"] == 0.05
+    assert summary["mean_core_idle_ratio"] == pytest.approx(0.375)

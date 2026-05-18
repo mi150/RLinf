@@ -6,6 +6,7 @@ import csv
 import random
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -258,11 +259,16 @@ def run_schedule_with_step_function(
     step_fn: Any,
     cpu_affinity_by_core: dict[int, bool] | None = None,
 ) -> list[StepEvent]:
+    if not plan:
+        raise ValueError("plan must not be empty")
     if steps_per_env < 1:
         raise ValueError("steps_per_env must be >= 1")
+    task_ids = [item.task.task_id for item in plan]
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError("duplicate task_id in schedule plan")
     grouped = _items_by_core(plan)
     per_task_counts = {item.task.task_id: 0 for item in plan}
-    cursors = {core_index: 0 for core_index in grouped}
+    cursors = dict.fromkeys(grouped, 0)
     events: list[StepEvent] = []
     round_index = 0
     while any(count < steps_per_env for count in per_task_counts.values()):
@@ -278,9 +284,23 @@ def run_schedule_with_step_function(
             if item is None:
                 continue
             task_step_index = per_task_counts[item.task.task_id]
-            latency_s = float(step_fn(item, task_step_index))
+            raw_latency = step_fn(item, task_step_index)
+            try:
+                latency_s = float(raw_latency)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "invalid latency for "
+                    f"task_id={item.task.task_id}, core_index={item.core_index}, "
+                    f"step_index={task_step_index}: {raw_latency!r}"
+                ) from exc
+            if not np.isfinite(latency_s) or latency_s < 0.0:
+                raise ValueError(
+                    "invalid latency for "
+                    f"task_id={item.task.task_id}, core_index={item.core_index}, "
+                    f"step_index={task_step_index}: {latency_s!r}"
+                )
             per_task_counts[item.task.task_id] = task_step_index + 1
-            round_results.append((item, task_step_index, max(latency_s, 0.0)))
+            round_results.append((item, task_step_index, latency_s))
         if not round_results:
             break
         round_wall_time_s = max(latency for _, _, latency in round_results)
@@ -335,15 +355,25 @@ def compute_schedule_summary(
             "mean_core_idle_ratio": None,
             "cpu_affinity_success_rate": None,
         }
-    round_wall_times = {
-        event.round_index: event.round_wall_time_s for event in events
-    }
-    makespan_s = float(sum(round_wall_times.values()))
+    rounds: dict[int, list[StepEvent]] = {}
+    for event in events:
+        rounds.setdefault(event.round_index, []).append(event)
+    total_cores = len({event.core_index for event in events})
+    makespan_s = float(
+        sum(max(event.round_wall_time_s for event in round_events) for round_events in rounds.values())
+    )
     latencies = [event.latency_s for event in events]
-    idle_ratios = [
-        0.0 if event.round_wall_time_s == 0.0 else event.idle_time_s / event.round_wall_time_s
-        for event in events
-    ]
+    idle_ratios: list[float] = []
+    for round_events in rounds.values():
+        round_wall_time_s = max(event.round_wall_time_s for event in round_events)
+        per_round_idle_ratios = [
+            0.0 if round_wall_time_s == 0.0 else event.idle_time_s / round_wall_time_s
+            for event in round_events
+        ]
+        missing_cores = total_cores - len({event.core_index for event in round_events})
+        if missing_cores > 0:
+            per_round_idle_ratios.extend([1.0 if round_wall_time_s > 0.0 else 0.0] * missing_cores)
+        idle_ratios.append(float(np.mean(np.asarray(per_round_idle_ratios))))
     affinity_rate = sum(1 for event in events if event.cpu_affinity_applied) / len(events)
     return {
         "schedule_name": schedule_name,
