@@ -12,6 +12,7 @@ from toolkits.run_libero_latency_schedule_benchmark import (
     StepEvent,
     TaskRecord,
     apply_cpu_affinity,
+    build_historical_optimal_plan,
     build_phase_shifted_trapezoid_plan,
     build_random_baseline_plan,
     build_task_id_baseline_plan,
@@ -398,6 +399,52 @@ def test_trapezoid_pipeline_rejects_odd_task_count():
 
     with pytest.raises(ValueError, match="even"):
         build_trapezoid_pipeline_plan(records, cpu_ids=[0, 1])
+
+
+def test_historical_optimal_groups_slow_tasks_to_minimize_fake_makespan():
+    records = [
+        TaskRecord(
+            task_id=0,
+            task_name="slowest",
+            mean_latency_ms=100.0,
+            njnt=1,
+            ngeom=1,
+        ),
+        TaskRecord(
+            task_id=1,
+            task_name="fast",
+            mean_latency_ms=1.0,
+            njnt=1,
+            ngeom=1,
+        ),
+        TaskRecord(
+            task_id=2,
+            task_name="slow",
+            mean_latency_ms=90.0,
+            njnt=1,
+            ngeom=1,
+        ),
+        TaskRecord(
+            task_id=3,
+            task_name="fastest",
+            mean_latency_ms=1.0,
+            njnt=1,
+            ngeom=1,
+        ),
+    ]
+
+    plan = build_historical_optimal_plan(records, cpu_ids=[0, 1])
+    events = run_schedule_with_step_function(
+        plan,
+        steps_per_env=1,
+        step_fn=lambda item, step_index: item.task.mean_latency_ms / 1000.0,
+    )
+    summary = compute_schedule_summary("historical_optimal", events)
+
+    assert [item.task.task_id for item in plan] == [0, 2, 1, 3]
+    assert summary["makespan_s"] == pytest.approx(0.101)
+    assert summary["steps_per_second"] == pytest.approx(4 / 0.101)
+    assert {item.schedule_name for item in plan} == {"historical_optimal"}
 
 
 def test_phase_shifted_trapezoid_staggers_long_and_short_rounds_by_core():
@@ -1007,6 +1054,7 @@ def test_main_fake_mode_writes_outputs(tmp_path: Path):
     summaries = json.loads((output_dir / "schedule_summary.json").read_text())
     assert {item["schedule_name"] for item in summaries} >= {
         "task_id_baseline",
+        "historical_optimal",
         "trapezoid_pipeline",
     }
 

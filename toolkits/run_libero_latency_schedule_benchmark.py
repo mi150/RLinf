@@ -117,6 +117,7 @@ TASK_ID_BASELINE = "task_id_baseline"
 RANDOM_BASELINE = "random_baseline"
 TRAPEZOID_PIPELINE = "trapezoid_pipeline"
 PHASE_SHIFTED_TRAPEZOID = "phase_shifted_trapezoid"
+HISTORICAL_OPTIMAL = "historical_optimal"
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,19 @@ def build_random_baseline_plan(
         ordered,
         cpu_ids=cpu_ids,
         schedule_name=RANDOM_BASELINE,
+    )
+
+
+def build_historical_optimal_plan(
+    records: list[TaskRecord],
+    *,
+    cpu_ids: list[int],
+) -> list[ScheduleItem]:
+    ordered = sorted(records, key=lambda record: (-record.mean_latency_ms, record.task_id))
+    return _layered_plan(
+        ordered,
+        cpu_ids=cpu_ids,
+        schedule_name=HISTORICAL_OPTIMAL,
     )
 
 
@@ -1477,11 +1491,15 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output_dir / "run_config.json", run_config)
     write_selected_tasks(output_dir / "selected_tasks.csv", records)
 
-    plans: list[list[ScheduleItem]] = [
-        build_task_id_baseline_plan(records, cpu_ids=cpu_ids),
-        build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids),
-        build_phase_shifted_trapezoid_plan(records, cpu_ids=cpu_ids),
-    ]
+    plans: list[list[ScheduleItem]] = [build_task_id_baseline_plan(records, cpu_ids=cpu_ids)]
+    if args.fake_latency_from_csv:
+        plans.append(build_historical_optimal_plan(records, cpu_ids=cpu_ids))
+    plans.extend(
+        [
+            build_trapezoid_pipeline_plan(records, cpu_ids=cpu_ids),
+            build_phase_shifted_trapezoid_plan(records, cpu_ids=cpu_ids),
+        ]
+    )
     for repeat in range(args.random_baseline_repeats):
         plans.append(
             build_random_baseline_plan(
