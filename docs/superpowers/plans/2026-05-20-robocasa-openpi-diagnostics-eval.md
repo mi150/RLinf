@@ -10,6 +10,16 @@
 
 ---
 
+## 测试环境
+
+所有测试、Ruff 检查和脚本冒烟命令都必须先激活 RoboCasa + OpenPI 虚拟环境：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+```
+
+计划中每条测试命令都显式写出这一步。执行实现时不要使用其他 Python 环境跑这些命令。
+
 ## 文件结构
 
 - 修改：`rlinf/envs/robocasa/venv.py`
@@ -102,7 +112,12 @@ def test_build_mujoco_diagnostics_snapshot_serializes_arrays_and_names() -> None
 
 - [ ] **步骤 2：运行测试验证失败**
 
-运行：`pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py::test_build_mujoco_diagnostics_snapshot_serializes_arrays_and_names -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py::test_build_mujoco_diagnostics_snapshot_serializes_arrays_and_names -v
+```
 
 预期：FAIL，报错包含 `cannot import name 'build_mujoco_diagnostics_snapshot'`。
 
@@ -186,7 +201,12 @@ def build_mujoco_diagnostics_snapshot(
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py::test_build_mujoco_diagnostics_snapshot_serializes_arrays_and_names -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py::test_build_mujoco_diagnostics_snapshot_serializes_arrays_and_names -v
+```
 
 预期：PASS。
 
@@ -231,7 +251,12 @@ def test_build_mujoco_diagnostics_snapshot_keeps_contact_when_force_fails() -> N
 
 - [ ] **步骤 6：运行新增测试验证通过**
 
-运行：`pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_mujoco_diagnostics.py -v
+```
 
 预期：PASS，3 个测试通过。
 
@@ -308,6 +333,7 @@ def test_robocasa_env_get_mujoco_diagnostics_delegates_to_vector_env() -> None:
 运行：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 pytest \
   tests/unit_tests/test_robocasa_mujoco_diagnostics.py::test_robocasa_subproc_env_get_mujoco_diagnostics_calls_workers \
   tests/unit_tests/test_robocasa_env.py::test_robocasa_env_get_mujoco_diagnostics_delegates_to_vector_env \
@@ -391,6 +417,7 @@ pytest \
 运行：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 pytest \
   tests/unit_tests/test_robocasa_mujoco_diagnostics.py \
   tests/unit_tests/test_robocasa_env.py \
@@ -488,7 +515,12 @@ def test_build_episode_record_contains_required_fields() -> None:
 
 - [ ] **步骤 2：运行测试验证失败**
 
-运行：`pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v
+```
 
 预期：FAIL，报错包含 `No module named` 或 `cannot import name`。
 
@@ -558,7 +590,12 @@ def build_episode_record(
 
 - [ ] **步骤 4：运行测试验证通过**
 
-运行：`pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v
+```
 
 预期：PASS。
 
@@ -628,7 +665,12 @@ def test_validate_diagnostics_cfg_sets_defaults(tmp_path) -> None:
 
 - [ ] **步骤 2：运行测试验证失败**
 
-运行：`pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py::test_validate_diagnostics_cfg_rejects_non_robocasa_openpi tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py::test_validate_diagnostics_cfg_sets_defaults -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py::test_validate_diagnostics_cfg_rejects_non_robocasa_openpi tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py::test_validate_diagnostics_cfg_sets_defaults -v
+```
 
 预期：FAIL，报错包含 `cannot import name 'validate_diagnostics_cfg'`。
 
@@ -813,7 +855,12 @@ if __name__ == "__main__":
 
 - [ ] **步骤 6：运行单元测试验证通过**
 
-运行：`pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v`
+运行：
+
+```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
+pytest tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py -v
+```
 
 预期：PASS。
 
@@ -822,6 +869,7 @@ if __name__ == "__main__":
 运行：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 EMBODIED_PATH=/data1/miliang/RLinf/examples/embodiment \
 PYTHONPATH=/data1/miliang/RLinf:$PYTHONPATH \
 python examples/embodiment/eval_robocasa_openpi_diagnostics.py --help
@@ -848,6 +896,7 @@ git commit -s -m "feat: add robocasa openpi diagnostics eval"
 运行：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 pytest \
   tests/unit_tests/test_robocasa_mujoco_diagnostics.py \
   tests/unit_tests/test_robocasa_env.py \
@@ -862,6 +911,7 @@ pytest \
 运行：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 ruff check rlinf/envs/robocasa/venv.py rlinf/envs/robocasa/robocasa_env.py examples/embodiment/eval_robocasa_openpi_diagnostics.py tests/unit_tests/test_robocasa_mujoco_diagnostics.py tests/unit_tests/test_robocasa_openpi_diagnostics_eval.py tests/unit_tests/test_robocasa_env.py
 ```
 
@@ -874,6 +924,7 @@ ruff check rlinf/envs/robocasa/venv.py rlinf/envs/robocasa/robocasa_env.py examp
 在最终回复中给出真实 eval 命令：
 
 ```bash
+source /data1/gaobowen/RLinf/.venv-robocasa-openpi/bin/activate
 EMBODIED_PATH=/data1/miliang/RLinf/examples/embodiment \
 PYTHONPATH=/data1/miliang/RLinf:$PYTHONPATH \
 python examples/embodiment/eval_robocasa_openpi_diagnostics.py \
