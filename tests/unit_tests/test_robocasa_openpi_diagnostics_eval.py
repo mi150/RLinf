@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
+from omegaconf import OmegaConf
 
 from examples.embodiment.eval_robocasa_openpi_diagnostics import (
     build_episode_record,
     to_jsonable,
+    validate_diagnostics_cfg,
 )
 
 
@@ -63,3 +66,45 @@ def test_build_episode_record_contains_required_fields() -> None:
     assert record["actions"] == [[0.1, 0.2]]
     assert record["steps"][0]["diagnostics"]["qvel"] == [0.0]
     json.dumps(record)
+
+
+def test_validate_diagnostics_cfg_rejects_non_robocasa_openpi() -> None:
+    cfg = OmegaConf.create(
+        {
+            "env": {"eval": {"env_type": "libero"}},
+            "actor": {
+                "model": {"model_type": "openpi", "model_path": "/tmp/model"}
+            },
+            "diagnostics": {"output_path": "/tmp/out.jsonl", "num_episodes": 1},
+        }
+    )
+
+    with pytest.raises(ValueError, match="RoboCasa"):
+        validate_diagnostics_cfg(cfg)
+
+
+def test_validate_diagnostics_cfg_sets_defaults(tmp_path) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    cfg = OmegaConf.create(
+        {
+            "env": {
+                "eval": {
+                    "env_type": "robocasa",
+                    "total_num_envs": 1,
+                    "max_episode_steps": 3,
+                }
+            },
+            "actor": {
+                "model": {"model_type": "openpi", "model_path": str(model_path)}
+            },
+            "diagnostics": {"output_path": str(tmp_path / "out.jsonl")},
+        }
+    )
+
+    validate_diagnostics_cfg(cfg)
+
+    assert cfg.diagnostics.num_episodes == 1
+    assert cfg.diagnostics.max_contacts == 32
+    assert cfg.diagnostics.include_model_names is True
+    assert cfg.diagnostics.flush_every == 1
