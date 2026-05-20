@@ -23,6 +23,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.envs.action_utils import prepare_actions
+
 
 def to_jsonable(value: Any) -> Any:
     """Convert numpy and torch values into JSON-serializable Python values."""
@@ -106,6 +108,13 @@ def validate_diagnostics_cfg(cfg: DictConfig) -> None:
                 force_add=True,
             )
 
+    if int(cfg.diagnostics.num_episodes) < 1:
+        raise ValueError("diagnostics.num_episodes must be >= 1")
+    if int(cfg.diagnostics.max_contacts) < 0:
+        raise ValueError("diagnostics.max_contacts must be >= 0")
+    if int(cfg.diagnostics.flush_every) < 1:
+        raise ValueError("diagnostics.flush_every must be >= 1")
+
 
 def load_openpi_model(cfg: DictConfig) -> torch.nn.Module:
     """Load the configured OpenPI model for local evaluation."""
@@ -159,8 +168,9 @@ def _first_task_name(cfg: DictConfig) -> str:
     task_names = OmegaConf.select(cfg, "env.eval.task_names")
     if task_names is None:
         return ""
-    task_names = OmegaConf.to_container(task_names, resolve=True)
-    if isinstance(task_names, list):
+    if OmegaConf.is_config(task_names):
+        task_names = OmegaConf.to_container(task_names, resolve=True)
+    if isinstance(task_names, (list, tuple)):
         return str(task_names[0]) if task_names else ""
     return str(task_names)
 
@@ -192,6 +202,24 @@ def _iter_single_env_actions(action_chunk: Any):
         yield action_chunk.reshape(1, -1)
 
 
+def _select_env_success(infos: dict[str, Any], terminated: Any, env_id: int = 0) -> bool:
+    episode_info = infos.get("episode", {}) if isinstance(infos, dict) else {}
+    if isinstance(episode_info, dict) and "success_at_end" in episode_info:
+        success_at_end = episode_info["success_at_end"]
+        if isinstance(success_at_end, torch.Tensor):
+            if success_at_end.numel() > env_id:
+                return bool(success_at_end.detach().cpu().reshape(-1)[env_id].item())
+        elif isinstance(success_at_end, np.ndarray):
+            if success_at_end.size > env_id:
+                return bool(success_at_end.reshape(-1)[env_id].item())
+        elif isinstance(success_at_end, (list, tuple)):
+            if len(success_at_end) > env_id:
+                return bool(success_at_end[env_id])
+        else:
+            return bool(success_at_end)
+    return _tensor_bool(terminated)
+
+
 def run_diagnostics_eval(cfg: DictConfig) -> None:
     """Run local RoboCasa OpenPI diagnostics evaluation and write JSONL records."""
     validate_diagnostics_cfg(cfg)
@@ -217,6 +245,26 @@ def run_diagnostics_eval(cfg: DictConfig) -> None:
                             env_obs=obs,
                             mode="eval",
                         )
+                    if isinstance(action_chunk, tuple):
+                        action_chunk = action_chunk[0]
+                    action_chunk = prepare_actions(
+                        raw_chunk_actions=action_chunk,
+                        env_type=str(cfg.env.eval.env_type),
+                        model_type=str(cfg.actor.model.model_type),
+                        num_action_chunks=int(cfg.actor.model.num_action_chunks),
+                        action_dim=int(cfg.actor.model.action_dim),
+                        policy=str(
+                            OmegaConf.select(
+                                cfg,
+                                "actor.model.policy_setup",
+                                default=OmegaConf.select(
+                                    cfg,
+                                    "env.eval.action_space",
+                                    default="",
+                                ),
+                            )
+                        ),
+                    )
 
                     should_stop = False
                     for action in _iter_single_env_actions(action_chunk):
@@ -224,7 +272,7 @@ def run_diagnostics_eval(cfg: DictConfig) -> None:
                             should_stop = True
                             break
 
-                        obs, reward, terminated, truncated, _ = env.step(
+                        obs, reward, terminated, truncated, infos = env.step(
                             action,
                             auto_reset=False,
                         )
@@ -235,7 +283,8 @@ def run_diagnostics_eval(cfg: DictConfig) -> None:
                             ),
                         )[0]
 
-                        is_success = _tensor_bool(terminated)
+                        is_terminated = _tensor_bool(terminated)
+                        is_success = _select_env_success(infos, terminated)
                         is_truncated = _tensor_bool(truncated)
                         actions.append(action)
                         step_records.append(
@@ -243,7 +292,7 @@ def run_diagnostics_eval(cfg: DictConfig) -> None:
                                 "step": len(step_records),
                                 "reward": _tensor_float(reward),
                                 "success": is_success,
-                                "terminated": is_success,
+                                "terminated": is_terminated,
                                 "truncated": is_truncated,
                                 "diagnostics": diagnostics,
                             }
