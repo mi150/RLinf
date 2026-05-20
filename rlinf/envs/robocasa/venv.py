@@ -35,6 +35,75 @@ from rlinf.envs.venv import (
 )
 
 
+def _json_list(value: Any) -> list:
+    return np.asarray(value).tolist()
+
+
+def _named_items(model: Any, count_attr: str, accessor_name: str) -> list[str]:
+    count = int(getattr(model, count_attr, 0))
+    accessor = getattr(model, accessor_name)
+    return [accessor(idx).name for idx in range(count)]
+
+
+def _default_contact_force(model: Any, data: Any, contact_id: int) -> list[float]:
+    import mujoco
+
+    force = np.zeros(6, dtype=np.float64)
+    mujoco.mj_contactForce(model, data, contact_id, force)
+    return _json_list(force)
+
+
+def build_mujoco_diagnostics_snapshot(
+    model: Any,
+    data: Any,
+    max_contacts: Optional[int] = None,
+    include_model_names: bool = True,
+    contact_force_fn: Optional[Callable[[Any, Any, int], list[float]]] = None,
+) -> dict[str, Any]:
+    """Build a JSON-serializable MuJoCo diagnostics snapshot."""
+    ncon = int(getattr(data, "ncon", 0))
+    contact_limit = ncon if max_contacts is None else min(ncon, max_contacts)
+    force_fn = contact_force_fn or _default_contact_force
+
+    contacts = []
+    for contact_id in range(contact_limit):
+        contact = data.contact[contact_id]
+        geom1 = int(contact.geom1)
+        geom2 = int(contact.geom2)
+        contact_snapshot = {
+            "dist": float(contact.dist),
+            "geom1": geom1,
+            "geom2": geom2,
+            "geom1_name": model.geom(geom1).name if include_model_names else "",
+            "geom2_name": model.geom(geom2).name if include_model_names else "",
+            "force": None,
+        }
+        try:
+            contact_snapshot["force"] = _json_list(force_fn(model, data, contact_id))
+        except Exception as exc:
+            contact_snapshot["force_error"] = str(exc)
+        contacts.append(contact_snapshot)
+
+    energy = _json_list(getattr(data, "energy", []))
+    return {
+        "ncon": ncon,
+        "contacts": contacts,
+        "qvel": _json_list(getattr(data, "qvel", [])),
+        "xpos": _json_list(getattr(data, "xpos", [])),
+        "xquat": _json_list(getattr(data, "xquat", [])),
+        "subtree_linvel": _json_list(getattr(data, "subtree_linvel", [])),
+        "energy": energy,
+        "kinetic_energy": energy[0] if len(energy) > 0 else None,
+        "potential_energy": energy[1] if len(energy) > 1 else None,
+        "body_names": _named_items(model, "nbody", "body")
+        if include_model_names
+        else [],
+        "geom_names": _named_items(model, "ngeom", "geom")
+        if include_model_names
+        else [],
+    }
+
+
 def _worker(
     parent: connection.Connection,
     p: connection.Connection,
