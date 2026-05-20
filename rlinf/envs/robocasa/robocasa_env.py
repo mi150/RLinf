@@ -146,6 +146,7 @@ class RobocasaEnv(gym.Env):
                 robot=robot_name,
             ):
                 """Factory function to create a robosuite environment in subprocess."""
+                import robocasa  # noqa: F401 RoboCasa must register envs per subprocess
                 import robosuite
                 from robosuite.controllers import load_composite_controller_config
 
@@ -493,6 +494,17 @@ class RobocasaEnv(gym.Env):
             return reward_diff
         else:
             return reward
+
+    def get_mujoco_diagnostics(
+        self,
+        max_contacts: Optional[int] = None,
+        include_model_names: bool = True,
+    ) -> list[dict]:
+        """Return MuJoCo diagnostics for each RoboCasa subprocess env."""
+        return self.env.get_mujoco_diagnostics(
+            max_contacts=max_contacts,
+            include_model_names=include_model_names,
+        )
 
     def close(self):
         """Close all environments."""

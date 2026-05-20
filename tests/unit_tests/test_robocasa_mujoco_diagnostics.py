@@ -105,3 +105,27 @@ def test_build_mujoco_diagnostics_snapshot_keeps_contact_when_force_fails():
     assert snapshot["contacts"][0]["force"] is None
     assert snapshot["contacts"][0]["force_error"] == "force unavailable"
     assert snapshot["contacts"][0]["dist"] == -0.1
+
+
+def test_robocasa_subproc_env_get_mujoco_diagnostics_calls_workers() -> None:
+    from rlinf.envs.robocasa.venv import RobocasaSubprocEnv
+
+    env = RobocasaSubprocEnv.__new__(RobocasaSubprocEnv)
+
+    class _Worker:
+        def __init__(self, value):
+            self.value = value
+
+        def get_mujoco_diagnostics(self, max_contacts, include_model_names):
+            return {
+                "value": self.value,
+                "max_contacts": max_contacts,
+                "include_model_names": include_model_names,
+            }
+
+    env.workers = [_Worker(1), _Worker(2)]
+
+    assert env.get_mujoco_diagnostics(max_contacts=4, include_model_names=False) == [
+        {"value": 1, "max_contacts": 4, "include_model_names": False},
+        {"value": 2, "max_contacts": 4, "include_model_names": False},
+    ]

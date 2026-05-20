@@ -21,6 +21,11 @@ def test_get_env_fns_imports_robocasa_before_robosuite_make(
     fake_pil_image_font = ModuleType("PIL.ImageFont")
     fake_venv = ModuleType("rlinf.envs.robocasa.venv")
     fake_venv.RobocasaSubprocEnv = object
+    monkeypatch.delitem(
+        sys.modules,
+        "rlinf.envs.robocasa.robocasa_env",
+        raising=False,
+    )
     monkeypatch.setitem(sys.modules, "gymnasium", fake_gymnasium)
     monkeypatch.setitem(sys.modules, "imageio", fake_imageio)
     monkeypatch.setitem(sys.modules, "PIL", fake_pil)
@@ -84,3 +89,19 @@ def test_get_env_fns_imports_robocasa_before_robosuite_make(
     env_fn = env.get_env_fns()[0]
 
     assert env_fn() is fake_env
+
+
+def test_robocasa_env_get_mujoco_diagnostics_delegates_to_vector_env() -> None:
+    module = importlib.import_module("rlinf.envs.robocasa.robocasa_env")
+    RobocasaEnv = module.RobocasaEnv
+    env = RobocasaEnv.__new__(RobocasaEnv)
+
+    class _VectorEnv:
+        def get_mujoco_diagnostics(self, max_contacts, include_model_names):
+            return [{"max_contacts": max_contacts, "names": include_model_names}]
+
+    env.env = _VectorEnv()
+
+    assert env.get_mujoco_diagnostics(max_contacts=7, include_model_names=True) == [
+        {"max_contacts": 7, "names": True}
+    ]

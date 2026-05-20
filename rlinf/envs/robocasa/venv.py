@@ -205,6 +205,15 @@ def _worker(
                 p.send(getattr(env, data) if hasattr(env, data) else None)
             elif cmd == "setattr":
                 setattr(env.unwrapped, data["key"], data["value"])
+            elif cmd == "get_mujoco_diagnostics":
+                p.send(
+                    build_mujoco_diagnostics_snapshot(
+                        model=env.sim.model,
+                        data=env.sim.data,
+                        max_contacts=data.get("max_contacts"),
+                        include_model_names=data.get("include_model_names", True),
+                    )
+                )
             else:
                 p.close()
                 raise NotImplementedError(f"Unknown command: {cmd}")
@@ -241,6 +250,22 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
         self.child_remote.close()
         EnvWorker.__init__(self, env_fn)
 
+    def get_mujoco_diagnostics(
+        self,
+        max_contacts: Optional[int] = None,
+        include_model_names: bool = True,
+    ) -> dict[str, Any]:
+        self.parent_remote.send(
+            [
+                "get_mujoco_diagnostics",
+                {
+                    "max_contacts": max_contacts,
+                    "include_model_names": include_model_names,
+                },
+            ]
+        )
+        return self.parent_remote.recv()
+
 
 class RobocasaSubprocEnv(SubprocVectorEnv):
     """Subprocess vectorized environment for Robocasa/Robosuite.
@@ -256,3 +281,16 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
             return RobocasaSubprocEnvWorker(fn, share_memory=False)
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
+
+    def get_mujoco_diagnostics(
+        self,
+        max_contacts: Optional[int] = None,
+        include_model_names: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not hasattr(self, "is_closed"):
+            self.is_closed = False
+        self._assert_is_not_closed()
+        return [
+            worker.get_mujoco_diagnostics(max_contacts, include_model_names)
+            for worker in self.workers
+        ]
