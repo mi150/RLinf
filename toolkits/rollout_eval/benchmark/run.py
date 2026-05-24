@@ -28,6 +28,9 @@ DEFAULT_PRESET_MAP = {
     "libero_gr00t": EnvModelPreset(
         name="libero_gr00t", env_type="libero", model_type="gr00t"
     ),
+    "libero_openpi": EnvModelPreset(
+        name="libero_openpi", env_type="libero", model_type="openpi"
+    ),
     "metaworld_openpi": EnvModelPreset(
         name="metaworld_openpi", env_type="metaworld", model_type="openpi"
     ),
@@ -90,7 +93,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-only-input",
         default="dummy_from_env_reset",
-        choices=["dummy_from_env_reset"],
+        choices=["dummy_from_env_reset", "random"],
         help="Model-only input source",
     )
     parser.add_argument(
@@ -106,6 +109,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Override env.eval.total_num_envs to increase/decrease benchmark batch size",
+    )
+    parser.add_argument(
+        "--num-envs-list",
+        default=None,
+        help=(
+            "Comma-separated env.eval.total_num_envs values to sweep as a "
+            "batch-size matrix dimension. Mutually exclusive with --num-envs."
+        ),
+    )
+    parser.add_argument(
+        "--skip-validate-cfg",
+        action="store_true",
+        help=(
+            "Skip rlinf.config.validate_cfg. Use this for lightweight benchmark "
+            "runs that should not initialize Ray/Cluster state."
+        ),
     )
     parser.add_argument(
         "--pipeline-queue-timeout-s",
@@ -153,6 +172,13 @@ def build_request(args: argparse.Namespace) -> BenchmarkRequest:
 
     raw_scenario_set = args.scenario_set
     scenario_set = _parse_csv(raw_scenario_set)
+    num_envs_list = (
+        _parse_int_csv(args.num_envs_list) if args.num_envs_list is not None else ()
+    )
+    if args.num_envs is not None and num_envs_list:
+        raise ValueError("Use either --num-envs or --num-envs-list, not both")
+    if any(value <= 0 for value in num_envs_list):
+        raise ValueError("--num-envs-list values must be positive integers")
     cpu_scenarios = {"env_only_cpu_core", "concurrent_cpu_core"}
     has_cpu_scenario = any(scenario in cpu_scenarios for scenario in scenario_set)
     has_cpu_bind_cores = bool((args.cpu_bind_cores or "").strip())
@@ -197,6 +223,8 @@ def build_request(args: argparse.Namespace) -> BenchmarkRequest:
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
         num_envs_override=args.num_envs,
+        num_envs_list=num_envs_list,
+        skip_validate_cfg=bool(args.skip_validate_cfg),
         pipeline_queue_timeout_s=args.pipeline_queue_timeout_s,
         pipeline_run_timeout_s=args.pipeline_run_timeout_s,
         cpu_bind_cores=args.cpu_bind_cores or None,

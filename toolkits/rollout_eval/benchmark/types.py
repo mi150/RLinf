@@ -32,6 +32,8 @@ class BenchmarkRequest:
     warmup_steps: int
     measure_steps: int
     num_envs_override: int | None = None
+    num_envs_list: tuple[int, ...] = ()
+    skip_validate_cfg: bool = False
     pipeline_queue_timeout_s: float = 5.0
     pipeline_run_timeout_s: float | None = None
     cpu_bind_cores: str | None = None
@@ -49,6 +51,7 @@ class BenchmarkCase:
     preset_name: str
     env_type: str
     model_type: str
+    num_envs: int | None = None
     mps_sm: int | None = None
     mig_device: str | None = None
     cpu_binding_mode: str | None = None

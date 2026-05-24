@@ -12,6 +12,7 @@ from pathlib import Path
 from queue import Empty
 from typing import Callable
 
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import open_dict
 
@@ -112,8 +113,14 @@ def _load_cfg_for_case(request: BenchmarkRequest, case: BenchmarkCase):
 
         if "rollout" in cfg and "model" in cfg.rollout and "model_type" in cfg.rollout.model:
             cfg.rollout.model.model_type = case.model_type
-        if request.num_envs_override is not None:
-            cfg.env.eval.total_num_envs = int(request.num_envs_override)
+        num_envs = case.num_envs
+        if num_envs is None:
+            num_envs = request.num_envs_override
+        if num_envs is not None:
+            cfg.env.eval.total_num_envs = int(num_envs)
+
+    if request.skip_validate_cfg:
+        return cfg
 
     try:
         return validate_cfg(cfg)
@@ -186,6 +193,41 @@ class _PipelineModelAdapter:
         return action
 
 
+def _get_cfg_value(root, path: tuple[str, ...], default):
+    current = root
+    for key in path:
+        if current is None:
+            return default
+        getter = getattr(current, "get", None)
+        if callable(getter):
+            current = getter(key, None)
+        else:
+            current = getattr(current, key, None)
+    return default if current is None else current
+
+
+def _make_random_model_obs(cfg, case: BenchmarkCase) -> dict:
+    batch_size = case.num_envs
+    if batch_size is None:
+        batch_size = int(_get_cfg_value(cfg, ("env", "eval", "total_num_envs"), 1))
+    batch_size = int(batch_size)
+
+    if case.env_type == "libero" and case.model_type == "openpi":
+        state_dim = int(_get_cfg_value(cfg, ("actor", "model", "state_dim"), 8))
+        image_shape = (batch_size, 224, 224, 3)
+        return {
+            "main_images": torch.randint(0, 256, image_shape, dtype=torch.uint8),
+            "wrist_images": torch.randint(0, 256, image_shape, dtype=torch.uint8),
+            "extra_view_images": None,
+            "states": torch.rand(batch_size, state_dim, dtype=torch.float32),
+            "task_descriptions": ["do something"] * batch_size,
+        }
+
+    raise SkipCase(
+        "random model-only input is currently implemented for libero_openpi only"
+    )
+
+
 def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics:
     if case.scenario not in {
         "concurrent_mps",
@@ -225,8 +267,16 @@ def _execute_case(request: BenchmarkRequest, case: BenchmarkCase) -> CaseMetrics
 
         if case.scenario.startswith("model_only_"):
             cfg = _load_cfg_for_case(request, case)
-            env_adapter = build_env_adapter(cfg, split="eval", profile_output_dir=None)
             model_adapter = build_model_adapter(cfg, split_model_stages=False)
+            if request.model_only_input == "random":
+                return run_model_only_case(
+                    env_adapter=None,
+                    model_adapter=model_adapter,
+                    warmup_steps=request.warmup_steps,
+                    measure_steps=request.measure_steps,
+                    obs_batch=_make_random_model_obs(cfg, case),
+                ).metrics
+            env_adapter = build_env_adapter(cfg, split="eval", profile_output_dir=None)
             return run_model_only_case(
                 env_adapter=env_adapter,
                 model_adapter=model_adapter,

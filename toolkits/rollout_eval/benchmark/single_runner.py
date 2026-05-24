@@ -131,15 +131,21 @@ def run_env_only_case(
 
 def run_model_only_case(
     *,
-    env_adapter: Any,
+    env_adapter: Any | None = None,
     model_adapter: Any,
     warmup_steps: int,
     measure_steps: int,
+    obs_batch: Any | None = None,
 ) -> SingleRunnerResult:
     """Run model-only benchmark loop with dummy observations from reset template."""
     total_steps = warmup_steps + measure_steps
-    reset_obs, _ = env_adapter.reset()
-    dummy_obs = _make_dummy_obs_from_template(reset_obs)
+    if obs_batch is None:
+        if env_adapter is None:
+            raise ValueError("run_model_only_case requires env_adapter or obs_batch")
+        reset_obs, _ = env_adapter.reset()
+        dummy_obs = _make_dummy_obs_from_template(reset_obs)
+    else:
+        dummy_obs = obs_batch
 
     model_infer_latency_ms: list[float] = []
     model_infer_gpu_time_ms: list[float] = []
@@ -166,7 +172,7 @@ def run_model_only_case(
             if start_event is not None and end_event is not None:
                 model_infer_gpu_time_ms.append(float(start_event.elapsed_time(end_event)))
 
-    if hasattr(env_adapter, "close"):
+    if env_adapter is not None and hasattr(env_adapter, "close"):
         env_adapter.close()
 
     metrics = aggregate_case_metrics(

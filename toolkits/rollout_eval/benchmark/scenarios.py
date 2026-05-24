@@ -28,6 +28,14 @@ def _make_case_id(scenario: str, preset_name: str, resource_token: str) -> str:
     return f"{_normalize_token(scenario)}-{_normalize_token(preset_name)}-{_normalize_token(resource_token)}"
 
 
+def _resource_tokens(base_token: str, num_envs_values: tuple[int | None, ...]):
+    for num_envs in num_envs_values:
+        if num_envs is None:
+            yield base_token, None
+        else:
+            yield f"{base_token}-bs{num_envs}", num_envs
+
+
 def _parse_cpu_core_set(spec: str) -> tuple[int, ...]:
     if not spec.strip():
         return ()
@@ -56,6 +64,11 @@ def expand_cases(request: BenchmarkRequest) -> list[BenchmarkCase]:
     presets = sorted(request.presets, key=lambda preset: preset.name)
     mps_values = sorted(set(request.mps_sm))
     mig_values = sorted(set(request.mig_devices))
+    num_envs_values: tuple[int | None, ...] = (
+        tuple(sorted(set(request.num_envs_list)))
+        if request.num_envs_list
+        else (None,)
+    )
     cpu_binding_mode = request.cpu_bind_strategy or "even_split"
     cpu_binding_disabled = cpu_binding_mode == "none"
     parsed_cpu_cores = _parse_cpu_core_set(request.cpu_bind_cores or "")
@@ -88,51 +101,65 @@ def expand_cases(request: BenchmarkRequest) -> list[BenchmarkCase]:
         if scenario.endswith("_mps"):
             for preset in presets:
                 for sm in mps_values:
-                    resource_token = f"mps-sm{sm}"
-                    cases.append(
-                        BenchmarkCase(
-                            case_id=_make_case_id(scenario, preset.name, resource_token),
-                            scenario=scenario,
-                            preset_name=preset.name,
-                            env_type=preset.env_type,
-                            model_type=preset.model_type,
-                            mps_sm=sm,
+                    for resource_token, num_envs in _resource_tokens(
+                        f"mps-sm{sm}", num_envs_values
+                    ):
+                        cases.append(
+                            BenchmarkCase(
+                                case_id=_make_case_id(
+                                    scenario, preset.name, resource_token
+                                ),
+                                scenario=scenario,
+                                preset_name=preset.name,
+                                env_type=preset.env_type,
+                                model_type=preset.model_type,
+                                num_envs=num_envs,
+                                mps_sm=sm,
+                            )
                         )
-                    )
             continue
 
         if scenario.endswith("_mig"):
             for preset in presets:
                 for mig_device in mig_values:
-                    resource_token = f"mig-{mig_device}"
-                    cases.append(
-                        BenchmarkCase(
-                            case_id=_make_case_id(scenario, preset.name, resource_token),
-                            scenario=scenario,
-                            preset_name=preset.name,
-                            env_type=preset.env_type,
-                            model_type=preset.model_type,
-                            mig_device=mig_device,
+                    for resource_token, num_envs in _resource_tokens(
+                        f"mig-{mig_device}", num_envs_values
+                    ):
+                        cases.append(
+                            BenchmarkCase(
+                                case_id=_make_case_id(
+                                    scenario, preset.name, resource_token
+                                ),
+                                scenario=scenario,
+                                preset_name=preset.name,
+                                env_type=preset.env_type,
+                                model_type=preset.model_type,
+                                num_envs=num_envs,
+                                mig_device=mig_device,
+                            )
                         )
-                    )
             continue
 
         if scenario.endswith("_cpu_core"):
             if cpu_resource_token is None:
                 continue
             for preset in presets:
-                cases.append(
-                    BenchmarkCase(
-                        case_id=_make_case_id(
-                            scenario, preset.name, cpu_resource_token
-                        ),
-                        scenario=scenario,
-                        preset_name=preset.name,
-                        env_type=preset.env_type,
-                        model_type=preset.model_type,
-                        cpu_binding_mode=cpu_binding_mode,
-                        cpu_available_cores=cpu_available_cores,
+                for resource_token, num_envs in _resource_tokens(
+                    cpu_resource_token, num_envs_values
+                ):
+                    cases.append(
+                        BenchmarkCase(
+                            case_id=_make_case_id(
+                                scenario, preset.name, resource_token
+                            ),
+                            scenario=scenario,
+                            preset_name=preset.name,
+                            env_type=preset.env_type,
+                            model_type=preset.model_type,
+                            num_envs=num_envs,
+                            cpu_binding_mode=cpu_binding_mode,
+                            cpu_available_cores=cpu_available_cores,
+                        )
                     )
-                )
 
     return cases

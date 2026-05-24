@@ -26,6 +26,7 @@ def _resource_binding(case: BenchmarkCase) -> dict[str, object]:
         else None
     )
     return {
+        "num_envs": case.num_envs,
         "mps_sm": case.mps_sm,
         "mig_device": case.mig_device,
         "cpu_binding_mode": case.cpu_binding_mode,
@@ -49,6 +50,9 @@ def write_case_report(
     """Write case-level report and metadata files, return report dict."""
     case_dir = output_dir / case.scenario / case.case_id
     case_dir.mkdir(parents=True, exist_ok=True)
+    resource = _resource_binding(case)
+    if resource["num_envs"] is None:
+        resource["num_envs"] = request.num_envs_override
 
     report = {
         "case_id": case.case_id,
@@ -56,7 +60,7 @@ def write_case_report(
         "preset_name": case.preset_name,
         "env_type": case.env_type,
         "model_type": case.model_type,
-        "resource": _resource_binding(case),
+        "resource": resource,
         "status": status,
         "metrics": asdict(metrics) if metrics is not None else None,
         "error_message": error_message,
@@ -74,11 +78,13 @@ def write_case_report(
             "warmup_steps": request.warmup_steps,
             "measure_steps": request.measure_steps,
             "num_envs_override": request.num_envs_override,
+            "num_envs_list": list(request.num_envs_list),
+            "skip_validate_cfg": request.skip_validate_cfg,
             "pipeline_queue_timeout_s": request.pipeline_queue_timeout_s,
             "pipeline_run_timeout_s": request.pipeline_run_timeout_s,
         },
         "process_env": process_env,
-        "resource": _resource_binding(case),
+        "resource": resource,
     }
 
     _dump_json(report, case_dir / "case_report.json")
@@ -111,21 +117,31 @@ def write_summary_reports(*, output_dir: Path, case_records: list[dict]) -> dict
         f"- Failed: {counts['failed']}",
         f"- Skipped: {counts['skipped']}",
         "",
-        "| case_id | scenario | status | env_steps/s | infer/s | pipeline/s | cpu_mode | cpu_cores | infer_gpu_ms(avg) |",
-        "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |",
+        "| case_id | scenario | status | num_envs | env_steps/s | infer/s | step/s | ideal step/s | pipeline/s | cpu_mode | cpu_cores | infer_gpu_ms(avg) |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |",
     ]
 
     for record in case_records:
         metrics = record.get("metrics") or {}
         resource = record.get("resource") or {}
+        num_envs_value = resource.get("num_envs")
+        infer_per_sec = float(metrics.get("model_infers_per_sec", 0.0))
+        step_per_sec = infer_per_sec * float(num_envs_value or 0)
+        mps_sm = resource.get("mps_sm")
+        ideal_step_per_sec = (
+            (100.0 / float(mps_sm)) * step_per_sec if mps_sm else 0.0
+        )
         cpu_cores = len(resource.get("cpu_effective_affinity") or [])
         lines.append(
-            "| {case_id} | {scenario} | {status} | {env:.6f} | {infer:.6f} | {pipe:.6f} | {cpu_mode} | {cpu_cores} | {gpu:.3f} |".format(
+            "| {case_id} | {scenario} | {status} | {num_envs} | {env:.6f} | {infer:.6f} | {step:.6f} | {ideal_step:.6f} | {pipe:.6f} | {cpu_mode} | {cpu_cores} | {gpu:.3f} |".format(
                 case_id=record.get("case_id", ""),
                 scenario=record.get("scenario", ""),
                 status=record.get("status", ""),
+                num_envs=num_envs_value or "",
                 env=float(metrics.get("env_steps_per_sec", 0.0)),
-                infer=float(metrics.get("model_infers_per_sec", 0.0)),
+                infer=infer_per_sec,
+                step=step_per_sec,
+                ideal_step=ideal_step_per_sec,
                 pipe=float(metrics.get("pipeline_samples_per_sec", 0.0)),
                 cpu_mode=resource.get("cpu_binding_mode") or "",
                 cpu_cores=cpu_cores,
