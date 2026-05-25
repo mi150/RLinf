@@ -188,3 +188,75 @@ def test_plan_file_mode_allows_explicit_cpu_sharing(tmp_path: Path) -> None:
         "0": ["env:0", "env:1"],
         "1": ["env:0", "env:1"],
     }
+
+
+def test_plan_file_mode_sorts_components_and_ranks(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "rollout",
+                        "rank": 1,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": None,
+                    },
+                    {
+                        "component": "env",
+                        "rank": 1,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": None,
+                        "gpu": None,
+                    },
+                    {
+                        "component": "rollout",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": None,
+                    },
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": None,
+                        "gpu": None,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0:0-1"},
+                    "rollout": "0-1",
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 2}, "eval": {"total_num_envs": 2}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=2)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    pool = FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+    assert list(pool.bindings) == ["env", "rollout"]
+    assert [binding.rank for binding in pool.bindings["env"]] == [0, 1]
+    assert [binding.rank for binding in pool.bindings["rollout"]] == [0, 1]

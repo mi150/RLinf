@@ -209,7 +209,7 @@ class ResourcePoolSolver:
             bindings[binding.component].append(binding)
         return {
             component: sorted(component_bindings, key=lambda binding: binding.rank)
-            for component, component_bindings in bindings.items()
+            for component, component_bindings in sorted(bindings.items())
         }
 
     def _refresh_summary(
