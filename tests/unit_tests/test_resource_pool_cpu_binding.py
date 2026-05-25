@@ -1,6 +1,6 @@
 import pytest
 
-from rlinf.scheduler.resource_pool.cpu_binding import (
+from rlinf.scheduler.resource_pool import (
     apply_process_cpu_affinity,
     build_even_split_cpu_groups,
     effective_process_affinity,
@@ -37,6 +37,21 @@ def test_parse_env_cpu_core_groups_and_lookup_by_index() -> None:
     assert get_env_core_group_from_env(
         {"RLINF_ENV_CPU_CORE_GROUPS": "0;1,2;3"}, local_env_index=1
     ) == (1, 2)
+
+
+def test_get_env_core_group_from_env_returns_none_when_unconfigured() -> None:
+    assert get_env_core_group_from_env({}, local_env_index=0) is None
+
+
+def test_get_env_core_group_from_env_rejects_out_of_range_index() -> None:
+    with pytest.raises(ValueError, match="local env index 2"):
+        get_env_core_group_from_env(
+            {"RLINF_ENV_CPU_CORE_GROUPS": "0;1"}, local_env_index=2
+        )
+
+
+def test_parse_env_cpu_core_groups_allows_explicit_shared_cores() -> None:
+    assert parse_env_cpu_core_groups("0;0,1") == ((0,), (0, 1))
 
 
 def test_effective_process_affinity_unions_groups() -> None:
