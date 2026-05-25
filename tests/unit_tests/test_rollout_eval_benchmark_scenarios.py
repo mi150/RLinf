@@ -18,10 +18,29 @@ def test_benchmark_cli_defaults() -> None:
     assert args.env_only_action == "random"
     assert args.pipeline_queue_timeout_s == 5.0
     assert args.num_envs is None
+    assert args.num_envs_list is None
+    assert args.skip_validate_cfg is False
     assert args.cpu_bind_cores == ""
     assert args.cpu_bind_strategy == "even_split"
     assert args.cpu_bind_config is None
     assert args.cpu_bind_strict is True
+
+
+def test_build_request_parses_random_model_only_input() -> None:
+    args = parse_args(
+        [
+            "--config-path",
+            "examples/embodiment/config",
+            "--config-name",
+            "x",
+            "--model-only-input",
+            "random",
+        ]
+    )
+
+    request = build_request(args)
+
+    assert request.model_only_input == "random"
 
 
 def test_benchmark_build_request_defaults() -> None:
@@ -40,6 +59,8 @@ def test_benchmark_build_request_defaults() -> None:
     assert request.pipeline == "process"
     assert request.pipeline_queue_timeout_s == 5.0
     assert request.num_envs_override is None
+    assert request.num_envs_list == ()
+    assert request.skip_validate_cfg is False
     assert request.cpu_bind_cores is None
     assert request.cpu_bind_strategy == "even_split"
     assert request.cpu_bind_config is None
@@ -151,6 +172,81 @@ def test_build_request_supports_robocasa_openpi_preset() -> None:
     )
 
 
+def test_build_request_supports_libero_openpi_preset() -> None:
+    args = parse_args(
+        [
+            "--config-path",
+            "examples/embodiment/config",
+            "--config-name",
+            "libero_spatial_ppo_openpi",
+            "--env-model-preset",
+            "libero_openpi",
+        ]
+    )
+
+    request = build_request(args)
+
+    assert request.presets == (
+        EnvModelPreset(
+            name="libero_openpi",
+            env_type="libero",
+            model_type="openpi",
+        ),
+    )
+
+
+def test_build_request_parses_num_envs_list() -> None:
+    args = parse_args(
+        [
+            "--config-path",
+            "examples/embodiment/config",
+            "--config-name",
+            "x",
+            "--num-envs-list",
+            "1,4,8",
+        ]
+    )
+
+    request = build_request(args)
+
+    assert request.num_envs_override is None
+    assert request.num_envs_list == (1, 4, 8)
+
+
+def test_build_request_rejects_num_envs_and_num_envs_list_together() -> None:
+    args = parse_args(
+        [
+            "--config-path",
+            "examples/embodiment/config",
+            "--config-name",
+            "x",
+            "--num-envs",
+            "4",
+            "--num-envs-list",
+            "1,4,8",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="Use either --num-envs or --num-envs-list"):
+        build_request(args)
+
+
+def test_build_request_parses_skip_validate_cfg() -> None:
+    args = parse_args(
+        [
+            "--config-path",
+            "examples/embodiment/config",
+            "--config-name",
+            "x",
+            "--skip-validate-cfg",
+        ]
+    )
+
+    request = build_request(args)
+
+    assert request.skip_validate_cfg is True
+
+
 def test_expand_all_scenarios_generates_expected_classes_and_unique_ids() -> None:
     request = BenchmarkRequest(
         config_path="c",
@@ -190,6 +286,36 @@ def test_expand_all_scenarios_generates_expected_classes_and_unique_ids() -> Non
     }
     assert len(cases) == 24
     assert len({case.case_id for case in cases}) == len(cases)
+
+
+def test_expand_mps_cases_across_num_envs_list() -> None:
+    request = BenchmarkRequest(
+        config_path="c",
+        config_name="n",
+        override=(),
+        output_dir="o",
+        scenario_set=("model_only_mps",),
+        pipeline="process",
+        mps_sm=(20, 40),
+        mig_devices=(),
+        presets=(EnvModelPreset("libero_openpi", "libero", "openpi"),),
+        model_only_input="dummy_from_env_reset",
+        env_only_action="random",
+        warmup_steps=1,
+        measure_steps=2,
+        num_envs_list=(1, 8),
+    )
+
+    cases = expand_cases(request)
+
+    assert [(case.mps_sm, case.num_envs) for case in cases] == [
+        (20, 1),
+        (20, 8),
+        (40, 1),
+        (40, 8),
+    ]
+    assert all("bs" in case.case_id for case in cases)
+    assert len({case.case_id for case in cases}) == 4
 
 
 def test_expand_cases_is_deterministic() -> None:

@@ -44,6 +44,19 @@ if TYPE_CHECKING:
 WorkerClsType = TypeVar("WorkerClsType")
 
 
+def _clear_external_ray_address_for_training_eval() -> None:
+    """Clear external Ray address when training eval uses a local Ray runtime."""
+    if (
+        os.environ.get(
+            Cluster.get_full_env_var_name(
+                ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY
+            )
+        )
+        == "1"
+    ):
+        os.environ.pop("RAY_ADDRESS", None)
+
+
 class WorkerMeta(type):
     """Metaclass to capture failures in worker classes."""
 
@@ -447,6 +460,7 @@ class Worker(metaclass=WorkerMeta):
             "CLUSTER_NAMESPACE environment variable must be set before initializing Worker."
         )
         Cluster.NAMESPACE = namespace
+        _clear_external_ray_address_for_training_eval()
 
         # Initialize Ray if not already initialized
         if not ray.is_initialized():

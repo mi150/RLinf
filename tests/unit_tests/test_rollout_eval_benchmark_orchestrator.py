@@ -5,6 +5,7 @@ from queue import Empty
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 import toolkits.rollout_eval.benchmark.orchestrator as orchestrator_module
 from toolkits.rollout_eval.benchmark.orchestrator import (
@@ -192,6 +193,180 @@ def test_execute_case_env_only_cpu_core_applies_affinity_before_env_adapter(
 
     assert metrics.env_steps_per_sec == 1.0
     assert call_order == [("affinity", (0, 1, 2, 3)), ("env_adapter", None)]
+
+
+def test_load_cfg_for_case_applies_case_num_envs(monkeypatch) -> None:
+    class _OpenDict:
+        def __init__(self, _cfg) -> None:
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    cfg = OmegaConf.create(
+        {
+            "env": {
+                "train": {"env_type": "maniskill"},
+                "eval": {"env_type": "maniskill", "total_num_envs": 500},
+            },
+            "actor": {"model": {"model_type": "openvla_oft"}},
+            "rollout": {"model": {"model_type": "openvla_oft"}},
+        }
+    )
+
+    monkeypatch.setattr(orchestrator_module.Path, "resolve", lambda self: self)
+    monkeypatch.setattr(orchestrator_module, "initialize_config_dir", lambda **_kwargs: _OpenDict(None))
+    monkeypatch.setattr(orchestrator_module, "compose", lambda **_kwargs: cfg)
+    monkeypatch.setattr(orchestrator_module, "open_dict", lambda _cfg: _OpenDict(_cfg))
+    monkeypatch.setattr(orchestrator_module, "validate_cfg", lambda validated_cfg: validated_cfg)
+
+    request = _make_request("/tmp/out")
+    request = BenchmarkRequest(
+        **{
+            **request.__dict__,
+            "num_envs_override": None,
+            "num_envs_list": (4, 8),
+        }
+    )
+    case = BenchmarkCase(
+        case_id="libero-openpi-bs8",
+        scenario="model_only_mps",
+        preset_name="libero_openpi",
+        env_type="libero",
+        model_type="openpi",
+        mps_sm=20,
+        num_envs=8,
+    )
+
+    loaded_cfg = orchestrator_module._load_cfg_for_case(request, case)
+
+    assert loaded_cfg.env.eval.env_type == "libero"
+    assert loaded_cfg.actor.model.model_type == "openpi"
+    assert loaded_cfg.env.eval.total_num_envs == 8
+
+
+def test_load_cfg_for_case_skips_validate_cfg_when_requested(monkeypatch) -> None:
+    class _OpenDict:
+        def __init__(self, _cfg) -> None:
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    cfg = OmegaConf.create(
+        {
+            "env": {
+                "train": {"env_type": "maniskill"},
+                "eval": {"env_type": "maniskill", "total_num_envs": 500},
+            },
+            "actor": {"model": {"model_type": "openvla_oft"}},
+            "rollout": {"model": {"model_type": "openvla_oft"}},
+        }
+    )
+
+    monkeypatch.setattr(orchestrator_module.Path, "resolve", lambda self: self)
+    monkeypatch.setattr(orchestrator_module, "initialize_config_dir", lambda **_kwargs: _OpenDict(None))
+    monkeypatch.setattr(orchestrator_module, "compose", lambda **_kwargs: cfg)
+    monkeypatch.setattr(orchestrator_module, "open_dict", lambda _cfg: _OpenDict(_cfg))
+    monkeypatch.setattr(
+        orchestrator_module,
+        "validate_cfg",
+        lambda _cfg: (_ for _ in ()).throw(AssertionError("validate_cfg should be skipped")),
+    )
+
+    request = _make_request("/tmp/out")
+    request = BenchmarkRequest(
+        **{
+            **request.__dict__,
+            "skip_validate_cfg": True,
+        }
+    )
+    case = BenchmarkCase(
+        case_id="libero-openpi",
+        scenario="model_only_mps",
+        preset_name="libero_openpi",
+        env_type="libero",
+        model_type="openpi",
+        mps_sm=20,
+        num_envs=4,
+    )
+
+    loaded_cfg = orchestrator_module._load_cfg_for_case(request, case)
+
+    assert loaded_cfg.env.eval.env_type == "libero"
+    assert loaded_cfg.actor.model.model_type == "openpi"
+    assert loaded_cfg.env.eval.total_num_envs == 4
+
+
+def test_execute_case_model_only_random_input_skips_env_adapter(
+    tmp_path, monkeypatch
+) -> None:
+    case = BenchmarkCase(
+        case_id="libero-openpi-random",
+        scenario="model_only_mps",
+        preset_name="libero_openpi",
+        env_type="libero",
+        model_type="openpi",
+        mps_sm=20,
+        num_envs=4,
+    )
+    request = _make_request(str(tmp_path))
+    request = BenchmarkRequest(
+        **{
+            **request.__dict__,
+            "scenario_set": ("model_only_mps",),
+            "model_only_input": "random",
+        }
+    )
+    cfg = SimpleNamespace(
+        env=SimpleNamespace(eval=SimpleNamespace(total_num_envs=4)),
+        actor=SimpleNamespace(model=SimpleNamespace(model_type="openpi")),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_load_cfg_for_case",
+        lambda _request, _case: cfg,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "build_env_adapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("random model-only input should not build env adapter")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "build_model_adapter",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    captured = {}
+
+    def _run_model_only_case(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(metrics=CaseMetrics(model_infers_per_sec=2.0))
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "run_model_only_case",
+        _run_model_only_case,
+    )
+
+    metrics = orchestrator_module._execute_case(request, case)
+
+    assert metrics.model_infers_per_sec == 2.0
+    assert captured["env_adapter"] is None
+    assert captured["obs_batch"]["states"].shape == (4, 8)
+    assert captured["obs_batch"]["main_images"].shape == (4, 224, 224, 3)
+    assert captured["obs_batch"]["wrist_images"].shape == (4, 224, 224, 3)
+    assert captured["obs_batch"]["extra_view_images"] is None
+    assert captured["obs_batch"]["task_descriptions"] == ["do something"] * 4
 
 
 def test_execute_case_env_only_cpu_core_none_mode_skips_affinity(
@@ -580,8 +755,35 @@ def test_orchestrator_writes_cpu_binding_metadata(tmp_path, monkeypatch) -> None
     assert report["resource"]["cpu_available_cores"] == [0, 1, 2, 3]
     assert report["resource"]["cpu_env_core_groups"] == [[0, 1], [2, 3]]
     assert metadata["resource"]["cpu_effective_affinity"] == [0, 1, 2, 3]
-    assert "| cpu-report-case | env_only_cpu_core | pass | 12.000000 | 0.000000 | 0.000000 | even_split | 4 |" in summary_md
+    assert "| case_id | scenario | status | num_envs | env_steps/s | infer/s | step/s | ideal step/s | pipeline/s | cpu_mode | cpu_cores | infer_gpu_ms(avg) |" in summary_md
+    assert "| cpu-report-case | env_only_cpu_core | pass |  | 12.000000 | 0.000000 | 0.000000 | 0.000000 | 0.000000 | even_split | 4 |" in summary_md
     assert "[[0, 1], [2, 3]]" not in summary_md
+
+
+def test_summary_markdown_includes_step_per_second(tmp_path, monkeypatch) -> None:
+    case = BenchmarkCase(
+        case_id="model-report-case",
+        scenario="model_only_mps",
+        preset_name="p",
+        env_type="libero",
+        model_type="openpi",
+        num_envs=8,
+        mps_sm=40,
+    )
+    monkeypatch.setattr(
+        "toolkits.rollout_eval.benchmark.orchestrator.expand_cases",
+        lambda _request: [case],
+    )
+
+    request = _make_request(str(tmp_path))
+    run_benchmark_orchestrator(
+        request,
+        case_executor=lambda _request, _case: CaseMetrics(model_infers_per_sec=2.5),
+    )
+
+    summary_md = (tmp_path / "summary.md").read_text(encoding="utf-8")
+
+    assert "| model-report-case | model_only_mps | pass | 8 | 0.000000 | 2.500000 | 20.000000 | 50.000000 | 0.000000 |  | 0 |" in summary_md
 
 
 def test_orchestrator_isolates_prepare_case_failures(tmp_path, monkeypatch) -> None:

@@ -1208,6 +1208,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
 
+    def load_batch(self, rollout_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Load a rollout batch prepared for one training update.
+
+        This keeps the real rollout preprocessing path intact while exposing a
+        narrow public hook for benchmark tooling.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        self.rollout_batch = self._process_received_rollout_batch(rollout_batch)
+        return self.compute_advantages_and_returns()
+
+    def sample_peak_gpu_memory_gb(self) -> tuple[float, float]:
+        """Return peak allocated and reserved CUDA memory in GB for this rank."""
+        if not torch.cuda.is_available():
+            return 0.0, 0.0
+
+        device = torch.cuda.current_device()
+        gb = 1024.0**3
+        return (
+            torch.cuda.max_memory_allocated(device) / gb,
+            torch.cuda.max_memory_reserved(device) / gb,
+        )
+
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
             # NOTE: This must be set before importing openpi.training.data_loader

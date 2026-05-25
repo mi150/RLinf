@@ -73,6 +73,9 @@ class ClusterEnvVar(str, Enum):
         export RLINF_EXT_MODULE=workflows.scripts.rlinf_ext
     """
 
+    TRAINING_EVAL_LOCAL_RAY = "TRAINING_EVAL_LOCAL_RAY"
+    """Force local Ray initialization for training_eval benchmark workers."""
+
 
 class Cluster:
     """A singleton class that manages the cluster resources for Ray workers."""
@@ -90,6 +93,7 @@ class Cluster:
         ClusterEnvVar.NODE_RANK: None,
         ClusterEnvVar.COMM_NET_DEVICES: None,
         ClusterEnvVar.EXT_MODULE: None,
+        ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY: None,
     }
 
     class NamespaceConflictError(Exception):
@@ -220,20 +224,27 @@ class Cluster:
         )
         assert self._num_nodes >= 0, "num_nodes must be greater than or equal to 0."
 
-        try:
-            # First try to connect to an existing Ray cluster
+        local_training_eval = os.environ.get("RLINF_TRAINING_EVAL_LOCAL_RAY") == "1"
+        if local_training_eval:
             ray.init(
-                address="auto",
-                logging_level=Cluster.LOGGING_LEVEL,
-                namespace=Cluster.NAMESPACE,
-                runtime_env={"env_vars": {"RAY_DEBUG": "0"},
-                             }
-            )
-        except ConnectionError:
-            ray.init(
+                address="local",
                 logging_level=Cluster.LOGGING_LEVEL,
                 namespace=Cluster.NAMESPACE,
             )
+        else:
+            try:
+                # First try to connect to an existing Ray cluster
+                ray.init(
+                    address="auto",
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    namespace=Cluster.NAMESPACE,
+                    runtime_env={"env_vars": {"RAY_DEBUG": "0"}},
+                )
+            except ConnectionError:
+                ray.init(
+                    logging_level=Cluster.LOGGING_LEVEL,
+                    namespace=Cluster.NAMESPACE,
+                )
 
         # Ray log collector
         if distributed_log_dir is not None:
@@ -341,11 +352,18 @@ class Cluster:
 
     def _init_from_existing_managers(self):
         if not ray.is_initialized():
-            ray.init(
-                address="auto",
-                namespace=Cluster.NAMESPACE,
-                logging_level=Cluster.LOGGING_LEVEL,
-            )
+            if os.environ.get("RLINF_TRAINING_EVAL_LOCAL_RAY") == "1":
+                ray.init(
+                    address="local",
+                    namespace=Cluster.NAMESPACE,
+                    logging_level=Cluster.LOGGING_LEVEL,
+                )
+            else:
+                ray.init(
+                    address="auto",
+                    namespace=Cluster.NAMESPACE,
+                    logging_level=Cluster.LOGGING_LEVEL,
+                )
 
         from ..manager.node_manager import NodeManager
 

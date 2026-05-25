@@ -26,6 +26,8 @@ from rlinf.scheduler import (
     Worker,
     WorkerAddress,
 )
+from rlinf.scheduler.hardware import AcceleratorType
+from rlinf.scheduler.placement import Placement
 
 
 # Fixture to provide a ClusterResource instance for the test session
@@ -71,6 +73,9 @@ class DistributedTestWorker(Worker):
             "gpu_id": self._local_accelerator_rank,
             "node_local_rank": self._node_local_rank,
         }
+
+    def get_env_marker(self, key: str):
+        return os.environ.get(key)
 
     def sum_with_rank(self, value):
         """Adds the worker's rank to the given value."""
@@ -179,6 +184,76 @@ class TestWorkerGroup:
         results2 = group2.sum_with_rank(200).wait()
         assert len(results2) == num_workers
         assert sorted(results2) == [200 + i for i in range(num_workers)]
+
+    def test_worker_group_launch_applies_extra_env_vars(self):
+        """Test per-launch worker env vars are forwarded to allocation."""
+        from rlinf.scheduler.worker.worker_group import WorkerGroup
+
+        env_key = "RLINF_TEST_WORKER_GROUP_EXTRA_ENV"
+
+        class _PlacementStrategy:
+            def get_placement(self, cluster, isolate_gpu):
+                return [
+                    Placement(
+                        rank=0,
+                        cluster_node_rank=0,
+                        placement_node_rank=0,
+                        local_accelerator_rank=0,
+                        accelerator_type=str(AcceleratorType.NO_ACCEL.value),
+                        local_rank=0,
+                        local_world_size=1,
+                        visible_accelerators=[],
+                        isolate_accelerator=False,
+                        local_hardware_ranks=[],
+                        node_group_label="cluster",
+                    )
+                ]
+
+        class _NodeInfo:
+            accelerator_type = AcceleratorType.NO_ACCEL
+            accelerator_model = "NO_ACCEL"
+            python_interpreter_path = None
+
+        class _NodeGroup:
+            def get_node_env_vars(self, node_rank):
+                return {}
+
+            def get_node_python_interpreter_path(self, node_rank):
+                return None
+
+        class _Cluster:
+            num_accelerators = 0
+
+            def __init__(self):
+                self.allocations = []
+
+            def get_node_ip(self, node_rank):
+                return "127.0.0.1"
+
+            def get_node_info(self, node_rank):
+                return _NodeInfo()
+
+            def get_node_group(self, label):
+                return _NodeGroup()
+
+            def allocate(self, **kwargs):
+                self.allocations.append(kwargs)
+                return object()
+
+        cluster = _Cluster()
+        worker_group = WorkerGroup(DistributedTestWorker, (), {})
+        worker_group._cluster = cluster
+        worker_group._placement_strategy = _PlacementStrategy()
+        worker_group._isolate_gpu = True
+        worker_group._catch_system_failure = False
+        worker_group._max_concurrency = None
+        worker_group._disable_distributed_log = False
+        worker_group._extra_env_vars = {env_key: "extra-value"}
+        worker_group._worker_group_name = "extra_env_group"
+
+        worker_group._create_workers()
+
+        assert cluster.allocations[0]["env_vars"][env_key] == "extra-value"
 
 
 class TestLoadUserExtensions:
