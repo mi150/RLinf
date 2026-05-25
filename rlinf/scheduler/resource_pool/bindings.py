@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from typing import Any, Literal
+
+RESOURCE_BINDING_ENV = "RLINF_RESOURCE_BINDING_JSON"
+CPU_AFFINITY_ENV = "RLINF_CPU_AFFINITY"
+ENV_CPU_CORE_GROUPS_ENV = "RLINF_ENV_CPU_CORE_GROUPS"
+CUDA_VISIBLE_DEVICES_ENV = "CUDA_VISIBLE_DEVICES"
+MPS_ACTIVE_THREAD_PERCENTAGE_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+
+
+def _tuple_int(values: Any) -> tuple[int, ...]:
+    return tuple(int(v) for v in values)
+
+
+@dataclass(frozen=True)
+class CpuBinding:
+    process_cpu_cores: tuple[int, ...] = ()
+    env_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "CpuBinding | None":
+        if payload is None:
+            return None
+        return cls(
+            process_cpu_cores=_tuple_int(payload.get("process_cpu_cores", ())),
+            env_cpu_core_groups=tuple(
+                _tuple_int(group) for group in payload.get("env_cpu_core_groups", ())
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class GpuBinding:
+    mode: Literal["mps", "mig"] | None = None
+    sm_percent: int = 0
+    visible_devices: tuple[str, ...] = ()
+    mig_device_uuid: str | None = None
+    parent_gpu: int | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "GpuBinding | None":
+        if payload is None:
+            return None
+        return cls(
+            mode=payload.get("mode"),
+            sm_percent=int(payload.get("sm_percent", 0)),
+            visible_devices=tuple(str(v) for v in payload.get("visible_devices", ())),
+            mig_device_uuid=payload.get("mig_device_uuid"),
+            parent_gpu=payload.get("parent_gpu"),
+        )
+
+
+@dataclass(frozen=True)
+class WorkerResourceBinding:
+    component: str
+    rank: int
+    cluster_node_rank: int
+    node_group_label: str
+    cpu: CpuBinding | None = None
+    gpu: GpuBinding | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, text: str) -> "WorkerResourceBinding":
+        payload = json.loads(text)
+        return cls(
+            component=str(payload["component"]),
+            rank=int(payload["rank"]),
+            cluster_node_rank=int(payload["cluster_node_rank"]),
+            node_group_label=str(payload["node_group_label"]),
+            cpu=CpuBinding.from_dict(payload.get("cpu")),
+            gpu=GpuBinding.from_dict(payload.get("gpu")),
+        )
+
+    def to_env_vars(self) -> dict[str, str]:
+        from .gpu_binding import build_gpu_env_vars
+
+        env = {RESOURCE_BINDING_ENV: self.to_json()}
+        if self.cpu is not None and self.cpu.process_cpu_cores:
+            env[CPU_AFFINITY_ENV] = ",".join(map(str, self.cpu.process_cpu_cores))
+            if self.cpu.env_cpu_core_groups:
+                env[ENV_CPU_CORE_GROUPS_ENV] = ";".join(
+                    ",".join(map(str, group)) for group in self.cpu.env_cpu_core_groups
+                )
+        if self.gpu is not None:
+            env.update(build_gpu_env_vars(self.gpu))
+        return env
