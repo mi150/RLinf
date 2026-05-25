@@ -7,9 +7,11 @@ from .cpu_binding import (
     parse_cpu_core_set,
     parse_env_cpu_core_groups,
 )
+from .pool import FineGrainedResourcePool
 
 __all__ = [
     "CpuBinding",
+    "FineGrainedResourcePool",
     "GpuBinding",
     "WorkerResourceBinding",
     "apply_process_cpu_affinity",
