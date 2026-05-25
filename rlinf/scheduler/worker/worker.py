@@ -44,6 +44,7 @@ from ..manager import WorkerAddress
 if TYPE_CHECKING:
     from ..collective import CollectiveGroupOptions
     from ..manager import WorkerInfo
+    from ..resource_pool.bindings import WorkerResourceBinding
     from .worker_group import WorkerGroup
 
 WorkerClsType = TypeVar("WorkerClsType")
@@ -516,7 +517,7 @@ class Worker(metaclass=WorkerMeta):
         return self._worker_info
 
     @property
-    def resource_binding(self):
+    def resource_binding(self) -> "WorkerResourceBinding | None":
         """Return fine-grained resource binding metadata for this worker."""
         return self._resource_binding
 
