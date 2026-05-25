@@ -9,55 +9,71 @@ from omegaconf import DictConfig, OmegaConf
 from .gpu_binding import validate_sm_percent
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpuPoolConfig:
+    """CPU resource pool definition."""
+
     node_group: str = "cluster"
     cores: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpuComponentConfig:
+    """CPU resource assignment for a scheduler component."""
+
     pool: str
     granularity: Literal["process", "per_env"] = "process"
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpuResourceConfig:
+    """CPU resource pool configuration."""
+
     enabled: bool = False
     pools: dict[str, CpuPoolConfig] = field(default_factory=dict)
     components: dict[str, CpuComponentConfig] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class MigDeviceConfig:
+    """MIG device slice exposed to a GPU resource pool."""
+
     uuid: str
     parent_gpu: int
     sm_percent: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class GpuPoolConfig:
+    """GPU resource pool definition."""
+
     node_group: str = "cluster"
     devices: str | None = None
     mig_devices: tuple[MigDeviceConfig, ...] = ()
 
 
-@dataclass
+@dataclass(frozen=True)
 class GpuComponentConfig:
+    """GPU resource assignment for a scheduler component."""
+
     pool: str
     sm_percent: int = 0
 
 
-@dataclass
+@dataclass(frozen=True)
 class GpuResourceConfig:
+    """GPU resource pool configuration."""
+
     enabled: bool = False
     mode: Literal["mps", "mig"] = "mps"
     pools: dict[str, GpuPoolConfig] = field(default_factory=dict)
     components: dict[str, GpuComponentConfig] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ResourcePoolConfig:
+    """Top-level resource pool configuration."""
+
     enabled: bool = False
     allocation_mode: Literal["default", "plan_file"] = "default"
     allocation_plan_path: str | None = None
@@ -66,6 +82,7 @@ class ResourcePoolConfig:
 
     @classmethod
     def from_cluster_cfg(cls, cluster_cfg: DictConfig) -> "ResourcePoolConfig":
+        """Build resource pool config from a Hydra cluster config."""
         raw = OmegaConf.select(cluster_cfg, "resource_pool")
         if raw is None:
             return cls()
@@ -99,9 +116,7 @@ class ResourcePoolConfig:
             enabled=True,
             allocation_mode=allocation_mode,
             allocation_plan_path=(
-                None
-                if allocation_plan_path is None
-                else str(allocation_plan_path)
+                None if allocation_plan_path is None else str(allocation_plan_path)
             ),
             cpu=cpu,
             gpu=gpu,
@@ -119,9 +134,13 @@ def _as_mapping(payload: object, context: str) -> Mapping[str, object]:
 def _parse_cpu_resource(payload: object) -> CpuResourceConfig:
     config = _as_mapping(payload, "cpu resource config")
     enabled = bool(config.get("enabled", False))
+    if not enabled:
+        return CpuResourceConfig(enabled=False)
 
     pools: dict[str, CpuPoolConfig] = {}
-    for pool_name, pool_payload in _as_mapping(config.get("pools"), "cpu pools").items():
+    for pool_name, pool_payload in _as_mapping(
+        config.get("pools"), "cpu pools"
+    ).items():
         pool_config = _as_mapping(pool_payload, f"cpu pool '{pool_name}'")
         pools[str(pool_name)] = CpuPoolConfig(
             node_group=str(pool_config.get("node_group", "cluster")),
@@ -144,8 +163,7 @@ def _parse_cpu_resource(payload: object) -> CpuResourceConfig:
         granularity = str(component_config.get("granularity", "process"))
         if granularity not in {"process", "per_env"}:
             raise ValueError(
-                "granularity must be one of 'process' or 'per_env', "
-                f"got {granularity}"
+                f"granularity must be one of 'process' or 'per_env', got {granularity}"
             )
 
         components[str(component_name)] = CpuComponentConfig(
@@ -159,13 +177,17 @@ def _parse_cpu_resource(payload: object) -> CpuResourceConfig:
 def _parse_gpu_resource(payload: object) -> GpuResourceConfig:
     config = _as_mapping(payload, "gpu resource config")
     enabled = bool(config.get("enabled", False))
+    if not enabled:
+        return GpuResourceConfig(enabled=False)
 
     mode = str(config.get("mode", "mps"))
     if mode not in {"mps", "mig"}:
         raise ValueError(f"mode must be one of 'mps' or 'mig', got {mode}")
 
     pools: dict[str, GpuPoolConfig] = {}
-    for pool_name, pool_payload in _as_mapping(config.get("pools"), "gpu pools").items():
+    for pool_name, pool_payload in _as_mapping(
+        config.get("pools"), "gpu pools"
+    ).items():
         pool_config = _as_mapping(pool_payload, f"gpu pool '{pool_name}'")
         mig_devices_payload = pool_config.get("mig_devices", ())
         mig_devices: list[MigDeviceConfig] = []
@@ -209,4 +231,6 @@ def _parse_gpu_resource(payload: object) -> GpuResourceConfig:
             sm_percent=sm_percent,
         )
 
-    return GpuResourceConfig(enabled=enabled, mode=mode, pools=pools, components=components)
+    return GpuResourceConfig(
+        enabled=enabled, mode=mode, pools=pools, components=components
+    )
