@@ -22,6 +22,7 @@ from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
 from rlinf.scheduler import Cluster, FineGrainedResourcePool
+from rlinf.scheduler.resource_pool import WorkerResourceBinding
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.async_env_worker import AsyncEnvWorker
 from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
@@ -29,10 +30,10 @@ from rlinf.workers.rollout.hf.async_huggingface_worker import (
     AsyncMultiStepRolloutWorker,
 )
 
-mp.set_start_method("spawn", force=True)
 
-
-def _get_resource_bindings(resource_pool: FineGrainedResourcePool, component: str):
+def _get_resource_bindings(
+    resource_pool: FineGrainedResourcePool, component: str
+) -> list[WorkerResourceBinding] | None:
     return resource_pool.get_component_bindings(component)
 
 
@@ -140,4 +141,5 @@ def main(cfg) -> None:
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
