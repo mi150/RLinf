@@ -24,6 +24,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import ray
@@ -52,9 +53,7 @@ def _clear_external_ray_address_for_training_eval() -> None:
     """Clear external Ray address when training eval uses a local Ray runtime."""
     if (
         os.environ.get(
-            Cluster.get_full_env_var_name(
-                ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY
-            )
+            Cluster.get_full_env_var_name(ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY)
         )
         == "1"
     ):
@@ -477,6 +476,9 @@ class Worker(metaclass=WorkerMeta):
         # Setup node group and hardware ranks
         self._setup_hardware()
 
+        # Setup fine-grained resource binding
+        self._setup_resource_binding()
+
         # Setup worker info
         self._setup_worker_info()
 
@@ -512,6 +514,11 @@ class Worker(metaclass=WorkerMeta):
     def worker_info(self) -> "WorkerInfo":
         """Get the WorkerInfo of the worker."""
         return self._worker_info
+
+    @property
+    def resource_binding(self):
+        """Return fine-grained resource binding metadata for this worker."""
+        return self._resource_binding
 
     @property
     def manager_proxy(self):
@@ -1214,6 +1221,20 @@ class Worker(metaclass=WorkerMeta):
         with self._lock:
             return self._collective.create_collective_group(workers)
 
+    def _setup_resource_binding(self) -> None:
+        """Parse fine-grained resource binding metadata from the environment."""
+        from ..resource_pool.bindings import RESOURCE_BINDING_ENV, WorkerResourceBinding
+
+        binding_json = os.environ.get(RESOURCE_BINDING_ENV)
+        self._resource_binding = (
+            WorkerResourceBinding.from_json(binding_json) if binding_json else None
+        )
+        self._resource_binding_dict = (
+            asdict(self._resource_binding)
+            if self._resource_binding is not None
+            else None
+        )
+
     def _setup_worker_info(self):
         """Get the worker information for local access.
 
@@ -1239,6 +1260,7 @@ class Worker(metaclass=WorkerMeta):
             node_port=node_port,
             available_accelerators=self.global_accelerator_ids,
             hardware_infos=self.hardware_infos,
+            resource_binding=self._resource_binding_dict,
         )
 
     def __repr__(self):
