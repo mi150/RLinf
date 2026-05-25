@@ -29,6 +29,7 @@ from rlinf.envs.venv import (
     SubprocVectorEnv,
     _setup_buf,
 )
+from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
 
 gym_old_venv_step_type = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 gym_new_venv_step_type = tuple[
@@ -42,6 +43,7 @@ def _worker(
     p: connection.Connection,
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
+    local_env_index: int = -1,
 ) -> None:
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
@@ -57,6 +59,8 @@ def _worker(
         return None
 
     parent.close()
+    if local_env_index >= 0:
+        _apply_subproc_env_cpu_affinity(local_env_index)
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -127,7 +131,12 @@ def _worker(
 
 
 class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
-    def __init__(self, env_fn: Callable[[], gym.Env], share_memory: bool = False):
+    def __init__(
+        self,
+        env_fn: Callable[[], gym.Env],
+        share_memory: bool = False,
+        local_env_index: int = -1,
+    ):
         self.parent_remote, self.child_remote = Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
@@ -142,6 +151,7 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
             self.child_remote,
             CloudpickleWrapper(env_fn),
             self.buffer,
+            local_env_index,
         )
         self.process = Process(target=_worker, args=args, daemon=True)
         self.process.start()
@@ -155,8 +165,14 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
 
 class ReconfigureSubprocEnv(SubprocVectorEnv):
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        env_index = {"value": 0}
+
         def worker_fn(fn: Callable[[], gym.Env]) -> ReconfigureSubprocEnvWorker:
-            return ReconfigureSubprocEnvWorker(fn, share_memory=False)
+            local_env_index = env_index["value"]
+            env_index["value"] += 1
+            return ReconfigureSubprocEnvWorker(
+                fn, share_memory=False, local_env_index=local_env_index
+            )
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
 

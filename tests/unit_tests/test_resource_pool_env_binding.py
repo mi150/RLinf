@@ -1,4 +1,6 @@
+import inspect
 import os
+import types
 
 import pytest
 from omegaconf import OmegaConf
@@ -183,3 +185,83 @@ def test_subproc_env_affinity_uses_local_env_index(monkeypatch) -> None:
     _apply_subproc_env_cpu_affinity(local_env_index=1)
 
     assert captured == {"cpus": (1, 2)}
+
+
+def test_custom_subproc_workers_accept_local_env_index(monkeypatch) -> None:
+    calvin_env = types.ModuleType("calvin_env")
+    calvin_env.__file__ = __file__
+    monkeypatch.setitem(os.sys.modules, "calvin_env", calvin_env)
+
+    hydra = types.ModuleType("hydra")
+    hydra.utils = types.SimpleNamespace(instantiate=lambda *args, **kwargs: None)
+    monkeypatch.setitem(os.sys.modules, "hydra", hydra)
+
+    calvin_agent = types.ModuleType("calvin_agent")
+    calvin_agent_evaluation = types.ModuleType("calvin_agent.evaluation")
+    calvin_agent_evaluation_utils = types.ModuleType("calvin_agent.evaluation.utils")
+    calvin_agent_evaluation_utils.get_env_state_for_initial_condition = (
+        lambda init_state: init_state
+    )
+    calvin_agent_evaluation_utils.temp_seed = lambda seed: pytest.MonkeyPatch.context()
+    calvin_agent_evaluation_multistep = types.ModuleType(
+        "calvin_agent.evaluation.multistep_sequences"
+    )
+    calvin_agent_evaluation_multistep.flatten = lambda values: values
+    calvin_agent_evaluation_multistep.get_sequences_for_state2 = lambda value: value
+    monkeypatch.setitem(os.sys.modules, "calvin_agent", calvin_agent)
+    monkeypatch.setitem(
+        os.sys.modules, "calvin_agent.evaluation", calvin_agent_evaluation
+    )
+    monkeypatch.setitem(
+        os.sys.modules,
+        "calvin_agent.evaluation.utils",
+        calvin_agent_evaluation_utils,
+    )
+    monkeypatch.setitem(
+        os.sys.modules,
+        "calvin_agent.evaluation.multistep_sequences",
+        calvin_agent_evaluation_multistep,
+    )
+
+    libero_utils = types.ModuleType("rlinf.envs.libero.utils")
+    libero_utils.get_libero_type = lambda: "standard"
+    monkeypatch.setitem(os.sys.modules, "rlinf.envs.libero.utils", libero_utils)
+    libero = types.ModuleType("libero")
+    libero_libero = types.ModuleType("libero.libero")
+    libero_envs = types.ModuleType("libero.libero.envs")
+    libero_envs.OffScreenRenderEnv = object
+    monkeypatch.setitem(os.sys.modules, "libero", libero)
+    monkeypatch.setitem(os.sys.modules, "libero.libero", libero_libero)
+    monkeypatch.setitem(os.sys.modules, "libero.libero.envs", libero_envs)
+
+    habitat_env = types.ModuleType("rlinf.envs.habitat.habitat_env")
+    habitat_env.HabitatEnv = object
+    monkeypatch.setitem(os.sys.modules, "rlinf.envs.habitat.habitat_env", habitat_env)
+    habitat = types.ModuleType("habitat")
+    habitat_core = types.ModuleType("habitat.core")
+    habitat_core_env = types.ModuleType("habitat.core.env")
+    habitat_core_env.RLEnv = object
+    monkeypatch.setitem(os.sys.modules, "habitat", habitat)
+    monkeypatch.setitem(os.sys.modules, "habitat.core", habitat_core)
+    monkeypatch.setitem(os.sys.modules, "habitat.core.env", habitat_core_env)
+
+    robocasa_env = types.ModuleType("rlinf.envs.robocasa.robocasa_env")
+    robocasa_env.RobocasaEnv = object
+    monkeypatch.setitem(
+        os.sys.modules, "rlinf.envs.robocasa.robocasa_env", robocasa_env
+    )
+
+    from rlinf.envs.calvin.venv import ReconfigureSubprocEnvWorker as CalvinWorker
+    from rlinf.envs.habitat.venv import ReconfigureSubprocEnvWorker as HabitatWorker
+    from rlinf.envs.libero.venv import ReconfigureSubprocEnvWorker as LiberoWorker
+    from rlinf.envs.metaworld.venv import ReconfigureSubprocEnvWorker as MetaWorldWorker
+    from rlinf.envs.robocasa.venv import RobocasaSubprocEnvWorker
+
+    for worker_cls in [
+        CalvinWorker,
+        HabitatWorker,
+        LiberoWorker,
+        MetaWorldWorker,
+        RobocasaSubprocEnvWorker,
+    ]:
+        assert "local_env_index" in inspect.signature(worker_cls.__init__).parameters
