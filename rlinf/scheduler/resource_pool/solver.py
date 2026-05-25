@@ -50,6 +50,8 @@ class ResourcePoolSolver:
             bindings = self._load_plan_file()
             self._refresh_summary(bindings)
             return bindings
+        self._used_mig_uuids = set()
+        self._validate_default_cpu_pool_exclusivity()
         self._validate_default_mig_devices()
         components = sorted(
             set(self.pool_cfg.cpu.components) | set(self.pool_cfg.gpu.components)
@@ -59,6 +61,23 @@ class ResourcePoolSolver:
         }
         self._refresh_summary(bindings)
         return bindings
+
+    def _validate_default_cpu_pool_exclusivity(self) -> None:
+        if not self.pool_cfg.cpu.enabled:
+            return
+
+        pool_components: dict[str, list[str]] = defaultdict(list)
+        for component, request in self.pool_cfg.cpu.components.items():
+            pool_components[request.pool].append(component)
+
+        for pool_name, components in pool_components.items():
+            if len(components) > 1:
+                raise ValueError(
+                    f"CPU pool '{pool_name}' is exclusive in default allocation "
+                    "mode and cannot be shared by multiple components: "
+                    f"{sorted(components)}. Use allocation_mode='plan_file' for "
+                    "explicit CPU sharing."
+                )
 
     def _component_local_env_count(self, worker_count: int) -> int:
         stage_num = int(self.cfg.rollout.get("pipeline_stage_num", 1))
@@ -153,10 +172,12 @@ class ResourcePoolSolver:
 
         if self.pool_cfg.gpu.mode == "mps":
             devices = parse_cpu_core_set(pool.devices or "")
-            if placement.local_accelerator_rank not in devices:
+            visible_devices = {int(device) for device in placement.visible_accelerators}
+            if not visible_devices.issubset(devices):
                 raise ValueError(
-                    f"GPU {placement.local_accelerator_rank} for {component}:"
-                    f"{placement.rank} is not in pool '{request.pool}' devices"
+                    f"GPU pool '{request.pool}' devices {sorted(devices)} do not "
+                    f"include all visible devices {sorted(visible_devices)} for "
+                    f"{component}:{placement.rank}"
                 )
             return GpuBinding(
                 mode="mps",
@@ -224,7 +245,9 @@ class ResourcePoolSolver:
                 owner = f"{component}:{binding.rank}"
                 if binding.cpu is not None:
                     for core in binding.cpu.process_cpu_cores:
-                        cpu_owners[str(core)].append(owner)
+                        cpu_owners[f"node{binding.cluster_node_rank}:cpu{core}"].append(
+                            owner
+                        )
                 if binding.gpu is None:
                     continue
                 if binding.gpu.mode == "mig" and binding.gpu.mig_device_uuid:
@@ -234,7 +257,9 @@ class ResourcePoolSolver:
                     and binding.gpu.parent_gpu is not None
                     and binding.gpu.sm_percent > 0
                 ):
-                    mps_totals[str(binding.gpu.parent_gpu)] += binding.gpu.sm_percent
+                    mps_totals[
+                        f"node{binding.cluster_node_rank}:gpu{binding.gpu.parent_gpu}"
+                    ] += binding.gpu.sm_percent
 
         self._summary = {
             "shared_cpu_cores": {

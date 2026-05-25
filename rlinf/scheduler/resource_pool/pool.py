@@ -49,7 +49,9 @@ class FineGrainedResourcePool:
             "bindings": [
                 json.loads(binding.to_json())
                 for component in sorted(self.bindings)
-                for binding in self.bindings[component]
+                for binding in sorted(
+                    self.bindings[component], key=lambda binding: binding.rank
+                )
             ],
             "summary": self.summary,
         }
