@@ -30,6 +30,7 @@ This design enables users to build large-scale RL training pipelines with minima
    :maxdepth: 4
 
    user/index
+   multi_nodes/index
    mode/index
    scheduler/index
    communication/index
@@ -37,3 +38,4 @@ This design enables users to build large-scale RL training pipelines with minima
    advance/index
    rlalg/index
    extend/index
+   release
