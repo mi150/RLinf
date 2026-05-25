@@ -4,11 +4,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from examples.embodiment.train_embodied_agent import _get_resource_bindings
 from rlinf.scheduler.placement.placement import Placement
 from rlinf.scheduler.resource_pool.bindings import (
     RESOURCE_BINDING_ENV,
     WorkerResourceBinding,
 )
+from rlinf.scheduler.resource_pool.pool import FineGrainedResourcePool
 from rlinf.scheduler.worker.worker import Worker
 from rlinf.scheduler.worker.worker_group import WorkerGroup
 
@@ -175,3 +177,7 @@ def test_worker_parses_resource_binding_from_env() -> None:
 
     assert worker.resource_binding == binding
     assert worker._resource_binding_dict == asdict(binding)
+
+
+def test_get_resource_bindings_returns_none_when_pool_disabled() -> None:
+    assert _get_resource_bindings(FineGrainedResourcePool.disabled(), "actor") is None
