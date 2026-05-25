@@ -3,6 +3,7 @@ import os
 import pytest
 from omegaconf import OmegaConf
 
+from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
 from rlinf.scheduler.resource_pool.bindings import (
     ENV_CPU_CORE_GROUPS_ENV,
     CpuBinding,
@@ -165,3 +166,20 @@ def test_setup_env_and_wrappers_injects_stage_cpu_groups() -> None:
 
     assert seen_cpu_groups == ["0;1", "2;3"]
     assert len(envs) == 2
+
+
+def test_subproc_env_affinity_uses_local_env_index(monkeypatch) -> None:
+    captured = {}
+
+    def fake_apply(cpus):
+        captured["cpus"] = cpus
+
+    monkeypatch.setattr(
+        "rlinf.envs.venv.venv.apply_process_cpu_affinity",
+        fake_apply,
+    )
+    monkeypatch.setenv("RLINF_ENV_CPU_CORE_GROUPS", "0;1,2;3")
+
+    _apply_subproc_env_cpu_affinity(local_env_index=1)
+
+    assert captured == {"cpus": (1, 2)}
