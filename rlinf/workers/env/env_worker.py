@@ -212,7 +212,10 @@ class EnvWorker(Worker):
             and self.cfg.env.get("train", None) is not None
         ):
             env_types.add(str(self.cfg.env.train.env_type).lower())
-        if self.cfg.env.get("eval", None) is not None:
+        if (
+            getattr(self, "enable_eval", False)
+            and self.cfg.env.get("eval", None) is not None
+        ):
             env_types.add(str(self.cfg.env.eval.env_type).lower())
         unsupported = env_types - self._PER_ENV_CPU_SUPPORTED_ENVS
         if unsupported:
