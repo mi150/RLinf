@@ -7,6 +7,7 @@ from .bindings import ENV_CPU_CORE_GROUPS_ENV
 
 
 def parse_cpu_core_set(spec: str) -> tuple[int, ...]:
+    """Parse a comma-separated CPU core spec into sorted core ids."""
     text = str(spec).strip()
     if not text:
         raise ValueError("cpu core spec must not be empty")
@@ -40,6 +41,7 @@ def parse_cpu_core_set(spec: str) -> tuple[int, ...]:
 def build_even_split_cpu_groups(
     cores: tuple[int, ...], partitions: int
 ) -> tuple[tuple[int, ...], ...]:
+    """Split CPU cores into deterministic non-empty partitions."""
     if partitions <= 0:
         raise ValueError("partitions must be > 0")
     if len(set(cores)) != len(cores):
@@ -59,10 +61,12 @@ def build_even_split_cpu_groups(
 
 
 def effective_process_affinity(groups: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    """Return the process affinity that covers all per-env groups."""
     return tuple(sorted({core for group in groups for core in group}))
 
 
 def parse_env_cpu_core_groups(spec: str) -> tuple[tuple[int, ...], ...]:
+    """Parse semicolon-separated per-env CPU core groups."""
     text = str(spec).strip()
     if not text:
         return ()
@@ -72,6 +76,7 @@ def parse_env_cpu_core_groups(spec: str) -> tuple[tuple[int, ...], ...]:
 def get_env_core_group_from_env(
     env: Mapping[str, str], local_env_index: int
 ) -> tuple[int, ...] | None:
+    """Return the CPU core group for one local env from environment variables."""
     spec = env.get(ENV_CPU_CORE_GROUPS_ENV)
     if not spec:
         return None
@@ -86,6 +91,7 @@ def get_env_core_group_from_env(
 
 
 def apply_process_cpu_affinity(cpus: tuple[int, ...]) -> None:
+    """Apply Linux CPU affinity to the current process."""
     if not cpus:
         raise ValueError("cpu affinity set must not be empty")
     if not hasattr(os, "sched_setaffinity"):

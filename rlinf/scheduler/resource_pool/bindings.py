@@ -17,11 +17,14 @@ def _tuple_int(values: Any) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class CpuBinding:
+    """CPU binding metadata for one worker process."""
+
     process_cpu_cores: tuple[int, ...] = ()
     env_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "CpuBinding | None":
+        """Build a CPU binding from JSON-compatible data."""
         if payload is None:
             return None
         return cls(
@@ -34,6 +37,8 @@ class CpuBinding:
 
 @dataclass(frozen=True)
 class GpuBinding:
+    """GPU quota and visibility metadata for one worker process."""
+
     mode: Literal["mps", "mig"] | None = None
     sm_percent: int = 0
     visible_devices: tuple[str, ...] = ()
@@ -42,6 +47,7 @@ class GpuBinding:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuBinding | None":
+        """Build a GPU binding from JSON-compatible data."""
         if payload is None:
             return None
         mode = payload.get("mode")
@@ -53,13 +59,17 @@ class GpuBinding:
             mode=mode,
             sm_percent=int(payload.get("sm_percent", 0)),
             visible_devices=tuple(str(v) for v in payload.get("visible_devices", ())),
-            mig_device_uuid=str(mig_device_uuid) if mig_device_uuid is not None else None,
+            mig_device_uuid=str(mig_device_uuid)
+            if mig_device_uuid is not None
+            else None,
             parent_gpu=int(parent_gpu) if parent_gpu is not None else None,
         )
 
 
 @dataclass(frozen=True)
 class WorkerResourceBinding:
+    """Resolved resource binding for a worker rank."""
+
     component: str
     rank: int
     cluster_node_rank: int
@@ -68,10 +78,12 @@ class WorkerResourceBinding:
     gpu: GpuBinding | None = None
 
     def to_json(self) -> str:
+        """Serialize the binding as stable compact JSON."""
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, text: str) -> "WorkerResourceBinding":
+        """Deserialize a binding from JSON."""
         payload = json.loads(text)
         return cls(
             component=str(payload["component"]),
@@ -83,6 +95,7 @@ class WorkerResourceBinding:
         )
 
     def to_env_vars(self) -> dict[str, str]:
+        """Convert the binding into environment variables for a worker."""
         from .gpu_binding import build_gpu_env_vars
 
         env = {RESOURCE_BINDING_ENV: self.to_json()}

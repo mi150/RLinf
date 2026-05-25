@@ -10,6 +10,7 @@ ALLOWED_SM_PERCENTAGES = (0, 20, 40, 60, 80, 100)
 
 
 def validate_sm_percent(value: int | None) -> int:
+    """Validate and normalize a supported GPU SM percentage."""
     percent = 0 if value is None else int(value)
     if percent not in ALLOWED_SM_PERCENTAGES:
         raise ValueError(
@@ -19,6 +20,7 @@ def validate_sm_percent(value: int | None) -> int:
 
 
 def build_gpu_env_vars(binding: GpuBinding) -> dict[str, str]:
+    """Build CUDA environment variables for a GPU binding."""
     sm_percent = validate_sm_percent(binding.sm_percent)
     if sm_percent == 0:
         return {}
