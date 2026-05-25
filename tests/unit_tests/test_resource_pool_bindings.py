@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from rlinf.scheduler.resource_pool.bindings import (
     CPU_AFFINITY_ENV,
     CUDA_VISIBLE_DEVICES_ENV,
@@ -40,3 +42,28 @@ def test_worker_resource_binding_round_trips_and_builds_env() -> None:
     assert env[ENV_CPU_CORE_GROUPS_ENV] == "0;1;2;3"
     assert env[CUDA_VISIBLE_DEVICES_ENV] == "0"
     assert env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] == "40"
+
+
+def test_gpu_binding_from_dict_normalizes_optional_types() -> None:
+    binding = GpuBinding.from_dict(
+        {
+            "mode": "mig",
+            "sm_percent": "20",
+            "visible_devices": (),
+            "mig_device_uuid": 123,
+            "parent_gpu": "0",
+        }
+    )
+
+    assert binding == GpuBinding(
+        mode="mig",
+        sm_percent=20,
+        visible_devices=(),
+        mig_device_uuid="123",
+        parent_gpu=0,
+    )
+
+
+def test_gpu_binding_from_dict_rejects_invalid_mode() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        GpuBinding.from_dict({"mode": "exclusive", "sm_percent": 20})

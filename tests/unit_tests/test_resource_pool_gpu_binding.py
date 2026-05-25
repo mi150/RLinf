@@ -21,6 +21,18 @@ def test_validate_sm_percent_rejects_unsupported_value() -> None:
         validate_sm_percent(25)
 
 
+def test_build_gpu_env_vars_rejects_unsupported_sm_percent() -> None:
+    binding = GpuBinding(
+        mode="mps",
+        sm_percent=25,
+        visible_devices=("0",),
+        parent_gpu=0,
+    )
+
+    with pytest.raises(ValueError, match="sm_percent"):
+        build_gpu_env_vars(binding)
+
+
 def test_mps_zero_quota_does_not_build_gpu_env() -> None:
     binding = GpuBinding(
         mode="mps",
@@ -52,3 +64,27 @@ def test_mig_quota_builds_uuid_visibility() -> None:
         parent_gpu=0,
     )
     assert build_gpu_env_vars(binding) == {CUDA_VISIBLE_DEVICES_ENV: "MIG-abc"}
+
+
+def test_nonzero_quota_without_mode_raises() -> None:
+    binding = GpuBinding(
+        mode=None,
+        sm_percent=20,
+        visible_devices=("0",),
+        parent_gpu=0,
+    )
+
+    with pytest.raises(ValueError, match="mode"):
+        build_gpu_env_vars(binding)
+
+
+def test_nonzero_quota_with_unknown_mode_raises() -> None:
+    binding = GpuBinding(
+        mode="exclusive",
+        sm_percent=20,
+        visible_devices=("0",),
+        parent_gpu=0,
+    )
+
+    with pytest.raises(ValueError, match="mode"):
+        build_gpu_env_vars(binding)

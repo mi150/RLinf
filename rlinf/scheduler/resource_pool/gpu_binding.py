@@ -19,17 +19,18 @@ def validate_sm_percent(value: int | None) -> int:
 
 
 def build_gpu_env_vars(binding: GpuBinding) -> dict[str, str]:
-    if binding.sm_percent == 0:
+    sm_percent = validate_sm_percent(binding.sm_percent)
+    if sm_percent == 0:
         return {}
     if binding.mode == "mps":
         if not binding.visible_devices:
             raise ValueError("MPS binding requires visible_devices")
         return {
             CUDA_VISIBLE_DEVICES_ENV: ",".join(binding.visible_devices),
-            MPS_ACTIVE_THREAD_PERCENTAGE_ENV: str(binding.sm_percent),
+            MPS_ACTIVE_THREAD_PERCENTAGE_ENV: str(sm_percent),
         }
     if binding.mode == "mig":
         if not binding.mig_device_uuid:
             raise ValueError("MIG binding requires mig_device_uuid")
         return {CUDA_VISIBLE_DEVICES_ENV: binding.mig_device_uuid}
-    return {}
+    raise ValueError(f"mode must be one of 'mps' or 'mig', got {binding.mode}")

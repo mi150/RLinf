@@ -44,12 +44,17 @@ class GpuBinding:
     def from_dict(cls, payload: dict[str, Any] | None) -> "GpuBinding | None":
         if payload is None:
             return None
+        mode = payload.get("mode")
+        if mode not in (None, "mps", "mig"):
+            raise ValueError(f"mode must be one of None, 'mps', or 'mig', got {mode}")
+        mig_device_uuid = payload.get("mig_device_uuid")
+        parent_gpu = payload.get("parent_gpu")
         return cls(
-            mode=payload.get("mode"),
+            mode=mode,
             sm_percent=int(payload.get("sm_percent", 0)),
             visible_devices=tuple(str(v) for v in payload.get("visible_devices", ())),
-            mig_device_uuid=payload.get("mig_device_uuid"),
-            parent_gpu=payload.get("parent_gpu"),
+            mig_device_uuid=str(mig_device_uuid) if mig_device_uuid is not None else None,
+            parent_gpu=int(parent_gpu) if parent_gpu is not None else None,
         )
 
 
