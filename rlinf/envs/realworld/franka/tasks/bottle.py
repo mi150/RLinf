@@ -23,6 +23,7 @@ from ..franka_env import FrankaEnv, FrankaRobotConfig
 
 @dataclass
 class BottleConfig(FrankaRobotConfig):
+    task_description: str = "screw the bottle cap onto the bottle"
     target_ee_pose: np.ndarray = field(default_factory=lambda: np.zeros(6))
     reward_threshold: np.ndarray = field(
         default_factory=lambda: np.array([0.01, 0.01, 0.01, 0.2, 0.2, 0.2])
@@ -108,21 +109,14 @@ class BottleConfig(FrankaRobotConfig):
 
 
 class BottleEnv(FrankaEnv):
-    def __init__(self, override_cfg, worker_info=None, hardware_info=None, env_idx=0):
-        # Update config according to current env
-        config = BottleConfig(**override_cfg)
-        super().__init__(config, worker_info, hardware_info, env_idx)
-
-    @property
-    def task_description(self):
-        return "screw the bottle cap onto the bottle"
+    CONFIG_CLS = BottleConfig
 
     def go_to_rest(self, joint_reset=False):
         """
         Move to the rest position defined in base class.
         Add a small z offset before going to rest to avoid collision with object.
         """
-        self._gripper_action(1)
+        self._end_effector_action(np.array([1.0]))
         self._franka_state = self._controller.get_state().wait()[0]
         self._move_action(self._franka_state.tcp_pose)
 

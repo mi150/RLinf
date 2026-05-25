@@ -57,8 +57,8 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         # if train_data_paths is not set, the code will just eval the model
         if self.cfg.data.get("train_data_paths") is None:
             logging.warning("train_data_paths is not set, will just eval the model")
-            assert self.cfg.data.get("eval_data_paths") is not None, (
-                "train_data_paths is not set, eval_data_paths must be set"
+            assert self.cfg.data.get("val_data_paths") is not None, (
+                "train_data_paths is not set, val_data_paths must be set"
             )
             self.data_loader = None
             self.data_iter = None
@@ -68,9 +68,9 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             )
             self.data_iter = iter(self.data_loader)
 
-        if self.cfg.data.get("eval_data_paths") is not None:
+        if self.cfg.data.get("val_data_paths") is not None:
             self.eval_data_loader, self.eval_data_config = self.build_dataloader(
-                self.cfg.data.eval_data_paths, eval_dataset=True
+                self.cfg.data.val_data_paths, eval_dataset=True
             )
         else:
             self.eval_data_loader = None
@@ -97,6 +97,11 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         self.global_step = global_step
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
+
+    def get_max_steps_per_epoch(self):
+        if self.data_loader is not None:
+            return max(1, len(self.data_loader) // self.gradient_accumulation)
+        return 0
 
     def run_eval(self):
         assert self.eval_data_loader is not None, "eval_data_loader is not set"
@@ -176,9 +181,8 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             grad_norm, lr_list = self.optimizer_step()
             self.optimizer.zero_grad(set_to_none=True)
 
-            lr_value = (
-                lr_list[0] if len(lr_list) > 0 else self.optimizer.param_groups[0]["lr"]
-            )
+            self.lr_scheduler.step()
+            lr_value = self.optimizer.param_groups[0]["lr"]
             grad_norm_value = (
                 float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
             )
@@ -190,8 +194,6 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                     "grad_norm": grad_norm_value,
                 },
             )
-
-            self.lr_scheduler.step()
 
             if self.global_step > 0 and self.global_step % 1000 == 0:
                 clear_memory()
