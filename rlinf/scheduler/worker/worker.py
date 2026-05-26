@@ -40,6 +40,7 @@ from ..cluster import (
 )
 from ..hardware import AcceleratorType, AcceleratorUtil, HardwareInfo
 from ..manager import WorkerAddress
+from ..resource_pool.cpu_binding import apply_process_cpu_affinity
 
 if TYPE_CHECKING:
     from ..collective import CollectiveGroupOptions
@@ -1244,6 +1245,12 @@ class Worker(metaclass=WorkerMeta):
             if self._resource_binding is not None
             else None
         )
+        if (
+            self._resource_binding is not None
+            and self._resource_binding.cpu is not None
+            and self._resource_binding.cpu.process_cpu_cores
+        ):
+            apply_process_cpu_affinity(self._resource_binding.cpu.process_cpu_cores)
 
     def _setup_worker_info(self):
         """Get the worker information for local access.

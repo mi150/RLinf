@@ -112,27 +112,27 @@ class ResourcePoolSolver:
             strategy.get_placement(self.cluster, isolate_accelerator=True),
             key=lambda placement: placement.rank,
         )
-        cpu_bindings = self._solve_cpu_component(component, placements)
+        cpu_bindings_by_rank = self._solve_cpu_component(component, placements)
         bindings: list[WorkerResourceBinding] = []
-        for index, placement in enumerate(placements):
+        for placement in placements:
             bindings.append(
                 WorkerResourceBinding(
                     component=component,
                     rank=int(placement.rank),
                     cluster_node_rank=int(placement.cluster_node_rank),
                     node_group_label=str(placement.node_group_label),
-                    cpu=cpu_bindings[index] if cpu_bindings else None,
+                    cpu=cpu_bindings_by_rank.get(int(placement.rank)),
                     gpu=self._solve_gpu_binding(component, placement),
                 )
             )
         return bindings
 
-    def _solve_cpu_component(self, component: str, placements) -> list[CpuBinding]:
+    def _solve_cpu_component(self, component: str, placements) -> dict[int, CpuBinding]:
         if (
             not self.pool_cfg.cpu.enabled
             or component not in self.pool_cfg.cpu.components
         ):
-            return []
+            return {}
 
         request = self.pool_cfg.cpu.components[component]
         pool = self.pool_cfg.cpu.pools[request.pool]
@@ -145,26 +145,41 @@ class ResourcePoolSolver:
                 )
 
         cores = parse_cpu_core_set(pool.cores)
-        process_core_groups = build_even_split_cpu_groups(cores, len(placements))
-        bindings: list[CpuBinding] = []
-        for process_cpu_cores in process_core_groups:
-            env_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
-            if request.granularity == "per_env":
-                if component != "env":
-                    raise ValueError(
-                        "per_env CPU binding is only valid for env component"
+        placements_by_node: dict[int, list] = defaultdict(list)
+        for placement in placements:
+            placements_by_node[int(placement.cluster_node_rank)].append(placement)
+
+        bindings: dict[int, CpuBinding] = {}
+        local_env_count = (
+            self._component_local_env_count(len(placements))
+            if request.granularity == "per_env"
+            else 0
+        )
+        for node_rank in sorted(placements_by_node):
+            node_placements = sorted(
+                placements_by_node[node_rank], key=lambda placement: placement.rank
+            )
+            process_core_groups = build_even_split_cpu_groups(
+                cores, len(node_placements)
+            )
+            for placement, process_cpu_cores in zip(
+                node_placements, process_core_groups, strict=True
+            ):
+                env_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
+                if request.granularity == "per_env":
+                    if component != "env":
+                        raise ValueError(
+                            "per_env CPU binding is only valid for env component"
+                        )
+                    env_cpu_core_groups = build_even_split_cpu_groups(
+                        process_cpu_cores,
+                        local_env_count,
                     )
-                env_cpu_core_groups = build_even_split_cpu_groups(
-                    process_cpu_cores,
-                    self._component_local_env_count(len(placements)),
-                )
-                process_cpu_cores = effective_process_affinity(env_cpu_core_groups)
-            bindings.append(
-                CpuBinding(
+                    process_cpu_cores = effective_process_affinity(env_cpu_core_groups)
+                bindings[int(placement.rank)] = CpuBinding(
                     process_cpu_cores=process_cpu_cores,
                     env_cpu_core_groups=env_cpu_core_groups,
                 )
-            )
         return bindings
 
     def _solve_gpu_binding(self, component: str, placement) -> GpuBinding | None:
@@ -327,9 +342,95 @@ class ResourcePoolSolver:
                         f"{placement.node_group_label}"
                     )
 
+                self._validate_plan_file_cpu_binding(
+                    owner, binding, len(component_placements)
+                )
                 self._validate_plan_file_gpu_binding(
                     owner, binding, placement, mig_devices
                 )
+
+    def _validate_plan_file_cpu_binding(
+        self,
+        owner: str,
+        binding: WorkerResourceBinding,
+        component_worker_count: int,
+    ) -> None:
+        if binding.cpu is None:
+            if binding.component in self.pool_cfg.cpu.components:
+                raise ValueError(
+                    f"plan file binding for {owner} requires CPU binding because "
+                    "the component is configured in resource_pool.cpu.components"
+                )
+            return
+
+        if not binding.cpu.process_cpu_cores:
+            raise ValueError(
+                f"plan file CPU binding for {owner} must include process CPU cores"
+            )
+        self._validate_cpu_core_tuple(
+            binding.cpu.process_cpu_cores,
+            f"plan file CPU binding for {owner}",
+        )
+
+        request = self.pool_cfg.cpu.components.get(binding.component)
+        if request is not None:
+            pool = self.pool_cfg.cpu.pools[request.pool]
+            if binding.node_group_label != pool.node_group:
+                raise ValueError(
+                    f"plan file CPU binding for {owner} targets node group "
+                    f"'{binding.node_group_label}', but CPU pool '{request.pool}' "
+                    f"is scoped to '{pool.node_group}'"
+                )
+            pool_cores = set(parse_cpu_core_set(pool.cores))
+            missing = sorted(set(binding.cpu.process_cpu_cores) - pool_cores)
+            if missing:
+                raise ValueError(
+                    f"plan file CPU binding for {owner} uses cores {missing} "
+                    f"outside CPU pool '{request.pool}'"
+                )
+
+        expects_per_env = request is not None and request.granularity == "per_env"
+        has_per_env_groups = bool(binding.cpu.env_cpu_core_groups)
+        if not expects_per_env and not has_per_env_groups:
+            return
+        if binding.component != "env":
+            raise ValueError(
+                f"plan file per-env CPU binding for {owner} is only valid for env"
+            )
+        if request is not None and not expects_per_env:
+            raise ValueError(
+                f"plan file binding for {owner} has env CPU groups, but the "
+                "component is not configured with granularity='per_env'"
+            )
+
+        expected_env_groups = self._component_local_env_count(component_worker_count)
+        if len(binding.cpu.env_cpu_core_groups) != expected_env_groups:
+            raise ValueError(
+                f"plan file per-env CPU binding for {owner} has "
+                f"{len(binding.cpu.env_cpu_core_groups)} env CPU groups, but "
+                f"{expected_env_groups} are required"
+            )
+
+        process_core_set = set(binding.cpu.process_cpu_cores)
+        for index, group in enumerate(binding.cpu.env_cpu_core_groups):
+            self._validate_cpu_core_tuple(
+                group,
+                f"plan file per-env CPU binding for {owner} group {index}",
+            )
+            missing = sorted(set(group) - process_core_set)
+            if missing:
+                raise ValueError(
+                    f"plan file per-env CPU binding for {owner} group {index} "
+                    f"uses cores outside process CPU affinity: {missing}"
+                )
+
+    def _validate_cpu_core_tuple(self, cores: tuple[int, ...], context: str) -> None:
+        if not cores:
+            raise ValueError(f"{context} must not be empty")
+        if any(core < 0 for core in cores):
+            raise ValueError(f"{context} contains negative CPU core ids")
+        if len(set(cores)) != len(cores):
+            raise ValueError(f"{context} contains duplicate CPU core ids")
 
     def _validate_plan_file_gpu_binding(
         self,

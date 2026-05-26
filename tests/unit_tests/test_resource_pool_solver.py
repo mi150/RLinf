@@ -49,6 +49,45 @@ def test_default_solver_builds_env_per_env_cpu_groups() -> None:
     assert bindings["env"][1].cpu.env_cpu_core_groups == ((4, 5), (6, 7))
 
 
+def test_default_solver_reuses_cpu_pool_per_cluster_node() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 2,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0-1:0-3"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-3"}},
+                        "components": {"env": {"pool": "env_cpu"}},
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 4}, "eval": {"total_num_envs": 4}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=2, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+    pool_cfg = ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+    bindings = ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
+
+    assert [
+        (binding.cluster_node_rank, binding.cpu.process_cpu_cores)
+        for binding in bindings["env"]
+    ] == [
+        (0, (0, 1)),
+        (0, (2, 3)),
+        (1, (0, 1)),
+        (1, (2, 3)),
+    ]
+
+
 def test_default_solver_rejects_shared_cpu_pool_across_components() -> None:
     cfg = OmegaConf.create(
         {
@@ -604,6 +643,266 @@ def test_plan_file_mode_rejects_missing_configured_component(tmp_path: Path) -> 
     placement = HybridComponentPlacement(cfg, cluster)
 
     with pytest.raises(ValueError, match="missing components"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_null_cpu_for_configured_cpu_component(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": None,
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "components": {"env": {"pool": "env_cpu"}},
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="CPU binding"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_invalid_cpu_cores(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": {
+                            "process_cpu_cores": [0, -1],
+                            "env_cpu_core_groups": [],
+                        },
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="CPU"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_cpu_cores_outside_configured_pool(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": {
+                            "process_cpu_cores": [0, 3],
+                            "env_cpu_core_groups": [],
+                        },
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "components": {"env": {"pool": "env_cpu"}},
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="CPU pool"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_validates_per_env_cpu_group_count(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": {
+                            "process_cpu_cores": [0, 1],
+                            "env_cpu_core_groups": [[0]],
+                        },
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "components": {
+                            "env": {"pool": "env_cpu", "granularity": "per_env"}
+                        },
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 2}, "eval": {"total_num_envs": 2}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="per-env|env CPU"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_empty_per_env_cpu_groups(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": {
+                            "process_cpu_cores": [0, 1],
+                            "env_cpu_core_groups": [],
+                        },
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "components": {
+                            "env": {"pool": "env_cpu", "granularity": "per_env"}
+                        },
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 2}, "eval": {"total_num_envs": 2}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="per-env|env CPU"):
         FineGrainedResourcePool.from_config(cfg, cluster, placement)
 
 

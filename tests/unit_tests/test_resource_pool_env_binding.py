@@ -61,25 +61,6 @@ def _make_worker_with_binding(
     return worker
 
 
-def test_env_worker_applies_process_cpu_affinity(monkeypatch) -> None:
-    worker = _make_worker_with_binding(
-        "maniskill", CpuBinding(process_cpu_cores=(0, 2))
-    )
-    captured = {}
-
-    def fake_apply(cpus):
-        captured["cpus"] = cpus
-
-    monkeypatch.setattr(
-        "rlinf.workers.env.env_worker.apply_process_cpu_affinity",
-        fake_apply,
-    )
-
-    worker._apply_resource_pool_cpu_affinity()
-
-    assert captured == {"cpus": (0, 2)}
-
-
 def test_env_worker_rejects_unsupported_per_env_backend() -> None:
     worker = _make_worker_with_binding(
         "maniskill",

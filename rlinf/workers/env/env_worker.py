@@ -35,7 +35,6 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.scheduler.resource_pool.bindings import ENV_CPU_CORE_GROUPS_ENV
-from rlinf.scheduler.resource_pool.cpu_binding import apply_process_cpu_affinity
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -143,7 +142,6 @@ class EnvWorker(Worker):
 
     def init_worker(self):
         self._validate_env_resource_binding_supported()
-        self._apply_resource_pool_cpu_affinity()
         self.dst_rank_map = self._setup_dst_rank_map()
         self.src_rank_map = self._setup_src_rank_map()
 
@@ -182,23 +180,6 @@ class EnvWorker(Worker):
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
-
-    def _apply_resource_pool_cpu_affinity(self) -> None:
-        binding = getattr(self, "_resource_binding", None)
-        if binding is None or binding.cpu is None:
-            return
-        if binding.cpu.process_cpu_cores:
-            apply_process_cpu_affinity(binding.cpu.process_cpu_cores)
-            log_info = getattr(self, "log_info", None)
-            if (
-                callable(log_info)
-                and hasattr(self, "_logger")
-                and hasattr(self, "_stacklevel")
-            ):
-                log_info(
-                    "Applied resource pool CPU affinity: "
-                    f"{binding.cpu.process_cpu_cores}"
-                )
 
     def _validate_env_resource_binding_supported(self) -> None:
         binding = getattr(self, "_resource_binding", None)
