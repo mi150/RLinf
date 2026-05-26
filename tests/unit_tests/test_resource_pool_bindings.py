@@ -69,6 +69,19 @@ def test_gpu_binding_from_dict_rejects_invalid_mode() -> None:
         GpuBinding.from_dict({"mode": "exclusive", "sm_percent": 20})
 
 
+def test_worker_resource_binding_requires_explicit_gpu_key() -> None:
+    payload = {
+        "component": "env",
+        "rank": 0,
+        "cluster_node_rank": 0,
+        "node_group_label": "node",
+        "cpu": None,
+    }
+
+    with pytest.raises(ValueError, match="gpu"):
+        WorkerResourceBinding.from_json(json.dumps(payload))
+
+
 @pytest.mark.parametrize("payload", [{}, {"mode": None, "sm_percent": 0}])
 def test_gpu_binding_from_dict_rejects_missing_mode(payload: dict) -> None:
     with pytest.raises(ValueError, match="mode"):

@@ -91,6 +91,8 @@ class WorkerResourceBinding:
     def from_json(cls, text: str) -> "WorkerResourceBinding":
         """Deserialize a binding from JSON."""
         payload = json.loads(text)
+        if "gpu" not in payload:
+            raise ValueError("resource binding requires explicit gpu field")
         return cls(
             component=str(payload["component"]),
             rank=int(payload["rank"]),

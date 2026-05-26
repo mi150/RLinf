@@ -339,6 +339,11 @@ class ResourcePoolSolver:
         mig_devices,
     ) -> None:
         if binding.gpu is None:
+            if binding.component in self.pool_cfg.gpu.components:
+                raise ValueError(
+                    f"plan file binding for {owner} requires GPU binding because "
+                    "the component is configured in resource_pool.gpu.components"
+                )
             return
 
         validate_sm_percent(binding.gpu.sm_percent)
