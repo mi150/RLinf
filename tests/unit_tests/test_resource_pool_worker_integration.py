@@ -5,9 +5,11 @@ from unittest.mock import Mock
 import pytest
 
 from examples.embodiment.train_embodied_agent import _get_resource_bindings
+from rlinf.scheduler.hardware import AcceleratorType
 from rlinf.scheduler.placement.placement import Placement
 from rlinf.scheduler.resource_pool.bindings import (
     RESOURCE_BINDING_ENV,
+    GpuBinding,
     WorkerResourceBinding,
 )
 from rlinf.scheduler.resource_pool.pool import FineGrainedResourcePool
@@ -177,6 +179,39 @@ def test_worker_parses_resource_binding_from_env() -> None:
 
     assert worker.resource_binding == binding
     assert worker._resource_binding_dict == asdict(binding)
+
+
+def test_worker_uses_mig_parent_gpu_for_available_accelerators(monkeypatch) -> None:
+    binding = _make_binding(
+        node_group_label="cluster",
+    )
+    binding = WorkerResourceBinding(
+        component=binding.component,
+        rank=binding.rank,
+        cluster_node_rank=binding.cluster_node_rank,
+        node_group_label=binding.node_group_label,
+        gpu=GpuBinding(
+            mode="mig", sm_percent=20, mig_device_uuid="MIG-A", parent_gpu=0
+        ),
+    )
+    worker = object.__new__(Worker)
+    worker._accelerator_type = AcceleratorType.NV_GPU
+    worker._cluster_node_rank = 0
+    worker._is_ray_actor = True
+    worker._resource_binding = binding
+
+    class _Cluster:
+        accelerator_ranks = [[7]]
+
+    monkeypatch.setattr("rlinf.scheduler.worker.worker.Cluster", _Cluster)
+    monkeypatch.setattr(
+        "rlinf.scheduler.worker.worker.AcceleratorUtil.get_visible_devices",
+        lambda accelerator_type: [],
+    )
+
+    worker._setup_accelerator_info()
+
+    assert worker.global_accelerator_ids == [7]
 
 
 def test_get_resource_bindings_returns_none_when_pool_disabled() -> None:

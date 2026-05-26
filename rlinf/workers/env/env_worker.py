@@ -206,25 +206,38 @@ class EnvWorker(Worker):
             return
         if not binding.cpu.env_cpu_core_groups:
             return
-        env_types = set()
+        env_cfgs = []
         if (
             not getattr(self, "only_eval", False)
             and self.cfg.env.get("train", None) is not None
         ):
-            env_types.add(str(self.cfg.env.train.env_type).lower())
+            env_cfgs.append(self.cfg.env.train)
         if (
             getattr(self, "enable_eval", False)
             and self.cfg.env.get("eval", None) is not None
         ):
-            env_types.add(str(self.cfg.env.eval.env_type).lower())
-        unsupported = env_types - self._PER_ENV_CPU_SUPPORTED_ENVS
+            env_cfgs.append(self.cfg.env.eval)
+        env_entries = [(str(env_cfg.env_type).lower(), env_cfg) for env_cfg in env_cfgs]
+        env_types = {env_type for env_type, _ in env_entries}
+        unsupported = {
+            env_type
+            for env_type, env_cfg in env_entries
+            if not self._is_per_env_cpu_supported_env(env_type, env_cfg)
+        }
         if unsupported:
             raise ValueError(
                 "per-env CPU binding is only supported for SubprocVectorEnv-style "
-                f"env backends {sorted(self._PER_ENV_CPU_SUPPORTED_ENVS)}, "
+                f"env backends {sorted(self._PER_ENV_CPU_SUPPORTED_ENVS | {'d4rl'})}, "
                 f"but got {sorted(env_types)}. Use granularity=process or a "
                 "supported backend."
             )
+
+    def _is_per_env_cpu_supported_env(self, env_type: str, env_cfg) -> bool:
+        if env_type in self._PER_ENV_CPU_SUPPORTED_ENVS:
+            return True
+        if env_type == "d4rl":
+            return bool(env_cfg.get("use_subproc_vector_env", False))
+        return False
 
     def update_env_cfg(self):
         if not self.only_eval:

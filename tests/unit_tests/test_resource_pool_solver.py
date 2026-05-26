@@ -83,6 +83,43 @@ def test_default_solver_rejects_shared_cpu_pool_across_components() -> None:
         ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
 
 
+def test_default_solver_rejects_overlapping_cpu_pools() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "actor": {"node_group": "node", "placement": "0"},
+                    "env": {"node_group": "node", "placement": "0"},
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {
+                            "actor_cpu": {"node_group": "node", "cores": "0-3"},
+                            "env_cpu": {"node_group": "node", "cores": "2-5"},
+                        },
+                        "components": {
+                            "actor": {"pool": "actor_cpu"},
+                            "env": {"pool": "env_cpu"},
+                        },
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+    pool_cfg = ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+    with pytest.raises(ValueError, match="CPU core|exclusive"):
+        ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
+
+
 def test_default_solver_skips_gpu_binding_for_zero_quota() -> None:
     cfg = OmegaConf.create(
         {
@@ -447,6 +484,252 @@ def test_plan_file_mode_sorts_components_and_ranks(tmp_path: Path) -> None:
     assert list(pool.bindings) == ["env", "rollout"]
     assert [binding.rank for binding in pool.bindings["env"]] == [0, 1]
     assert [binding.rank for binding in pool.bindings["rollout"]] == [0, 1]
+
+
+def test_plan_file_mode_rejects_nonexistent_component_rank(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 2,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": None,
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0:0-1"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 2}, "eval": {"total_num_envs": 2}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="plan file binding|rank 2"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_unknown_component(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "missing",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": None,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {"rollout": "0"},
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=1)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="unknown component"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_rejects_invalid_sm_percent(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "rollout",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": {
+                            "mode": "mps",
+                            "sm_percent": 25,
+                            "visible_devices": ["0"],
+                            "parent_gpu": 0,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {"rollout": "0"},
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=1)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="sm_percent"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_validates_mps_visible_devices(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "rollout",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": {
+                            "mode": "mps",
+                            "sm_percent": 20,
+                            "visible_devices": ["1"],
+                            "parent_gpu": 1,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {"rollout": "0"},
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=2)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="visible devices"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
+def test_plan_file_mode_validates_mig_metadata(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "rollout",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "cluster",
+                        "cpu": None,
+                        "gpu": {
+                            "mode": "mig",
+                            "sm_percent": 40,
+                            "mig_device_uuid": "MIG-A",
+                            "parent_gpu": 0,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {"rollout": "0"},
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                    "gpu": {
+                        "enabled": True,
+                        "mode": "mig",
+                        "pools": {
+                            "mig_pool": {
+                                "node_group": "cluster",
+                                "mig_devices": [
+                                    {
+                                        "uuid": "MIG-A",
+                                        "parent_gpu": 0,
+                                        "sm_percent": 20,
+                                    }
+                                ],
+                            }
+                        },
+                        "components": {
+                            "rollout": {"pool": "mig_pool", "sm_percent": 40}
+                        },
+                    },
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=1)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="MIG|sm_percent"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
 
 
 def test_write_plan_sorts_bindings_within_component(tmp_path: Path) -> None:

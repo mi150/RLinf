@@ -24,15 +24,23 @@ def _make_worker_with_binding(
     only_eval: bool = False,
     enable_eval: bool = False,
     stage_num: int = 1,
+    train_env_overrides: dict | None = None,
+    eval_env_overrides: dict | None = None,
 ) -> EnvWorker:
     worker = object.__new__(EnvWorker)
     train_env_type = train_env_type or env_type
     eval_env_type = eval_env_type or env_type
+    train_env_cfg = {"env_type": train_env_type}
+    if train_env_overrides:
+        train_env_cfg.update(train_env_overrides)
+    eval_env_cfg = {"env_type": eval_env_type}
+    if eval_env_overrides:
+        eval_env_cfg.update(eval_env_overrides)
     worker.cfg = OmegaConf.create(
         {
             "env": {
-                "train": {"env_type": train_env_type},
-                "eval": {"env_type": eval_env_type},
+                "train": train_env_cfg,
+                "eval": eval_env_cfg,
             },
             "runner": {"only_eval": only_eval},
         }
@@ -88,6 +96,26 @@ def test_env_worker_accepts_supported_per_env_backend() -> None:
         CpuBinding(process_cpu_cores=(0, 1), env_cpu_core_groups=((0,), (1,))),
     )
     worker._validate_env_resource_binding_supported()
+
+
+def test_env_worker_accepts_d4rl_when_subproc_vector_env_enabled() -> None:
+    worker = _make_worker_with_binding(
+        "d4rl",
+        CpuBinding(process_cpu_cores=(0, 1), env_cpu_core_groups=((0,), (1,))),
+        train_env_overrides={"use_subproc_vector_env": True},
+    )
+    worker._validate_env_resource_binding_supported()
+
+
+def test_env_worker_rejects_d4rl_without_subproc_vector_env() -> None:
+    worker = _make_worker_with_binding(
+        "d4rl",
+        CpuBinding(process_cpu_cores=(0, 1), env_cpu_core_groups=((0,), (1,))),
+        train_env_overrides={"use_subproc_vector_env": False},
+    )
+
+    with pytest.raises(ValueError, match="per-env CPU binding"):
+        worker._validate_env_resource_binding_supported()
 
 
 def test_env_worker_ignores_disabled_eval_backend_for_validation() -> None:

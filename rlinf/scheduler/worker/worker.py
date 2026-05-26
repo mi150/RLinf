@@ -468,6 +468,9 @@ class Worker(metaclass=WorkerMeta):
         # Setup local rank and world size
         self._setup_local_rank_world_size()
 
+        # Setup fine-grained resource binding
+        self._setup_resource_binding()
+
         # Setup accelerator ID
         self._setup_accelerator_info()
 
@@ -476,9 +479,6 @@ class Worker(metaclass=WorkerMeta):
 
         # Setup node group and hardware ranks
         self._setup_hardware()
-
-        # Setup fine-grained resource binding
-        self._setup_resource_binding()
 
         # Setup worker info
         self._setup_worker_info()
@@ -1071,6 +1071,15 @@ class Worker(metaclass=WorkerMeta):
     def _setup_accelerator_info(self) -> int:
         cluster = Cluster()
         visible_devices = AcceleratorUtil.get_visible_devices(self._accelerator_type)
+        binding = getattr(self, "_resource_binding", None)
+        if (
+            not visible_devices
+            and binding is not None
+            and binding.gpu is not None
+            and binding.gpu.mode == "mig"
+            and binding.gpu.parent_gpu is not None
+        ):
+            visible_devices = [binding.gpu.parent_gpu]
         node_accelerator_ranks = cluster.accelerator_ranks[self._cluster_node_rank]
         self.global_accelerator_ids = [
             node_accelerator_ranks[local_id] for local_id in visible_devices

@@ -13,6 +13,7 @@ from .cpu_binding import (
     effective_process_affinity,
     parse_cpu_core_set,
 )
+from .gpu_binding import validate_sm_percent
 
 
 class ResourcePoolSolver:
@@ -48,6 +49,7 @@ class ResourcePoolSolver:
             return {}
         if self.pool_cfg.allocation_mode == "plan_file":
             bindings = self._load_plan_file()
+            self._validate_plan_file_bindings(bindings)
             self._refresh_summary(bindings)
             return bindings
         self._used_mig_uuids = set()
@@ -78,6 +80,20 @@ class ResourcePoolSolver:
                     f"{sorted(components)}. Use allocation_mode='plan_file' for "
                     "explicit CPU sharing."
                 )
+
+        core_owners: dict[tuple[str, int], str] = {}
+        for pool_name, pool in self.pool_cfg.cpu.pools.items():
+            for core in parse_cpu_core_set(pool.cores):
+                key = (pool.node_group, core)
+                previous_owner = core_owners.get(key)
+                if previous_owner is not None:
+                    raise ValueError(
+                        f"CPU core {core} in node group '{pool.node_group}' is "
+                        f"claimed by both pools '{previous_owner}' and "
+                        f"'{pool_name}'. Default allocation mode is exclusive; "
+                        "use allocation_mode='plan_file' for explicit sharing."
+                    )
+                core_owners[key] = pool_name
 
     def _component_local_env_count(self, worker_count: int) -> int:
         stage_num = int(self.cfg.rollout.get("pipeline_stage_num", 1))
@@ -232,6 +248,126 @@ class ResourcePoolSolver:
             component: sorted(component_bindings, key=lambda binding: binding.rank)
             for component, component_bindings in sorted(bindings.items())
         }
+
+    def _validate_plan_file_bindings(
+        self, bindings: dict[str, list[WorkerResourceBinding]]
+    ) -> None:
+        placement_by_component = {}
+        for component in bindings:
+            try:
+                strategy = self.component_placement.get_strategy(component)
+            except AssertionError as exc:
+                raise ValueError(
+                    f"plan file binding references unknown component '{component}'"
+                ) from exc
+            placement_by_component[component] = {
+                placement.rank: placement
+                for placement in strategy.get_placement(
+                    self.cluster, isolate_accelerator=True
+                )
+            }
+
+        mig_devices = {
+            device.uuid: device
+            for pool in self.pool_cfg.gpu.pools.values()
+            for device in pool.mig_devices
+        }
+
+        seen_owner_ranks: set[tuple[str, int]] = set()
+        for component, component_bindings in bindings.items():
+            component_placements = placement_by_component[component]
+            for binding in component_bindings:
+                owner = f"{component}:{binding.rank}"
+                owner_key = (component, binding.rank)
+                if owner_key in seen_owner_ranks:
+                    raise ValueError(f"duplicate plan file binding for {owner}")
+                seen_owner_ranks.add(owner_key)
+
+                placement = component_placements.get(binding.rank)
+                if placement is None:
+                    raise ValueError(
+                        f"plan file binding for {owner} targets nonexistent "
+                        f"rank {binding.rank}; valid ranks are "
+                        f"{sorted(component_placements)}"
+                    )
+                if binding.cluster_node_rank != placement.cluster_node_rank:
+                    raise ValueError(
+                        f"plan file binding for {owner} targets cluster node "
+                        f"{binding.cluster_node_rank}, but placement uses "
+                        f"{placement.cluster_node_rank}"
+                    )
+                if binding.node_group_label != placement.node_group_label:
+                    raise ValueError(
+                        f"plan file binding for {owner} targets node group "
+                        f"{binding.node_group_label}, but placement uses "
+                        f"{placement.node_group_label}"
+                    )
+
+                self._validate_plan_file_gpu_binding(
+                    owner, binding, placement, mig_devices
+                )
+
+    def _validate_plan_file_gpu_binding(
+        self,
+        owner: str,
+        binding: WorkerResourceBinding,
+        placement,
+        mig_devices,
+    ) -> None:
+        if binding.gpu is None:
+            return
+
+        validate_sm_percent(binding.gpu.sm_percent)
+        if binding.gpu.sm_percent == 0:
+            return
+
+        if binding.gpu.mode == "mps":
+            if not binding.gpu.visible_devices:
+                raise ValueError(f"MPS plan file binding for {owner} has no devices")
+            if tuple(binding.gpu.visible_devices) != tuple(
+                placement.visible_accelerators
+            ):
+                raise ValueError(
+                    f"MPS plan file binding for {owner} uses visible devices "
+                    f"{binding.gpu.visible_devices}, but placement uses "
+                    f"{tuple(placement.visible_accelerators)}"
+                )
+            if binding.gpu.parent_gpu is not None and str(
+                binding.gpu.parent_gpu
+            ) != str(placement.local_accelerator_rank):
+                raise ValueError(
+                    f"MPS plan file binding for {owner} targets parent GPU "
+                    f"{binding.gpu.parent_gpu}, but placement uses "
+                    f"{placement.local_accelerator_rank}"
+                )
+            return
+
+        if binding.gpu.mode == "mig":
+            if not binding.gpu.mig_device_uuid:
+                raise ValueError(f"MIG plan file binding for {owner} has no UUID")
+            device = mig_devices.get(binding.gpu.mig_device_uuid)
+            if device is None:
+                raise ValueError(
+                    f"MIG plan file binding for {owner} references unknown UUID "
+                    f"{binding.gpu.mig_device_uuid}"
+                )
+            if binding.gpu.parent_gpu is not None and (
+                binding.gpu.parent_gpu != device.parent_gpu
+            ):
+                raise ValueError(
+                    f"MIG plan file binding for {owner} targets parent GPU "
+                    f"{binding.gpu.parent_gpu}, but metadata uses "
+                    f"{device.parent_gpu}"
+                )
+            if binding.gpu.sm_percent > device.sm_percent:
+                raise ValueError(
+                    f"MIG plan file binding for {owner} requests sm_percent "
+                    f"{binding.gpu.sm_percent}, but metadata for "
+                    f"{binding.gpu.mig_device_uuid} provides {device.sm_percent}"
+                )
+            return
+
+        raise ValueError(f"GPU plan file binding for {owner} has invalid mode")
 
     def _refresh_summary(
         self, bindings: dict[str, list[WorkerResourceBinding]]
