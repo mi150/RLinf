@@ -51,12 +51,16 @@ class GpuBinding:
         if payload is None:
             return None
         mode = payload.get("mode")
-        if mode not in (None, "mps", "mig"):
-            raise ValueError(f"mode must be one of None, 'mps', or 'mig', got {mode}")
-        if mode is not None and "sm_percent" not in payload:
+        if mode not in ("mps", "mig"):
+            raise ValueError(f"mode must be one of 'mps' or 'mig', got {mode}")
+        if "sm_percent" not in payload or payload.get("sm_percent") is None:
             raise ValueError("GPU binding requires sm_percent")
         mig_device_uuid = payload.get("mig_device_uuid")
         parent_gpu = payload.get("parent_gpu")
+        if mode == "mig" and not mig_device_uuid:
+            raise ValueError("MIG binding requires mig_device_uuid")
+        if mode == "mig" and parent_gpu is None:
+            raise ValueError("MIG binding requires parent GPU metadata")
         return cls(
             mode=mode,
             sm_percent=int(payload.get("sm_percent", 0)),

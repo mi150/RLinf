@@ -67,3 +67,33 @@ def test_gpu_binding_from_dict_normalizes_optional_types() -> None:
 def test_gpu_binding_from_dict_rejects_invalid_mode() -> None:
     with pytest.raises(ValueError, match="mode"):
         GpuBinding.from_dict({"mode": "exclusive", "sm_percent": 20})
+
+
+@pytest.mark.parametrize("payload", [{}, {"mode": None, "sm_percent": 0}])
+def test_gpu_binding_from_dict_rejects_missing_mode(payload: dict) -> None:
+    with pytest.raises(ValueError, match="mode"):
+        GpuBinding.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "mps"},
+        {"mode": "mps", "sm_percent": None},
+    ],
+)
+def test_gpu_binding_from_dict_requires_sm_percent(payload: dict) -> None:
+    with pytest.raises(ValueError, match="sm_percent"):
+        GpuBinding.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"mode": "mig", "sm_percent": 0, "parent_gpu": 0},
+        {"mode": "mig", "sm_percent": 0, "mig_device_uuid": "MIG-A"},
+    ],
+)
+def test_gpu_binding_from_dict_requires_mig_metadata(payload: dict) -> None:
+    with pytest.raises(ValueError, match="MIG"):
+        GpuBinding.from_dict(payload)
