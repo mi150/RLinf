@@ -53,6 +53,8 @@ class GpuBinding:
         mode = payload.get("mode")
         if mode not in (None, "mps", "mig"):
             raise ValueError(f"mode must be one of None, 'mps', or 'mig', got {mode}")
+        if mode is not None and "sm_percent" not in payload:
+            raise ValueError("GPU binding requires sm_percent")
         mig_device_uuid = payload.get("mig_device_uuid")
         parent_gpu = payload.get("parent_gpu")
         return cls(

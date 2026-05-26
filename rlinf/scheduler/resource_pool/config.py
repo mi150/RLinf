@@ -195,6 +195,10 @@ def _parse_gpu_resource(payload: object) -> GpuResourceConfig:
             mig_device_config = _as_mapping(
                 mig_device_payload, f"gpu pool '{pool_name}' mig device"
             )
+            if "parent_gpu" not in mig_device_config:
+                raise ValueError(
+                    f"gpu pool '{pool_name}' mig device requires parent_gpu"
+                )
             mig_devices.append(
                 MigDeviceConfig(
                     uuid=str(mig_device_config.get("uuid", "")),

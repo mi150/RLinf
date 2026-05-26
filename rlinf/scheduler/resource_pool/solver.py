@@ -252,6 +252,16 @@ class ResourcePoolSolver:
     def _validate_plan_file_bindings(
         self, bindings: dict[str, list[WorkerResourceBinding]]
     ) -> None:
+        configured_components = set(self.pool_cfg.cpu.components) | set(
+            self.pool_cfg.gpu.components
+        )
+        missing_components = configured_components - set(bindings)
+        if missing_components:
+            raise ValueError(
+                "plan file is missing components configured in resource_pool: "
+                f"{sorted(missing_components)}"
+            )
+
         placement_by_component = {}
         for component in bindings:
             try:

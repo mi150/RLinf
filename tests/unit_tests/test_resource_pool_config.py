@@ -128,3 +128,35 @@ def test_plan_file_mode_requires_path() -> None:
     )
     with pytest.raises(ValueError, match="allocation_plan_path"):
         ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+
+def test_mig_device_config_requires_parent_gpu() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "resource_pool": {
+                    "enabled": True,
+                    "gpu": {
+                        "enabled": True,
+                        "mode": "mig",
+                        "pools": {
+                            "mig_pool": {
+                                "mig_devices": [
+                                    {
+                                        "uuid": "MIG-A",
+                                        "sm_percent": 20,
+                                    }
+                                ],
+                            }
+                        },
+                        "components": {
+                            "rollout": {"pool": "mig_pool", "sm_percent": 20}
+                        },
+                    },
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="parent_gpu"):
+        ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
