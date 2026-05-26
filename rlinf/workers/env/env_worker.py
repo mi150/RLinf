@@ -220,6 +220,9 @@ class EnvWorker(Worker):
             return bool(env_cfg.get("use_subproc_vector_env", False))
         return False
 
+    def set_global_step(self, global_step: int) -> None:
+        self.global_step = int(global_step)
+
     def update_env_cfg(self):
         if not self.only_eval:
             # train env

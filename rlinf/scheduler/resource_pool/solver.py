@@ -449,10 +449,17 @@ class ResourcePoolSolver:
 
         validate_sm_percent(binding.gpu.sm_percent)
         if binding.gpu.sm_percent == 0:
-            raise ValueError(
-                f"plan file binding for {owner} uses a GPU object with "
-                "sm_percent 0; use gpu: null to express no GPU binding"
-            )
+            if binding.gpu.mode != "mps":
+                raise ValueError(
+                    f"plan file binding for {owner} with sm_percent 0 is only "
+                    "valid for MPS render-device visibility"
+                )
+            if not binding.gpu.visible_devices:
+                raise ValueError(
+                    f"MPS plan file binding for {owner} with sm_percent 0 has "
+                    "no render device"
+                )
+            return
 
         if binding.gpu.mode == "mps":
             if not binding.gpu.visible_devices:

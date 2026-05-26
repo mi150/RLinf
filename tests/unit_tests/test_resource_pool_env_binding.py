@@ -79,6 +79,14 @@ def test_env_worker_accepts_supported_per_env_backend() -> None:
     worker._validate_env_resource_binding_supported()
 
 
+def test_env_worker_tracks_global_step() -> None:
+    worker = _make_worker_with_binding("libero")
+
+    worker.set_global_step(3)
+
+    assert worker.global_step == 3
+
+
 def test_env_worker_accepts_d4rl_when_subproc_vector_env_enabled() -> None:
     worker = _make_worker_with_binding(
         "d4rl",

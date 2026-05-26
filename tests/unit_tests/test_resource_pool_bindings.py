@@ -3,10 +3,12 @@ import json
 import pytest
 
 from rlinf.scheduler.resource_pool.bindings import (
+    ACCELERATOR_TYPE_ENV,
     CPU_AFFINITY_ENV,
     CUDA_VISIBLE_DEVICES_ENV,
     ENV_CPU_CORE_GROUPS_ENV,
     MPS_ACTIVE_THREAD_PERCENTAGE_ENV,
+    MUJOCO_EGL_DEVICE_ID_ENV,
     RESOURCE_BINDING_ENV,
     CpuBinding,
     GpuBinding,
@@ -42,6 +44,47 @@ def test_worker_resource_binding_round_trips_and_builds_env() -> None:
     assert env[ENV_CPU_CORE_GROUPS_ENV] == "0;1;2;3"
     assert env[CUDA_VISIBLE_DEVICES_ENV] == "0"
     assert env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] == "40"
+
+
+def test_worker_resource_binding_without_gpu_hides_cuda_devices() -> None:
+    binding = WorkerResourceBinding(
+        component="env",
+        rank=0,
+        cluster_node_rank=0,
+        node_group_label="node",
+        cpu=CpuBinding(process_cpu_cores=(0,)),
+        gpu=None,
+    )
+
+    env = binding.to_env_vars()
+
+    assert env[CUDA_VISIBLE_DEVICES_ENV] == ""
+    assert env[MUJOCO_EGL_DEVICE_ID_ENV] == ""
+    assert env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] == ""
+    assert env[ACCELERATOR_TYPE_ENV] == "NO_ACCEL"
+
+
+def test_zero_quota_gpu_binding_preserves_render_device_without_accelerator() -> None:
+    binding = WorkerResourceBinding(
+        component="env",
+        rank=0,
+        cluster_node_rank=0,
+        node_group_label="node",
+        cpu=CpuBinding(process_cpu_cores=(0,)),
+        gpu=GpuBinding(
+            mode="mps",
+            sm_percent=0,
+            visible_devices=("3",),
+            parent_gpu=3,
+        ),
+    )
+
+    env = binding.to_env_vars()
+
+    assert env[ACCELERATOR_TYPE_ENV] == "NO_ACCEL"
+    assert env[CUDA_VISIBLE_DEVICES_ENV] == "3"
+    assert env[MUJOCO_EGL_DEVICE_ID_ENV] == "3"
+    assert env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] == ""
 
 
 def test_gpu_binding_from_dict_normalizes_optional_types() -> None:

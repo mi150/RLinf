@@ -7,7 +7,9 @@ from typing import Any, Literal
 RESOURCE_BINDING_ENV = "RLINF_RESOURCE_BINDING_JSON"
 CPU_AFFINITY_ENV = "RLINF_CPU_AFFINITY"
 ENV_CPU_CORE_GROUPS_ENV = "RLINF_ENV_CPU_CORE_GROUPS"
+ACCELERATOR_TYPE_ENV = "ACCELERATOR_TYPE"
 CUDA_VISIBLE_DEVICES_ENV = "CUDA_VISIBLE_DEVICES"
+MUJOCO_EGL_DEVICE_ID_ENV = "MUJOCO_EGL_DEVICE_ID"
 MPS_ACTIVE_THREAD_PERCENTAGE_ENV = "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
 
 
@@ -113,6 +115,19 @@ class WorkerResourceBinding:
                 env[ENV_CPU_CORE_GROUPS_ENV] = ";".join(
                     ",".join(map(str, group)) for group in self.cpu.env_cpu_core_groups
                 )
-        if self.gpu is not None:
+        if self.gpu is None:
+            env[ACCELERATOR_TYPE_ENV] = "NO_ACCEL"
+            env[CUDA_VISIBLE_DEVICES_ENV] = ""
+            env[MUJOCO_EGL_DEVICE_ID_ENV] = ""
+            env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] = ""
+        elif self.gpu.sm_percent == 0:
+            visible_devices = ",".join(self.gpu.visible_devices)
+            env[ACCELERATOR_TYPE_ENV] = "NO_ACCEL"
+            env[CUDA_VISIBLE_DEVICES_ENV] = visible_devices
+            env[MUJOCO_EGL_DEVICE_ID_ENV] = (
+                self.gpu.visible_devices[0] if self.gpu.visible_devices else ""
+            )
+            env[MPS_ACTIVE_THREAD_PERCENTAGE_ENV] = ""
+        else:
             env.update(build_gpu_env_vars(self.gpu))
         return env

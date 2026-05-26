@@ -1095,7 +1095,7 @@ def test_plan_file_mode_rejects_null_gpu_for_configured_gpu_component(
         FineGrainedResourcePool.from_config(cfg, cluster, placement)
 
 
-def test_plan_file_mode_rejects_zero_quota_gpu_object(tmp_path: Path) -> None:
+def test_plan_file_mode_allows_zero_quota_render_device(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(
         json.dumps(
@@ -1140,8 +1140,12 @@ def test_plan_file_mode_rejects_zero_quota_gpu_object(tmp_path: Path) -> None:
     cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=1)
     placement = HybridComponentPlacement(cfg, cluster)
 
-    with pytest.raises(ValueError, match="gpu: null"):
-        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+    pool = FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+    binding = pool.get_component_bindings("env")[0]
+    assert binding.gpu.sm_percent == 0
+    assert binding.gpu.visible_devices == ("0",)
+    assert pool.summary["mps_gpu_totals"] == {}
 
 
 def test_plan_file_mode_validates_mps_visible_devices(tmp_path: Path) -> None:
