@@ -276,6 +276,20 @@ class ResourcePoolSolver:
         seen_owner_ranks: set[tuple[str, int]] = set()
         for component, component_bindings in bindings.items():
             component_placements = placement_by_component[component]
+            binding_ranks = {binding.rank for binding in component_bindings}
+            placement_ranks = set(component_placements)
+            if binding_ranks != placement_ranks:
+                missing = sorted(placement_ranks - binding_ranks)
+                extra = sorted(binding_ranks - placement_ranks)
+                detail = []
+                if missing:
+                    detail.append(f"missing ranks {missing}")
+                if extra:
+                    detail.append(f"extra ranks {extra}")
+                raise ValueError(
+                    f"plan file bindings for component '{component}' must cover "
+                    f"all placement ranks; {', '.join(detail)}"
+                )
             for binding in component_bindings:
                 owner = f"{component}:{binding.rank}"
                 owner_key = (component, binding.rank)
@@ -345,6 +359,10 @@ class ResourcePoolSolver:
         if binding.gpu.mode == "mig":
             if not binding.gpu.mig_device_uuid:
                 raise ValueError(f"MIG plan file binding for {owner} has no UUID")
+            if binding.gpu.parent_gpu is None:
+                raise ValueError(
+                    f"MIG plan file binding for {owner} requires parent GPU metadata"
+                )
             device = mig_devices.get(binding.gpu.mig_device_uuid)
             if device is None:
                 raise ValueError(
@@ -358,6 +376,12 @@ class ResourcePoolSolver:
                     f"MIG plan file binding for {owner} targets parent GPU "
                     f"{binding.gpu.parent_gpu}, but metadata uses "
                     f"{device.parent_gpu}"
+                )
+            if str(device.parent_gpu) != str(placement.local_accelerator_rank):
+                raise ValueError(
+                    f"MIG plan file binding for {owner} targets parent GPU "
+                    f"{device.parent_gpu}, but placement uses "
+                    f"{placement.local_accelerator_rank}"
                 )
             if binding.gpu.sm_percent > device.sm_percent:
                 raise ValueError(
