@@ -796,6 +796,55 @@ def test_plan_file_mode_rejects_null_gpu_for_configured_gpu_component(
         FineGrainedResourcePool.from_config(cfg, cluster, placement)
 
 
+def test_plan_file_mode_rejects_zero_quota_gpu_object(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "bindings": [
+                    {
+                        "component": "env",
+                        "rank": 0,
+                        "cluster_node_rank": 0,
+                        "node_group_label": "node",
+                        "cpu": None,
+                        "gpu": {
+                            "mode": "mps",
+                            "sm_percent": 0,
+                            "visible_devices": ["0"],
+                            "parent_gpu": 0,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "allocation_mode": "plan_file",
+                    "allocation_plan_path": str(plan_path),
+                },
+            },
+            "env": {"train": {"total_num_envs": 1}, "eval": {"total_num_envs": 1}},
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=1)
+    placement = HybridComponentPlacement(cfg, cluster)
+
+    with pytest.raises(ValueError, match="gpu: null"):
+        FineGrainedResourcePool.from_config(cfg, cluster, placement)
+
+
 def test_plan_file_mode_validates_mps_visible_devices(tmp_path: Path) -> None:
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(
