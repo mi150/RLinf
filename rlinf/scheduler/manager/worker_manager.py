@@ -174,6 +174,9 @@ class WorkerInfo:
     hardware_infos: list[HardwareInfo]
     """List of hardware information available to the worker."""
 
+    resource_binding: dict | None = None
+    """Fine-grained resource binding metadata for this worker."""
+
     def __hash__(self):
         """Hash function for WorkerInfo."""
         return self.address.__hash__()

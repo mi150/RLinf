@@ -128,20 +128,34 @@ class NvidiaGPUManager(AcceleratorManager):
 
     @staticmethod
     def get_visible_devices():
-        """Get the visible device IDs."""
+        """Get the visible integer GPU IDs.
+
+        MIG UUIDs can be injected into CUDA_VISIBLE_DEVICES by resource bindings.
+        They are intentionally not mapped into integer GPU IDs here; callers that
+        need MIG metadata should use the worker resource binding instead.
+        """
         visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
 
         if visible_devices is None or visible_devices == "":
             return []
-        else:
-            try:
-                visible_devices = [int(v.strip()) for v in visible_devices.split(",")]
-            except ValueError:
-                raise ValueError(
-                    f"Invalid visible device IDs: {visible_devices}. "
-                    "Please ensure they are integers separated by commas."
-                )
-            return visible_devices
+
+        visible_device_tokens = [v.strip() for v in visible_devices.split(",")]
+        mig_tokens = [v for v in visible_device_tokens if v.startswith("MIG-")]
+        if len(mig_tokens) == len(visible_device_tokens):
+            return []
+        if mig_tokens:
+            raise ValueError(
+                f"Invalid visible device IDs: {visible_devices}. "
+                "MIG UUIDs cannot be mixed with integer GPU IDs."
+            )
+
+        try:
+            return [int(v) for v in visible_device_tokens]
+        except ValueError:
+            raise ValueError(
+                f"Invalid visible device IDs: {visible_devices}. "
+                "Please ensure they are integers separated by commas."
+            )
 
     @staticmethod
     def get_ccl_backend():

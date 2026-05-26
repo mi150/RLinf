@@ -24,6 +24,7 @@ import time
 import traceback
 import warnings
 from contextlib import contextmanager
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import ray
@@ -39,10 +40,12 @@ from ..cluster import (
 )
 from ..hardware import AcceleratorType, AcceleratorUtil, HardwareInfo
 from ..manager import WorkerAddress
+from ..resource_pool.cpu_binding import apply_process_cpu_affinity
 
 if TYPE_CHECKING:
     from ..collective import CollectiveGroupOptions
     from ..manager import WorkerInfo
+    from ..resource_pool.bindings import WorkerResourceBinding
     from .worker_group import WorkerGroup
 
 WorkerClsType = TypeVar("WorkerClsType")
@@ -52,9 +55,7 @@ def _clear_external_ray_address_for_training_eval() -> None:
     """Clear external Ray address when training eval uses a local Ray runtime."""
     if (
         os.environ.get(
-            Cluster.get_full_env_var_name(
-                ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY
-            )
+            Cluster.get_full_env_var_name(ClusterEnvVar.TRAINING_EVAL_LOCAL_RAY)
         )
         == "1"
     ):
@@ -468,6 +469,9 @@ class Worker(metaclass=WorkerMeta):
         # Setup local rank and world size
         self._setup_local_rank_world_size()
 
+        # Setup fine-grained resource binding
+        self._setup_resource_binding()
+
         # Setup accelerator ID
         self._setup_accelerator_info()
 
@@ -512,6 +516,11 @@ class Worker(metaclass=WorkerMeta):
     def worker_info(self) -> "WorkerInfo":
         """Get the WorkerInfo of the worker."""
         return self._worker_info
+
+    @property
+    def resource_binding(self) -> "WorkerResourceBinding | None":
+        """Return fine-grained resource binding metadata for this worker."""
+        return self._resource_binding
 
     @property
     def manager_proxy(self):
@@ -1063,6 +1072,15 @@ class Worker(metaclass=WorkerMeta):
     def _setup_accelerator_info(self) -> int:
         cluster = Cluster()
         visible_devices = AcceleratorUtil.get_visible_devices(self._accelerator_type)
+        binding = getattr(self, "_resource_binding", None)
+        if (
+            not visible_devices
+            and binding is not None
+            and binding.gpu is not None
+            and binding.gpu.mode == "mig"
+            and binding.gpu.parent_gpu is not None
+        ):
+            visible_devices = [binding.gpu.parent_gpu]
         node_accelerator_ranks = cluster.accelerator_ranks[self._cluster_node_rank]
         self.global_accelerator_ids = [
             node_accelerator_ranks[local_id] for local_id in visible_devices
@@ -1214,6 +1232,26 @@ class Worker(metaclass=WorkerMeta):
         with self._lock:
             return self._collective.create_collective_group(workers)
 
+    def _setup_resource_binding(self) -> None:
+        """Parse fine-grained resource binding metadata from the environment."""
+        from ..resource_pool.bindings import RESOURCE_BINDING_ENV, WorkerResourceBinding
+
+        binding_json = os.environ.get(RESOURCE_BINDING_ENV)
+        self._resource_binding = (
+            WorkerResourceBinding.from_json(binding_json) if binding_json else None
+        )
+        self._resource_binding_dict = (
+            asdict(self._resource_binding)
+            if self._resource_binding is not None
+            else None
+        )
+        if (
+            self._resource_binding is not None
+            and self._resource_binding.cpu is not None
+            and self._resource_binding.cpu.process_cpu_cores
+        ):
+            apply_process_cpu_affinity(self._resource_binding.cpu.process_cpu_cores)
+
     def _setup_worker_info(self):
         """Get the worker information for local access.
 
@@ -1239,6 +1277,7 @@ class Worker(metaclass=WorkerMeta):
             node_port=node_port,
             available_accelerators=self.global_accelerator_ids,
             hardware_infos=self.hardware_infos,
+            resource_binding=self._resource_binding_dict,
         )
 
     def __repr__(self):

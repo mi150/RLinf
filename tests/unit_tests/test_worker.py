@@ -14,6 +14,7 @@
 
 import os
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -38,6 +39,16 @@ def accelerator_is_available():
         and hasattr(Worker.torch_platform, "is_available")
         and Worker.torch_platform.is_available()
     )
+
+
+def _worker_runtime_env_vars() -> dict[str, str]:
+    """Return env vars needed for Ray workers to import this test module."""
+    tests_root = Path(__file__).resolve().parent
+    python_path_entries = [str(tests_root)]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        python_path_entries.append(existing_pythonpath)
+    return {"PYTHONPATH": os.pathsep.join(python_path_entries)}
 
 
 # Fixture to provide a ClusterResource instance for the test session
@@ -143,7 +154,9 @@ class TestWorkerGroup:
         else:
             num_workers = 1
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="dist_test_1"
+            cluster=cluster,
+            name="dist_test_1",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         # Check that the correct number of actors were created
@@ -162,7 +175,9 @@ class TestWorkerGroup:
         else:
             num_workers = 1
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="dist_test_2"
+            cluster=cluster,
+            name="dist_test_2",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         base_value = 10
@@ -179,7 +194,10 @@ class TestWorkerGroup:
         else:
             placement = NodePlacementStrategy([0] * 8)
         worker_group = DistributedTestWorker.create_group().launch(
-            cluster=cluster, placement_strategy=placement, name="dist_test_3"
+            cluster=cluster,
+            placement_strategy=placement,
+            name="dist_test_3",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         target_ranks = (0, 1)
@@ -199,10 +217,14 @@ class TestWorkerGroup:
         else:
             num_workers = 1
         group1 = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="multi_group_1"
+            cluster=cluster,
+            name="multi_group_1",
+            env_vars=_worker_runtime_env_vars(),
         )
         group2 = DistributedTestWorker.create_group().launch(
-            cluster=cluster, name="multi_group_2"
+            cluster=cluster,
+            name="multi_group_2",
+            env_vars=_worker_runtime_env_vars(),
         )
 
         # Call a method on group 1

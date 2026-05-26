@@ -33,6 +33,7 @@ from rlinf.envs.venv import (
     SubprocVectorEnv,
     _setup_buf,
 )
+from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
 
 
 def _json_list(value: Any) -> list:
@@ -109,6 +110,7 @@ def _worker(
     p: connection.Connection,
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
+    local_env_index: int = -1,
 ) -> None:
     """Worker function for robocasa subprocess environment.
 
@@ -147,6 +149,8 @@ def _worker(
         return env_return
 
     parent.close()
+    if local_env_index >= 0:
+        _apply_subproc_env_cpu_affinity(local_env_index)
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -228,7 +232,12 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
     functionality since robocasa doesn't need it.
     """
 
-    def __init__(self, env_fn: Callable[[], gym.Env], share_memory: bool = False):
+    def __init__(
+        self,
+        env_fn: Callable[[], gym.Env],
+        share_memory: bool = False,
+        local_env_index: int = -1,
+    ):
         self.parent_remote, self.child_remote = Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
@@ -243,6 +252,7 @@ class RobocasaSubprocEnvWorker(SubprocEnvWorker):
             self.child_remote,
             CloudpickleWrapper(env_fn),
             self.buffer,
+            local_env_index,
         )
         # Use our custom _worker function
         self.process = Process(target=_worker, args=args, daemon=True)
@@ -275,10 +285,16 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
     """
 
     def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        env_index = {"value": 0}
+
         def worker_fn(fn: Callable[[], gym.Env]) -> RobocasaSubprocEnvWorker:
             # Use our custom worker with shared memory disabled
             # Robosuite dict observations work better without shared memory
-            return RobocasaSubprocEnvWorker(fn, share_memory=False)
+            local_env_index = env_index["value"]
+            env_index["value"] += 1
+            return RobocasaSubprocEnvWorker(
+                fn, share_memory=False, local_env_index=local_env_index
+            )
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
 

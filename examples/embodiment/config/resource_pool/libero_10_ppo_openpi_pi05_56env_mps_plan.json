@@ -1,0 +1,820 @@
+{
+  "bindings": [
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 60,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 60,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 60,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 60,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 60,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 60,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 60,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 60,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ],
+          [
+            5
+          ],
+          [
+            6
+          ]
+        ],
+        "process_cpu_cores": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 0,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            7
+          ],
+          [
+            8
+          ],
+          [
+            9
+          ],
+          [
+            10
+          ],
+          [
+            11
+          ],
+          [
+            12
+          ],
+          [
+            13
+          ]
+        ],
+        "process_cpu_cores": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 0,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            14
+          ],
+          [
+            15
+          ],
+          [
+            16
+          ],
+          [
+            17
+          ],
+          [
+            18
+          ],
+          [
+            19
+          ],
+          [
+            20
+          ]
+        ],
+        "process_cpu_cores": [
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 0,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            21
+          ],
+          [
+            22
+          ],
+          [
+            23
+          ],
+          [
+            24
+          ],
+          [
+            25
+          ],
+          [
+            26
+          ],
+          [
+            27
+          ]
+        ],
+        "process_cpu_cores": [
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 0,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            28
+          ],
+          [
+            29
+          ],
+          [
+            30
+          ],
+          [
+            31
+          ],
+          [
+            32
+          ],
+          [
+            33
+          ],
+          [
+            34
+          ]
+        ],
+        "process_cpu_cores": [
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 0,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            35
+          ],
+          [
+            36
+          ],
+          [
+            37
+          ],
+          [
+            38
+          ],
+          [
+            39
+          ],
+          [
+            40
+          ],
+          [
+            41
+          ]
+        ],
+        "process_cpu_cores": [
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 0,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            42
+          ],
+          [
+            43
+          ],
+          [
+            44
+          ],
+          [
+            45
+          ],
+          [
+            46
+          ],
+          [
+            47
+          ],
+          [
+            48
+          ]
+        ],
+        "process_cpu_cores": [
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 0,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            49
+          ],
+          [
+            50
+          ],
+          [
+            51
+          ],
+          [
+            52
+          ],
+          [
+            53
+          ],
+          [
+            54
+          ],
+          [
+            55
+          ]
+        ],
+        "process_cpu_cores": [
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 0,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "node",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 40,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 40,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 40,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 40,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 40,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 40,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 40,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": {
+        "env_cpu_core_groups": [],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 40,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    }
+  ]
+}

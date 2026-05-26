@@ -1,33 +1,38 @@
 # Copyright 2025 The LIBERO project and The RLinf Authors.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cloudpickle
 import ctypes
-import gym
-import numpy as np
-import warnings
+import os
 import time
-
+import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from multiprocessing import Array, Pipe, connection
 from multiprocessing.context import Process
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Union
 
+import cloudpickle
+import gym
+import numpy as np
 
-gym_old_venv_step_type = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-gym_new_venv_step_type = Tuple[
+from rlinf.scheduler.resource_pool.cpu_binding import (
+    apply_process_cpu_affinity,
+    get_env_core_group_from_env,
+)
+
+gym_old_venv_step_type = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+gym_new_venv_step_type = tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
 ]
 warnings.simplefilter("once", DeprecationWarning)
@@ -89,7 +94,7 @@ class EnvWorker(ABC):
         self.result: Union[
             gym_old_venv_step_type,
             gym_new_venv_step_type,
-            Tuple[np.ndarray, dict],
+            tuple[np.ndarray, dict],
             np.ndarray,
         ]
         # self.action_space = self.get_env_attr("action_space")  # noqa: B009
@@ -127,7 +132,7 @@ class EnvWorker(ABC):
     ) -> Union[
         gym_old_venv_step_type,
         gym_new_venv_step_type,
-        Tuple[np.ndarray, dict],
+        tuple[np.ndarray, dict],
         np.ndarray,
     ]:  # noqa:E125
         """Receive result from low-level worker.
@@ -147,7 +152,7 @@ class EnvWorker(ABC):
         return self.result
 
     @abstractmethod
-    def reset(self, **kwargs: Any) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
+    def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
         pass
 
     def step(
@@ -164,12 +169,12 @@ class EnvWorker(ABC):
 
     @staticmethod
     def wait(
-        workers: List["EnvWorker"], wait_num: int, timeout: Optional[float] = None
-    ) -> List["EnvWorker"]:
+        workers: list["EnvWorker"], wait_num: int, timeout: Optional[float] = None
+    ) -> list["EnvWorker"]:
         """Given a list of workers, return those ready ones."""
         raise NotImplementedError
 
-    def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
+    def seed(self, seed: Optional[int] = None) -> Optional[list[int]]:
         # return self.action_space.seed(seed)  # issue 299
         pass
 
@@ -192,7 +197,7 @@ class EnvWorker(ABC):
 class ShArray:
     """Wrapper of multiprocessing Array."""
 
-    def __init__(self, dtype: np.generic, shape: Tuple[int]) -> None:
+    def __init__(self, dtype: np.generic, shape: tuple[int]) -> None:
         self.arr = Array(_NP_TO_CT[dtype.type], int(np.prod(shape)))  # type: ignore
         self.dtype = dtype
         self.shape = shape
@@ -200,9 +205,7 @@ class ShArray:
     def save(self, ndarray: np.ndarray) -> None:
         assert isinstance(ndarray, np.ndarray)
         dst = self.arr.get_obj()
-        dst_np = np.frombuffer(dst, dtype=self.dtype).reshape(
-            self.shape
-        )  # type: ignore
+        dst_np = np.frombuffer(dst, dtype=self.dtype).reshape(self.shape)  # type: ignore
         np.copyto(dst_np, ndarray)
 
     def get(self) -> np.ndarray:
@@ -221,11 +224,18 @@ def _setup_buf(space: gym.Space) -> Union[dict, tuple, ShArray]:
         return ShArray(space.dtype, space.shape)  # type: ignore
 
 
+def _apply_subproc_env_cpu_affinity(local_env_index: int) -> None:
+    core_group = get_env_core_group_from_env(os.environ, local_env_index)
+    if core_group is not None:
+        apply_process_cpu_affinity(core_group)
+
+
 def _worker(
     parent: connection.Connection,
     p: connection.Connection,
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
+    local_env_index: int = -1,
 ) -> None:
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
@@ -241,6 +251,8 @@ def _worker(
         return None
 
     parent.close()
+    if local_env_index >= 0:
+        _apply_subproc_env_cpu_affinity(local_env_index)
     env = env_fn_wrapper.data()
     try:
         while True:
@@ -318,15 +330,15 @@ class DummyEnvWorker(EnvWorker):
     def set_env_attr(self, key: str, value: Any) -> None:
         setattr(self.env.unwrapped, key, value)
 
-    def reset(self, **kwargs: Any) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
+    def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
         if "seed" in kwargs:
             super().seed(kwargs["seed"])
         return self.env.reset(**kwargs)
 
     @staticmethod
     def wait(  # type: ignore
-        workers: List["DummyEnvWorker"], wait_num: int, timeout: Optional[float] = None
-    ) -> List["DummyEnvWorker"]:
+        workers: list["DummyEnvWorker"], wait_num: int, timeout: Optional[float] = None
+    ) -> list["DummyEnvWorker"]:
         # Sequential EnvWorker objects are always ready
         return workers
 
@@ -336,7 +348,7 @@ class DummyEnvWorker(EnvWorker):
         else:
             self.result = self.env.step(action)  # type: ignore
 
-    def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
+    def seed(self, seed: Optional[int] = None) -> Optional[list[int]]:
         super().seed(seed)
         try:
             return self.env.seed(seed)  # type: ignore
@@ -367,7 +379,10 @@ class SubprocEnvWorker(EnvWorker):
     """Subprocess worker used in SubprocVectorEnv and ShmemVectorEnv."""
 
     def __init__(
-        self, env_fn: Callable[[], gym.Env], share_memory: bool = False
+        self,
+        env_fn: Callable[[], gym.Env],
+        share_memory: bool = False,
+        local_env_index: int = -1,
     ) -> None:
         self.parent_remote, self.child_remote = Pipe()
         self.share_memory = share_memory
@@ -383,6 +398,7 @@ class SubprocEnvWorker(EnvWorker):
             self.child_remote,
             CloudpickleWrapper(env_fn),
             self.buffer,
+            local_env_index,
         )
         self.process = Process(target=_worker, args=args, daemon=True)
         self.process.start()
@@ -398,7 +414,7 @@ class SubprocEnvWorker(EnvWorker):
 
     def _decode_obs(self) -> Union[dict, tuple, np.ndarray]:
         def decode_obs(
-            buffer: Optional[Union[dict, tuple, ShArray]]
+            buffer: Optional[Union[dict, tuple, ShArray]],
         ) -> Union[dict, tuple, np.ndarray]:
             if isinstance(buffer, ShArray):
                 return buffer.get()
@@ -413,12 +429,12 @@ class SubprocEnvWorker(EnvWorker):
 
     @staticmethod
     def wait(  # type: ignore
-        workers: List["SubprocEnvWorker"],
+        workers: list["SubprocEnvWorker"],
         wait_num: int,
         timeout: Optional[float] = None,
-    ) -> List["SubprocEnvWorker"]:
+    ) -> list["SubprocEnvWorker"]:
         remain_conns = conns = [x.parent_remote for x in workers]
-        ready_conns: List[connection.Connection] = []
+        ready_conns: list[connection.Connection] = []
         remain_time, t1 = timeout, time.time()
         while len(remain_conns) > 0 and len(ready_conns) < wait_num:
             if timeout:
@@ -444,7 +460,7 @@ class SubprocEnvWorker(EnvWorker):
     ) -> Union[
         gym_old_venv_step_type,
         gym_new_venv_step_type,
-        Tuple[np.ndarray, dict],
+        tuple[np.ndarray, dict],
         np.ndarray,
     ]:  # noqa:E125
         result = self.parent_remote.recv()
@@ -464,7 +480,7 @@ class SubprocEnvWorker(EnvWorker):
                 obs = self._decode_obs()
             return obs
 
-    def reset(self, **kwargs: Any) -> Union[np.ndarray, Tuple[np.ndarray, dict]]:
+    def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
         if "seed" in kwargs:
             super().seed(kwargs["seed"])
         self.parent_remote.send(["reset", kwargs])
@@ -481,7 +497,7 @@ class SubprocEnvWorker(EnvWorker):
                 obs = self._decode_obs()
             return obs
 
-    def seed(self, seed: Optional[int] = None) -> Optional[List[int]]:
+    def seed(self, seed: Optional[int] = None) -> Optional[list[int]]:
         super().seed(seed)
         self.parent_remote.send(["seed", seed])
         ret = self.parent_remote.recv()
@@ -582,7 +598,7 @@ class BaseVectorEnv(object):
 
     def __init__(
         self,
-        env_fns: List[Callable[[], gym.Env]],
+        env_fns: list[Callable[[], gym.Env]],
         worker_fn: Callable[[Callable[[], gym.Env]], EnvWorker],
         wait_num: Optional[int] = None,
         timeout: Optional[float] = None,
@@ -593,32 +609,32 @@ class BaseVectorEnv(object):
         self.workers = [worker_fn(fn) for fn in env_fns]
         self.worker_class = type(self.workers[0])
         assert issubclass(self.worker_class, EnvWorker)
-        assert all([isinstance(w, self.worker_class) for w in self.workers])
+        assert all(isinstance(w, self.worker_class) for w in self.workers)
 
         self.env_num = len(env_fns)
         self.wait_num = wait_num or len(env_fns)
-        assert (
-            1 <= self.wait_num <= len(env_fns)
-        ), f"wait_num should be in [1, {len(env_fns)}], but got {wait_num}"
+        assert 1 <= self.wait_num <= len(env_fns), (
+            f"wait_num should be in [1, {len(env_fns)}], but got {wait_num}"
+        )
         self.timeout = timeout
-        assert (
-            self.timeout is None or self.timeout > 0
-        ), f"timeout is {timeout}, it should be positive if provided!"
+        assert self.timeout is None or self.timeout > 0, (
+            f"timeout is {timeout}, it should be positive if provided!"
+        )
         self.is_async = self.wait_num != len(env_fns) or timeout is not None
-        self.waiting_conn: List[EnvWorker] = []
+        self.waiting_conn: list[EnvWorker] = []
         # environments in self.ready_id is actually ready
         # but environments in self.waiting_id are just waiting when checked,
         # and they may be ready now, but this is not known until we check it
         # in the step() function
-        self.waiting_id: List[int] = []
+        self.waiting_id: list[int] = []
         # all environments are ready in the beginning
         self.ready_id = list(range(self.env_num))
         self.is_closed = False
 
     def _assert_is_not_closed(self) -> None:
-        assert (
-            not self.is_closed
-        ), f"Methods of {self.__class__.__name__} cannot be called after close."
+        assert not self.is_closed, (
+            f"Methods of {self.__class__.__name__} cannot be called after close."
+        )
 
     def __len__(self) -> int:
         """Return len(self), which is the number of environments."""
@@ -639,8 +655,8 @@ class BaseVectorEnv(object):
     def get_env_attr(
         self,
         key: str,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
-    ) -> List[Any]:
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+    ) -> list[Any]:
         """Get an attribute from the underlying environments.
 
         If id is an int, retrieve the attribute denoted by key from the environment
@@ -664,7 +680,7 @@ class BaseVectorEnv(object):
         self,
         key: str,
         value: Any,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
     ) -> None:
         """Set an attribute in the underlying environments.
 
@@ -685,26 +701,26 @@ class BaseVectorEnv(object):
 
     def _wrap_id(
         self,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
-    ) -> Union[List[int], np.ndarray]:
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+    ) -> Union[list[int], np.ndarray]:
         if id is None:
             return list(range(self.env_num))
         return [id] if np.isscalar(id) else id  # type: ignore
 
-    def _assert_id(self, id: Union[List[int], np.ndarray]) -> None:
+    def _assert_id(self, id: Union[list[int], np.ndarray]) -> None:
         for i in id:
-            assert (
-                i not in self.waiting_id
-            ), f"Cannot interact with environment {i} which is stepping now."
-            assert (
-                i in self.ready_id
-            ), f"Can only interact with ready environments {self.ready_id}."
+            assert i not in self.waiting_id, (
+                f"Cannot interact with environment {i} which is stepping now."
+            )
+            assert i in self.ready_id, (
+                f"Can only interact with ready environments {self.ready_id}."
+            )
 
     def reset(
         self,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
         **kwargs: Any,
-    ) -> Union[np.ndarray, Tuple[np.ndarray, Union[dict, List[dict]]]]:
+    ) -> Union[np.ndarray, tuple[np.ndarray, Union[dict, list[dict]]]]:
         """Reset the state of some envs and return initial observations.
 
         If id is None, reset the state of all the environments and return
@@ -750,7 +766,7 @@ class BaseVectorEnv(object):
     def step(
         self,
         action: np.ndarray,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
     ) -> Union[gym_old_venv_step_type, gym_new_venv_step_type]:
         """Run one timestep of some environments' dynamics.
 
@@ -816,7 +832,7 @@ class BaseVectorEnv(object):
                     self.waiting_conn.append(self.workers[env_id])
                     self.waiting_id.append(env_id)
                 self.ready_id = [x for x in self.ready_id if x not in id]
-            ready_conns: List[EnvWorker] = []
+            ready_conns: list[EnvWorker] = []
             while not ready_conns:
                 ready_conns = self.worker_class.wait(
                     self.waiting_conn, self.wait_num, self.timeout
@@ -843,8 +859,8 @@ class BaseVectorEnv(object):
 
     def seed(
         self,
-        seed: Optional[Union[int, List[int]]] = None,
-    ) -> List[Optional[List[int]]]:
+        seed: Optional[Union[int, list[int]]] = None,
+    ) -> list[Optional[list[int]]]:
         """Set the seed for all environments.
 
         Accept ``None``, an int (which will extend ``i`` to
@@ -855,7 +871,7 @@ class BaseVectorEnv(object):
             which a reproducer pass to "seed".
         """
         self._assert_is_not_closed()
-        seed_list: Union[List[None], List[int]]
+        seed_list: Union[list[None], list[int]]
         if seed is None:
             seed_list = [seed] * self.env_num
         elif isinstance(seed, int):
@@ -864,7 +880,7 @@ class BaseVectorEnv(object):
             seed_list = seed
         return [w.seed(s) for w, s in zip(self.workers, seed_list)]
 
-    def render(self, **kwargs: Any) -> List[Any]:
+    def render(self, **kwargs: Any) -> list[Any]:
         """Render all of the environments."""
         self._assert_is_not_closed()
         if self.is_async and len(self.waiting_id) > 0:
@@ -894,7 +910,7 @@ class DummyVectorEnv(BaseVectorEnv):
         Please refer to :class:`~tianshou.env.BaseVectorEnv` for other APIs' usage.
     """
 
-    def __init__(self, env_fns: List[Callable[[], gym.Env]], **kwargs: Any) -> None:
+    def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
         super().__init__(env_fns, DummyEnvWorker, **kwargs)
 
     def check_success(self):
@@ -911,10 +927,10 @@ class DummyVectorEnv(BaseVectorEnv):
 
     def set_init_state(
         self,
-        init_state: Optional[Union[int, List[int], np.ndarray]] = None,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        init_state: Optional[Union[int, list[int], np.ndarray]] = None,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
         **kwargs: Any,
-    ) -> Union[np.ndarray, Tuple[np.ndarray, Union[dict, List[dict]]]]:
+    ) -> Union[np.ndarray, tuple[np.ndarray, Union[dict, list[dict]]]]:
         """Reset the state of some envs and return initial observations.
         If id is None, reset the state of all the environments and return
         initial observations, otherwise reset the specific environments with
@@ -942,9 +958,15 @@ class SubprocVectorEnv(BaseVectorEnv):
         Please refer to :class:`~tianshou.env.BaseVectorEnv` for other APIs' usage.
     """
 
-    def __init__(self, env_fns: List[Callable[[], gym.Env]], **kwargs: Any) -> None:
+    def __init__(self, env_fns: list[Callable[[], gym.Env]], **kwargs: Any) -> None:
+        env_index = {"value": 0}
+
         def worker_fn(fn: Callable[[], gym.Env]) -> SubprocEnvWorker:
-            return SubprocEnvWorker(fn, share_memory=False)
+            local_env_index = env_index["value"]
+            env_index["value"] += 1
+            return SubprocEnvWorker(
+                fn, share_memory=False, local_env_index=local_env_index
+            )
 
         super().__init__(env_fns, worker_fn, **kwargs)
 
@@ -962,10 +984,10 @@ class SubprocVectorEnv(BaseVectorEnv):
 
     def set_init_state(
         self,
-        init_state: Optional[Union[int, List[int], np.ndarray]] = None,
-        id: Optional[Union[int, List[int], np.ndarray]] = None,
+        init_state: Optional[Union[int, list[int], np.ndarray]] = None,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
         **kwargs: Any,
-    ) -> Union[np.ndarray, Tuple[np.ndarray, Union[dict, List[dict]]]]:
+    ) -> Union[np.ndarray, tuple[np.ndarray, Union[dict, list[dict]]]]:
         """Reset the state of some envs and return initial observations.
         If id is None, reset the state of all the environments and return
         initial observations, otherwise reset the specific environments with

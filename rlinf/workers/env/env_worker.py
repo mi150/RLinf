@@ -14,7 +14,9 @@
 
 import asyncio
 import gc
+import os
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Literal
 
 import numpy as np
@@ -32,6 +34,7 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler.resource_pool.bindings import ENV_CPU_CORE_GROUPS_ENV
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -45,6 +48,14 @@ from rlinf.workers.env.history_manager import HistoryManager
 
 
 class EnvWorker(Worker):
+    _PER_ENV_CPU_SUPPORTED_ENVS = {
+        "calvin",
+        "habitat",
+        "libero",
+        "metaworld",
+        "robocasa",
+    }
+
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
 
@@ -130,6 +141,7 @@ class EnvWorker(Worker):
             ]
 
     def init_worker(self):
+        self._validate_env_resource_binding_supported()
         self.dst_rank_map = self._setup_dst_rank_map()
         self.src_rank_map = self._setup_src_rank_map()
 
@@ -168,6 +180,48 @@ class EnvWorker(Worker):
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
+
+    def _validate_env_resource_binding_supported(self) -> None:
+        binding = getattr(self, "_resource_binding", None)
+        if binding is None or binding.cpu is None:
+            return
+        if not binding.cpu.env_cpu_core_groups:
+            return
+        env_cfgs = []
+        if (
+            not getattr(self, "only_eval", False)
+            and self.cfg.env.get("train", None) is not None
+        ):
+            env_cfgs.append(self.cfg.env.train)
+        if (
+            getattr(self, "enable_eval", False)
+            and self.cfg.env.get("eval", None) is not None
+        ):
+            env_cfgs.append(self.cfg.env.eval)
+        env_entries = [(str(env_cfg.env_type).lower(), env_cfg) for env_cfg in env_cfgs]
+        env_types = {env_type for env_type, _ in env_entries}
+        unsupported = {
+            env_type
+            for env_type, env_cfg in env_entries
+            if not self._is_per_env_cpu_supported_env(env_type, env_cfg)
+        }
+        if unsupported:
+            raise ValueError(
+                "per-env CPU binding is only supported for SubprocVectorEnv-style "
+                f"env backends {sorted(self._PER_ENV_CPU_SUPPORTED_ENVS | {'d4rl'})}, "
+                f"but got {sorted(env_types)}. Use granularity=process or a "
+                "supported backend."
+            )
+
+    def _is_per_env_cpu_supported_env(self, env_type: str, env_cfg) -> bool:
+        if env_type in self._PER_ENV_CPU_SUPPORTED_ENVS:
+            return True
+        if env_type == "d4rl":
+            return bool(env_cfg.get("use_subproc_vector_env", False))
+        return False
+
+    def set_global_step(self, global_step: int) -> None:
+        self.global_step = int(global_step)
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -239,17 +293,49 @@ class EnvWorker(Worker):
         override_cfg["reward_image_key"] = env_cfg.main_image_key
         setattr(env_cfg, "override_cfg", OmegaConf.create(override_cfg))
 
+    @contextmanager
+    def _stage_env_cpu_core_groups(self, stage_id: int, num_envs_per_stage: int):
+        binding = getattr(self, "_resource_binding", None)
+        groups = (
+            binding.cpu.env_cpu_core_groups
+            if binding is not None and binding.cpu is not None
+            else ()
+        )
+        if not groups:
+            yield
+            return
+        start = stage_id * num_envs_per_stage
+        end = start + num_envs_per_stage
+        stage_groups = groups[start:end]
+        if len(stage_groups) != num_envs_per_stage:
+            raise ValueError(
+                f"resource pool has {len(groups)} per-env CPU groups, but stage "
+                f"{stage_id} needs indexes [{start}, {end})"
+            )
+        old_value = os.environ.get(ENV_CPU_CORE_GROUPS_ENV)
+        os.environ[ENV_CPU_CORE_GROUPS_ENV] = ";".join(
+            ",".join(map(str, group)) for group in stage_groups
+        )
+        try:
+            yield
+        finally:
+            if old_value is None:
+                os.environ.pop(ENV_CPU_CORE_GROUPS_ENV, None)
+            else:
+                os.environ[ENV_CPU_CORE_GROUPS_ENV] = old_value
+
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
 
         for stage_id in range(self.stage_num):
-            env = env_cls(
-                cfg=env_cfg,
-                num_envs=num_envs_per_stage,
-                seed_offset=self._rank * self.stage_num + stage_id,
-                total_num_processes=self._world_size * self.stage_num,
-                worker_info=self.worker_info,
-            )
+            with self._stage_env_cpu_core_groups(stage_id, num_envs_per_stage):
+                env = env_cls(
+                    cfg=env_cfg,
+                    num_envs=num_envs_per_stage,
+                    seed_offset=self._rank * self.stage_num + stage_id,
+                    total_num_processes=self._world_size * self.stage_num,
+                    worker_info=self.worker_info,
+                )
             if env_cfg.video_cfg.save_video:
                 env = RecordVideo(env, env_cfg.video_cfg)
             if env_cfg.get("data_collection", None) and getattr(

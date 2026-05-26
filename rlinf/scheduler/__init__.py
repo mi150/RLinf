@@ -33,6 +33,7 @@ from .placement import (
     PackedPlacementStrategy,
     PlacementStrategy,
 )
+from .resource_pool import FineGrainedResourcePool
 from .worker import Worker, WorkerAddress, WorkerGroupFuncResult
 
 __all__ = [
@@ -50,6 +51,7 @@ __all__ = [
     "ComponentPlacement",
     "PlacementStrategy",
     "FlexiblePlacementStrategy",
+    "FineGrainedResourcePool",
     "NodePlacementStrategy",
     "PackedPlacementStrategy",
     "Worker",

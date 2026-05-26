@@ -13,20 +13,31 @@
 # limitations under the License.
 
 import json
+from pathlib import Path
 
 import hydra
 import torch.multiprocessing as mp
+from hydra.core.hydra_config import HydraConfig
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
 from rlinf.runners.embodied_runner import EmbodiedRunner
-from rlinf.scheduler import Cluster
+from rlinf.scheduler import Cluster, FineGrainedResourcePool
+from rlinf.scheduler.resource_pool import WorkerResourceBinding
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward.reward_worker import EmbodiedRewardWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
-mp.set_start_method("spawn", force=True)
+
+def _get_resource_bindings(
+    resource_pool: FineGrainedResourcePool, component: str
+) -> list[WorkerResourceBinding] | None:
+    return resource_pool.get_component_bindings(component)
+
+
+def _resource_pool_artifact_path() -> Path:
+    return Path(HydraConfig.get().runtime.output_dir) / "resource_pool_plan.json"
 
 
 @hydra.main(
@@ -40,6 +51,11 @@ def main(cfg) -> None:
         cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
+    resource_pool = FineGrainedResourcePool.from_config(
+        cfg=cfg,
+        cluster=cluster,
+        component_placement=component_placement,
+    )
 
     # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
@@ -63,19 +79,28 @@ def main(cfg) -> None:
 
         actor_worker_cls = EmbodiedFSDPActor
     actor_group = actor_worker_cls.create_group(cfg).launch(
-        cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
+        cluster,
+        name=cfg.actor.group_name,
+        placement_strategy=actor_placement,
+        resource_bindings=_get_resource_bindings(resource_pool, "actor"),
     )
 
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")
     rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
-        cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        cluster,
+        name=cfg.rollout.group_name,
+        placement_strategy=rollout_placement,
+        resource_bindings=_get_resource_bindings(resource_pool, "rollout"),
     )
 
     # Create env worker group
     env_placement = component_placement.get_strategy("env")
     env_group = EnvWorker.create_group(cfg).launch(
-        cluster, name=cfg.env.group_name, placement_strategy=env_placement
+        cluster,
+        name=cfg.env.group_name,
+        placement_strategy=env_placement,
+        resource_bindings=_get_resource_bindings(resource_pool, "env"),
     )
 
     reward_group = None
@@ -85,8 +110,14 @@ def main(cfg) -> None:
         # Create reward worker group
         reward_placement = component_placement.get_strategy("reward")
         reward_group = EmbodiedRewardWorker.create_group(cfg).launch(
-            cluster, name=cfg.reward.group_name, placement_strategy=reward_placement
+            cluster,
+            name=cfg.reward.group_name,
+            placement_strategy=reward_placement,
+            resource_bindings=_get_resource_bindings(resource_pool, "reward"),
         )
+
+    if resource_pool.enabled:
+        resource_pool.write_plan(_resource_pool_artifact_path())
 
     runner = EmbodiedRunner(
         cfg=cfg,
@@ -101,4 +132,5 @@ def main(cfg) -> None:
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
