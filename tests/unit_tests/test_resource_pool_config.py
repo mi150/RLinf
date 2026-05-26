@@ -139,6 +139,29 @@ def test_gpu_component_config_requires_sm_percent() -> None:
         ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
 
 
+def test_gpu_component_config_rejects_null_sm_percent() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "resource_pool": {
+                    "enabled": True,
+                    "gpu": {
+                        "enabled": True,
+                        "mode": "mps",
+                        "pools": {"gpu_pool": {"devices": "0"}},
+                        "components": {
+                            "rollout": {"pool": "gpu_pool", "sm_percent": None}
+                        },
+                    },
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="sm_percent"):
+        ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+
 def test_plan_file_mode_requires_path() -> None:
     cfg = OmegaConf.create(
         {
@@ -183,6 +206,38 @@ def test_mig_device_config_requires_parent_gpu() -> None:
         ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
 
 
+def test_mig_device_config_requires_uuid() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "resource_pool": {
+                    "enabled": True,
+                    "gpu": {
+                        "enabled": True,
+                        "mode": "mig",
+                        "pools": {
+                            "mig_pool": {
+                                "mig_devices": [
+                                    {
+                                        "parent_gpu": 0,
+                                        "sm_percent": 20,
+                                    }
+                                ],
+                            }
+                        },
+                        "components": {
+                            "rollout": {"pool": "mig_pool", "sm_percent": 20}
+                        },
+                    },
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="uuid"):
+        ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+
 def test_mig_device_config_requires_sm_percent() -> None:
     cfg = OmegaConf.create(
         {
@@ -198,6 +253,39 @@ def test_mig_device_config_requires_sm_percent() -> None:
                                     {
                                         "uuid": "MIG-A",
                                         "parent_gpu": 0,
+                                    }
+                                ],
+                            }
+                        },
+                        "components": {
+                            "rollout": {"pool": "mig_pool", "sm_percent": 20}
+                        },
+                    },
+                }
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="sm_percent"):
+        ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+
+def test_mig_device_config_rejects_null_sm_percent() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "resource_pool": {
+                    "enabled": True,
+                    "gpu": {
+                        "enabled": True,
+                        "mode": "mig",
+                        "pools": {
+                            "mig_pool": {
+                                "mig_devices": [
+                                    {
+                                        "uuid": "MIG-A",
+                                        "parent_gpu": 0,
+                                        "sm_percent": None,
                                     }
                                 ],
                             }
