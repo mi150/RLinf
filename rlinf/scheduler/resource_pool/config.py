@@ -199,6 +199,10 @@ def _parse_gpu_resource(payload: object) -> GpuResourceConfig:
                 raise ValueError(
                     f"gpu pool '{pool_name}' mig device requires parent_gpu"
                 )
+            if "sm_percent" not in mig_device_config:
+                raise ValueError(
+                    f"gpu pool '{pool_name}' mig device requires sm_percent"
+                )
             mig_devices.append(
                 MigDeviceConfig(
                     uuid=str(mig_device_config.get("uuid", "")),
@@ -228,6 +232,8 @@ def _parse_gpu_resource(payload: object) -> GpuResourceConfig:
             raise ValueError(
                 f"gpu component '{component_name}' references unknown pool '{pool_name}'"
             )
+        if "sm_percent" not in component_config:
+            raise ValueError(f"gpu component '{component_name}' requires sm_percent")
 
         sm_percent = validate_sm_percent(component_config.get("sm_percent"))
         components[str(component_name)] = GpuComponentConfig(
