@@ -24,6 +24,10 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.chunk_runner import (
+    build_chunk_done_outputs,
+    maybe_apply_ignore_terminations,
+)
 from rlinf.envs.libero.utils import (
     get_benchmark_overridden,
     get_libero_image,
@@ -96,6 +100,8 @@ class LiberoEnv(gym.Env):
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
+        self.chunk_step_mode = cfg.get("chunk_step_mode", "sync_time_major")
+        self.chunk_step_num_shards = int(cfg.get("chunk_step_num_shards", 1))
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -679,6 +685,11 @@ class LiberoEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions):
+        if self.chunk_step_mode == "parallel_shard":
+            return self._chunk_step_parallel_shard(chunk_actions)
+        return self._chunk_step_sync_time_major(chunk_actions)
+
+    def _chunk_step_sync_time_major(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []
@@ -726,6 +737,78 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_parallel_shard(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.chunk_step(chunk_actions)
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+
         return (
             obs_list,
             chunk_rewards,

@@ -26,6 +26,7 @@ from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
+from rlinf.envs.chunk_runner import CHUNK_STEP_MODES
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -834,6 +835,47 @@ def validate_embodied_cfg(cfg):
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
 
+    def validate_chunk_step_cfg(env_cfg, cfg_path: str):
+        local_num_envs = env_cfg.total_num_envs // env_world_size // stage_num
+        env_type = SupportedEnvType(env_cfg.env_type)
+        if "chunk_step_mode" not in env_cfg:
+            mode = "sync_time_major"
+            if (
+                env_type == SupportedEnvType.BEHAVIOR
+                and int(env_cfg.get("num_env_subprocess", 1)) > 1
+            ):
+                mode = "parallel_shard"
+        else:
+            mode = env_cfg.chunk_step_mode
+        num_shards = int(
+            env_cfg.get(
+                "chunk_step_num_shards",
+                env_cfg.get("num_env_subprocess", 1)
+                if env_type == SupportedEnvType.BEHAVIOR
+                else 1,
+            )
+        )
+
+        assert mode in CHUNK_STEP_MODES, (
+            f"{cfg_path}.chunk_step_mode must be one of "
+            f"{sorted(CHUNK_STEP_MODES)}, got {mode!r}"
+        )
+        assert num_shards >= 1, (
+            f"{cfg_path}.chunk_step_num_shards must be >= 1, got {num_shards}"
+        )
+        assert num_shards <= local_num_envs, (
+            f"{cfg_path}.chunk_step_num_shards({num_shards}) must be <= local "
+            f"env num({local_num_envs})"
+        )
+        if env_type == SupportedEnvType.MANISKILL and mode == "parallel_shard":
+            assert num_shards == 1, (
+                "ManiSkill parallel_shard chunk_step currently supports only "
+                f"chunk_step_num_shards=1, got {num_shards}"
+            )
+        with open_dict(env_cfg):
+            env_cfg.chunk_step_mode = mode
+            env_cfg.chunk_step_num_shards = num_shards
+
     if cfg.runner.val_check_interval > 0 or cfg.runner.get("only_eval", False):
         assert cfg.env.eval.total_num_envs > 0, (
             "Total number of parallel environments for evaluation must be greater than 0"
@@ -862,6 +904,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        validate_chunk_step_cfg(cfg.env.eval, "env.eval")
 
     if not cfg.runner.get("only_eval", False):
         assert cfg.env.train.total_num_envs > 0, (
@@ -892,6 +935,7 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        validate_chunk_step_cfg(cfg.env.train, "env.train")
 
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
