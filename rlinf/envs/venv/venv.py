@@ -26,6 +26,7 @@ import cloudpickle
 import gym
 import numpy as np
 
+from rlinf.envs.chunk_runner import stack_vector_chunk_returns
 from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
     get_env_core_group_from_env,
@@ -267,6 +268,13 @@ def _worker(
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                env_returns = [env.step(action) for action in data]
+                p.send(tuple(zip(*env_returns)))
             elif cmd == "reset":
                 retval = env.reset(**data)
                 reset_returns_info = (
@@ -347,6 +355,10 @@ class DummyEnvWorker(EnvWorker):
             self.result = self.env.reset(**kwargs)
         else:
             self.result = self.env.step(action)  # type: ignore
+
+    def send_chunk_step(self, chunk_action: np.ndarray) -> None:
+        env_returns = [self.env.step(action) for action in chunk_action]
+        self.result = tuple(zip(*env_returns))  # type: ignore
 
     def seed(self, seed: Optional[int] = None) -> Optional[list[int]]:
         super().seed(seed)
@@ -454,6 +466,9 @@ class SubprocEnvWorker(EnvWorker):
             self.parent_remote.send(["reset", kwargs])
         else:
             self.parent_remote.send(["step", action])
+
+    def send_chunk_step(self, chunk_action: np.ndarray) -> None:
+        self.parent_remote.send(["chunk_step", chunk_action])
 
     def recv(
         self,
@@ -856,6 +871,23 @@ class BaseVectorEnv(object):
             obs_stack = np.array(obs_list, dtype=object)
         other_stacks = map(np.stack, return_lists[1:])
         return (obs_stack, *other_stacks)  # type: ignore
+
+    def chunk_step(
+        self,
+        chunk_action: np.ndarray,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+    ) -> tuple[list[Any], ...]:
+        """Run full local action chunks in each worker before gathering results."""
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+        assert len(chunk_action) == len(id)
+
+        for i, j in enumerate(id):
+            self.workers[j].send_chunk_step(chunk_action[i])
+        env_results = [self.workers[j].recv() for j in id]
+        return stack_vector_chunk_returns(env_results)
 
     def seed(
         self,

@@ -252,7 +252,19 @@ class BehaviorEnv(gym.Env):
         self.worker_info = worker_info
         self.record_metrics = record_metrics
         self._is_start = True
-        self.num_env_subprocess = int(self.cfg.get("num_env_subprocess", 1))
+        configured_subprocesses = int(self.cfg.get("num_env_subprocess", 1))
+        self.chunk_step_mode = self.cfg.get(
+            "chunk_step_mode",
+            "parallel_shard" if configured_subprocesses > 1 else "sync_time_major",
+        )
+        self.chunk_step_num_shards = int(
+            self.cfg.get("chunk_step_num_shards", configured_subprocesses)
+        )
+        self.num_env_subprocess = (
+            self.chunk_step_num_shards
+            if self.chunk_step_mode == "parallel_shard"
+            else configured_subprocesses
+        )
         self.num_env_shard = self._split_num_envs(
             self.num_envs, self.num_env_subprocess
         )
@@ -315,7 +327,7 @@ class BehaviorEnv(gym.Env):
             payload_shards = [None] * len(self.env_proxys)
         else:
             assert len(payloads) == self.num_envs, (
-                f"payload_shards length {len(payload_shards)} != num subprocesses {self.num_envs}"
+                f"payloads length {len(payloads)} != num_envs {self.num_envs}"
             )
             s = self.num_env_shard
             payload_shards = [

@@ -59,6 +59,8 @@ class ManiskillEnv(gym.Env):
         self.auto_reset = cfg.auto_reset
         self.use_rel_reward = cfg.use_rel_reward
         self.ignore_terminations = cfg.ignore_terminations
+        self.chunk_step_mode = cfg.get("chunk_step_mode", "sync_time_major")
+        self.chunk_step_num_shards = int(cfg.get("chunk_step_num_shards", 1))
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
@@ -320,6 +322,15 @@ class ManiskillEnv(gym.Env):
         return extracted_obs, step_reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions):
+        if (
+            self.chunk_step_mode == "parallel_shard"
+            and self.chunk_step_num_shards > 1
+        ):
+            raise NotImplementedError(
+                "ManiSkill parallel_shard chunk_step with more than one shard "
+                "requires separate simulator shards and is not enabled in this "
+                "wrapper yet. Use sync_time_major or chunk_step_num_shards=1."
+            )
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []

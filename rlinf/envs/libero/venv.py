@@ -114,6 +114,13 @@ def _worker(
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                env_returns = [env.step(action) for action in data]
+                p.send(tuple(zip(*env_returns)))
             elif cmd == "reset":
                 retval = env.reset(**data)
                 reset_returns_info = (

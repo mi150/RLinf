@@ -172,6 +172,20 @@ def _worker(
                 if hasattr(env, "get_ep_meta"):
                     env_return = get_ep_meta(env, env_return)
                 p.send(env_return)
+            elif cmd == "chunk_step":
+                if obs_bufs is not None:
+                    raise NotImplementedError(
+                        "chunk_step does not support shared-memory observations"
+                    )
+                env_returns = []
+                for action in data:
+                    env_return = env.step(action)
+                    if hasattr(env, "_check_success"):
+                        env_return = _check_success(env, env_return)
+                    if hasattr(env, "get_ep_meta"):
+                        env_return = get_ep_meta(env, env_return)
+                    env_returns.append(env_return)
+                p.send(tuple(zip(*env_returns)))
             elif cmd == "reset":
                 # Robosuite reset can return just obs or (obs, info)
                 retval = env.reset(**data)
