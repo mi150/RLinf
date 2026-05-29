@@ -91,9 +91,31 @@ def compute_evaluate_metrics(eval_metrics_list):
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
 
+    # v17: use loss_mask to filter metrics (exclude dummy/masked steps)
+    loss_mask = data_buffer.get("loss_mask", None)
+    if loss_mask is not None:
+        # loss_mask: [T, B, 1] or [T, B, num_action_chunks] — broadcast to match data shapes
+        mask_bool = loss_mask.bool()
+        if mask_bool.dim() == 3 and mask_bool.shape[-1] == 1:
+            mask_1d = mask_bool.squeeze(-1)  # [T, B]
+        elif mask_bool.dim() == 3:
+            mask_1d = mask_bool[..., -1]  # use last action chunk
+        else:
+            mask_1d = mask_bool
+    else:
+        mask_1d = None
+
     if "rewards" in data_buffer:
         rewards = data_buffer["rewards"].clone()
-        mean_rewards = torch.mean(rewards).to(Worker.torch_platform.current_device())
+        if mask_1d is not None and rewards.shape[:2] == mask_1d.shape[:2]:
+            mean_rewards = (
+                rewards[mask_1d].mean()
+                if mask_1d.any()
+                else torch.zeros(1, device=rewards.device)
+            )
+        else:
+            mean_rewards = torch.mean(rewards)
+        mean_rewards = mean_rewards.to(Worker.torch_platform.current_device())
         torch.distributed.all_reduce(mean_rewards, op=torch.distributed.ReduceOp.AVG)
 
         rewards_metrics = {
@@ -103,10 +125,21 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
 
     if "advantages" in data_buffer:
         advantages = data_buffer["advantages"]
-        mean_adv = torch.mean(advantages).to(Worker.torch_platform.current_device())
+        if mask_1d is not None and advantages.shape[:2] == mask_1d.shape[:2]:
+            valid_adv = advantages[mask_1d]
+            mean_adv = (
+                valid_adv.mean()
+                if valid_adv.numel() > 0
+                else torch.zeros(1, device=advantages.device)
+            )
+            max_adv = valid_adv.max().detach().item() if valid_adv.numel() > 0 else 0.0
+            min_adv = valid_adv.min().detach().item() if valid_adv.numel() > 0 else 0.0
+        else:
+            mean_adv = torch.mean(advantages)
+            max_adv = torch.max(advantages).detach().item()
+            min_adv = torch.min(advantages).detach().item()
+        mean_adv = mean_adv.to(Worker.torch_platform.current_device())
         torch.distributed.all_reduce(mean_adv, op=torch.distributed.ReduceOp.AVG)
-        max_adv = torch.max(advantages).detach().item()
-        min_adv = torch.min(advantages).detach().item()
         reduce_adv_tensor = torch.as_tensor(
             [-min_adv, max_adv],
             device=Worker.torch_platform.current_device(),
@@ -126,10 +159,21 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
 
     if data_buffer.get("returns", None) is not None:
         returns = data_buffer["returns"]
-        mean_ret = torch.mean(returns).to(Worker.torch_platform.current_device())
+        if mask_1d is not None and returns.shape[:2] == mask_1d.shape[:2]:
+            valid_ret = returns[mask_1d]
+            mean_ret = (
+                valid_ret.mean()
+                if valid_ret.numel() > 0
+                else torch.zeros(1, device=returns.device)
+            )
+            max_ret = valid_ret.max().detach().item() if valid_ret.numel() > 0 else 0.0
+            min_ret = valid_ret.min().detach().item() if valid_ret.numel() > 0 else 0.0
+        else:
+            mean_ret = torch.mean(returns)
+            max_ret = torch.max(returns).detach().item()
+            min_ret = torch.min(returns).detach().item()
+        mean_ret = mean_ret.to(Worker.torch_platform.current_device())
         torch.distributed.all_reduce(mean_ret, op=torch.distributed.ReduceOp.AVG)
-        max_ret = torch.max(returns).detach().item()
-        min_ret = torch.min(returns).detach().item()
         reduce_ret_tensor = torch.as_tensor(
             [-min_ret, max_ret],
             device=Worker.torch_platform.current_device(),

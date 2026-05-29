@@ -1,0 +1,181 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/gr00t@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_10_autoreset_actprobe_task0_8gpu"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 200
+  max_steps: 50
+
+  only_eval: False
+  val_check_interval: 2
+  save_interval: 10
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 1  # v17/v19: 1 long epoch, GAE handles episode boundaries via dones
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+
+  update_epoch: 1
+  adv_type: gae
+  loss_type: actor_critic
+  failure_reweight: false
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  filter_rewards: False
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+  train:
+    total_num_envs: 128       # 8 GPUs x 16 envs per GPU
+    max_episode_steps: 480    # 480 / 5 action_chunks = 96 rollout steps per episode
+    max_steps_per_rollout_epoch: 1920  # 480 x 4 = 1920, 1920/480 = 4 eps/env, 16 env x 4 = 64 = target
+    reward_coef: ${algorithm.reward_coef}
+    auto_reset: True
+    use_fixed_reset_state_ids: False
+    use_ordered_reset_state_ids: False
+    task_ids_filter: [0]
+    v10_dynamic_stop:
+      enabled: false
+    v17_continuous_collect:
+      enabled: true
+      target_trajectories: 64  # per-rank limit, 8 ranks x 64 = 512 total, match baseline
+    probe_cfg:
+      enabled: true
+      checkpoint_path: "/workspace/RLinf/checkpoints/probe_libero10_task0/probe_v19.pt"
+      initial_tau: 0.95
+      warmup_steps: 2
+      K: 1
+      agg: "median"
+      max_chunk_steps: 128   # episode = 96 chunks, set > 96 to allow cut at any point
+      cut_ratio: 0.7
+      min_cut_chunk: 10
+      dropout: 0.4
+      lang_encoder:
+        enabled: true
+        model_path: "/workspace/RLinf/hf_cache_qwen3/snapshots/c54f2e6e80b2d7b7de06f51cec4959f6b3e03418"
+        lang_dim: 1024
+        task_instruction: "put both the alphabet soup and the tomato sauce in the basket"
+      online_update:
+        enabled: true
+        interval: 1
+        buffer_size: 400
+        recent_steps: 3
+        freeze_after_step: 0
+        epochs: 50
+        min_episodes: 50
+        max_base_episodes: 0
+        base_data_path: "/workspace/RLinf/checkpoints/probe_libero10_task0/merged_200eps.pkl"
+  eval:
+    total_num_envs: 96        # 8 GPUs x 12 envs per GPU
+    auto_reset: False
+    ignore_terminations: False
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    task_ids_filter: [0]
+    video_cfg:
+      save_video: False
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: True
+  pipeline_stage_num: 1
+
+  model:
+    model_path: "/workspace/RLinf/checkpoints/RLinf-Gr00t-SFT-10"
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 128
+  global_batch_size: 1024     # 1024 / (128 * 8 GPUs) = 1 grad accumulation step
+  seed: 1234
+  enable_offload: False
+
+  model:
+    model_path: "/workspace/RLinf/checkpoints/RLinf-Gr00t-SFT-10"
+    model_type: "gr00t"
+    add_value_head: True
+
+  optim:
+    lr: 2.0e-5
+    value_lr: 2.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+    weight_decay: 0.01
+    critic_warmup_steps: 0
+
+  fsdp_config:
+    strategy: "fsdp"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

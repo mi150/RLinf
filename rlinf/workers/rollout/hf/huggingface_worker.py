@@ -39,6 +39,16 @@ class MultiStepRolloutWorker(Worker):
         self.cfg = cfg
         self.should_stop = False
 
+        # Fix global RNG for reproducibility (per-rank seed)
+        import random
+
+        _seed = cfg.actor.seed + self._rank
+        random.seed(_seed)
+        np.random.seed(_seed)
+        torch.manual_seed(_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_seed)
+
         self.actor_group_name = cfg.actor.group_name
         self.device = self.torch_platform.current_device()
 
@@ -252,7 +262,6 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
-            SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
         ]:
             if self.cfg.algorithm.loss_type == "embodied_dagger":
@@ -351,50 +360,86 @@ class MultiStepRolloutWorker(Worker):
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
+        _last_rollout_result = None  # cache for dummy reuse when all envs done
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
-                actions, result = self.predict(env_output["obs"])
 
-                save_flags = None
-                if result.get("expert_label_flag", False):
-                    save_flags = torch.full(
-                        (actions.shape[0], self.cfg.actor.model.num_action_chunks),
-                        True,
-                        dtype=torch.bool,
-                        device=actions.device,
+                # v10: skip predict if all envs done
+                all_done_flag = env_output.get("env_all_done", None)
+                if (
+                    all_done_flag is not None
+                    and all_done_flag.all().item()
+                    and _last_rollout_result is not None
+                ):
+                    # Reuse last rollout_result as dummy (actions don't matter, env won't step)
+                    rollout_result = RolloutResult(
+                        actions=_last_rollout_result.actions,
+                        prev_logprobs=_last_rollout_result.prev_logprobs,
+                        prev_values=_last_rollout_result.prev_values,
+                        bootstrap_values=_last_rollout_result.bootstrap_values,
+                        save_flags=None,
+                        forward_inputs=_last_rollout_result.forward_inputs,
+                        versions=_last_rollout_result.versions,
                     )
+                else:
+                    actions, result = self.predict(env_output["obs"])
+
+                    save_flags = None
+                    if result.get("expert_label_flag", False):
+                        save_flags = torch.full(
+                            (actions.shape[0], self.cfg.actor.model.num_action_chunks),
+                            True,
+                            dtype=torch.bool,
+                            device=actions.device,
+                        )
+                    rollout_result = RolloutResult(
+                        actions=actions,
+                        prev_logprobs=result["prev_logprobs"]
+                        if self.collect_prev_infos
+                        else None,
+                        prev_values=result["prev_values"]
+                        if self.collect_prev_infos
+                        else None,
+                        bootstrap_values=self.get_bootstrap_values(
+                            env_output.get("final_obs", None)
+                        ),
+                        save_flags=save_flags,
+                        forward_inputs=result["forward_inputs"],
+                        versions=torch.full_like(
+                            result["prev_logprobs"],
+                            float(self.version),
+                            dtype=torch.float32,
+                        ),
+                    )
+                    _last_rollout_result = rollout_result
+                self.send_rollout_result(output_channel, rollout_result, mode="train")
+        for _ in range(self.num_pipeline_stages):
+            env_output = await self.recv_env_output(input_channel)
+
+            # v10: skip predict for final bootstrap too
+            all_done_flag = env_output.get("env_all_done", None)
+            if (
+                all_done_flag is not None
+                and all_done_flag.all().item()
+                and _last_rollout_result is not None
+            ):
+                rollout_result = RolloutResult(
+                    actions=_last_rollout_result.actions,
+                    prev_values=_last_rollout_result.prev_values,
+                    bootstrap_values=_last_rollout_result.bootstrap_values,
+                )
+            else:
+                actions, result = self.predict(env_output["obs"])
                 rollout_result = RolloutResult(
                     actions=actions,
-                    prev_logprobs=result["prev_logprobs"]
-                    if self.collect_prev_infos
-                    else None,
                     prev_values=result["prev_values"]
                     if self.collect_prev_infos
                     else None,
                     bootstrap_values=self.get_bootstrap_values(
                         env_output.get("final_obs", None)
                     ),
-                    save_flags=save_flags,
-                    forward_inputs=result["forward_inputs"],
-                    versions=torch.full_like(
-                        result["prev_logprobs"],
-                        float(self.version),
-                        dtype=torch.float32,
-                    ),
                 )
-                self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
-            env_output = await self.recv_env_output(input_channel)
-            actions, result = self.predict(env_output["obs"])
-
-            rollout_result = RolloutResult(
-                actions=actions,
-                prev_values=result["prev_values"] if self.collect_prev_infos else None,
-                bootstrap_values=self.get_bootstrap_values(
-                    env_output.get("final_obs", None)
-                ),
-            )
             self.send_rollout_result(output_channel, rollout_result, mode="train")
 
     async def generate(
@@ -405,8 +450,13 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
+        # v17: collect in 1 long epoch (env_worker splits later for actor)
+        v17_enabled = self.cfg.env.train.get("v17_continuous_collect", {}).get(
+            "enabled", False
+        )
+        actual_rollout_epoch = 1 if v17_enabled else self.rollout_epoch
         for _ in tqdm(
-            range(self.rollout_epoch),
+            range(actual_rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
@@ -544,7 +594,15 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        result = {"obs": merged_obs, "final_obs": merged_final_obs}
+
+        # v10: preserve env_all_done flag (concat across ranks, check all)
+        if obs_batches and "env_all_done" in obs_batches[0]:
+            result["env_all_done"] = torch.cat(
+                [b["env_all_done"] for b in obs_batches], dim=0
+            )
+
+        return result
 
     def send_chunk_actions(
         self,

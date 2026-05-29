@@ -63,6 +63,64 @@ def compute_gae_advantages_and_returns(
         gae_lambda = 1
         gamma = 1
 
+    # Log episode count and length distribution seen by GAE
+    if dones is not None and loss_mask is not None:
+        dones_last = dones[:T, :, -1] if dones.dim() == 3 else dones[:T]
+        mask_last = loss_mask[:, :, -1] if loss_mask.dim() == 3 else loss_mask
+        valid_ep_ends = dones_last & mask_last
+        n_gae_eps = valid_ep_ends.sum().item()
+        B = rewards.shape[1] if rewards.dim() >= 2 else 1
+        # Compute per-episode lengths
+        ep_lens = []
+        for ei in range(B):
+            start = 0
+            for t in range(T):
+                if dones_last[t, ei] and mask_last[t, ei]:
+                    ep_lens.append(t - start + 1)
+                    start = t + 1
+                elif dones_last[t, ei] and not mask_last[t, ei]:
+                    start = t + 1
+        avg_len = sum(ep_lens) / len(ep_lens) if ep_lens else 0
+        # Separate success (reward > 0) and fail episodes
+        # Use rewards summed per episode
+        succ_lens, fail_lens = [], []
+        for ei in range(B):
+            start = 0
+            for t in range(T):
+                if dones_last[t, ei] and mask_last[t, ei]:
+                    ep_reward = (
+                        (
+                            rewards[start : t + 1, ei]
+                            * mask_last[start : t + 1, ei].unsqueeze(-1).float()
+                        )
+                        .sum()
+                        .item()
+                        if rewards.dim() == 3
+                        else rewards[start : t + 1, ei].sum().item()
+                    )
+                    ep_len = t - start + 1
+                    if ep_reward > 0:
+                        succ_lens.append(ep_len)
+                    else:
+                        fail_lens.append(ep_len)
+                    start = t + 1
+                elif dones_last[t, ei] and not mask_last[t, ei]:
+                    start = t + 1
+        print(
+            f"[GAE] T={T}, B={B}, valid_episodes={int(n_gae_eps)}, avg_len={avg_len:.1f}"
+        )
+        print(
+            f"[GAE] success: n={len(succ_lens)}, avg_len={sum(succ_lens) / len(succ_lens):.1f}"
+            if succ_lens
+            else "[GAE] success: n=0"
+        )
+        print(
+            f"[GAE] fail: n={len(fail_lens)}, avg_len={sum(fail_lens) / len(fail_lens):.1f}"
+            if fail_lens
+            else "[GAE] fail: n=0"
+        )
+        # (GAE-detail removed — see [GAE] summary above)
+
     for step in reversed(range(T)):
         if critic_free:
             delta = rewards[step]
@@ -77,6 +135,160 @@ def compute_gae_advantages_and_returns(
         returns[step] = gae if critic_free else gae + values[step]
 
     advantages = returns - values[:-1] if not critic_free else returns
+
+    # ── Failure advantage reweighting + diagnostic ──
+    if loss_mask is not None and not critic_free:
+        try:
+            _T, _B = rewards.shape
+            env_reward_sum = (rewards * loss_mask.float()).sum(dim=0)  # [B]
+            succ_envs = env_reward_sum > 0
+            fail_envs = ~succ_envs
+
+            # Reweight cut-failure advantages: scale up to simulate full-length episode
+            # A failure cut at step t has active_steps < T; full timeout would have T steps.
+            # Scale factor = T / active_steps compensates the missing steps' gradient.
+            reweight_enabled = kwargs.get("failure_reweight", False)
+            n_reweighted = 0
+            if fail_envs.any():
+                fail_active_per_env = (
+                    loss_mask[:, fail_envs].float().sum(dim=0)
+                )  # [n_fail]
+                full_length = float(_T)
+                # Debug: show active_steps distribution for fail envs
+                active_list = fail_active_per_env.tolist()
+                n_short = sum(1 for a in active_list if 0 < a < full_length)
+                print(
+                    f"[reweight-debug] T={_T}, B={_B}, n_fail={fail_envs.sum().item()}, "
+                    f"full_length={full_length}, n_short={n_short}, "
+                    f"active_steps: min={min(active_list):.0f}, max={max(active_list):.0f}, "
+                    f"mean={sum(active_list) / len(active_list):.1f}, "
+                    f"dist={sorted({int(a) for a in active_list})[:10]}"
+                )
+            if reweight_enabled and fail_envs.any():
+                for j in range(fail_envs.sum().item()):
+                    actual = fail_active_per_env[j].item()
+                    if 0 < actual < full_length:
+                        scale = full_length / actual
+                        env_idx = fail_envs.nonzero(as_tuple=True)[0][j]
+                        advantages[:, env_idx] *= scale
+                        returns[:, env_idx] = (
+                            advantages[:, env_idx] + values[:-1, env_idx]
+                        )
+                        n_reweighted += 1
+
+            # Diagnostic logging (after reweighting)
+            masked_adv = advantages * loss_mask.float()
+            if succ_envs.any():
+                succ_adv = masked_adv[:, succ_envs]
+                succ_mask = loss_mask[:, succ_envs]
+                succ_active = succ_mask.sum().item()
+                succ_abs_sum = succ_adv.abs().sum().item()
+                succ_mean = succ_adv.sum().item() / max(succ_active, 1)
+            else:
+                succ_active, succ_abs_sum, succ_mean = 0, 0, 0
+
+            if fail_envs.any():
+                fail_adv = masked_adv[:, fail_envs]
+                fail_mask = loss_mask[:, fail_envs]
+                fail_active = fail_mask.sum().item()
+                fail_abs_sum = fail_adv.abs().sum().item()
+                fail_mean = fail_adv.sum().item() / max(fail_active, 1)
+            else:
+                fail_active, fail_abs_sum, fail_mean = 0, 0, 0
+
+            n_succ = succ_envs.sum().item()
+            n_fail = fail_envs.sum().item()
+            v_mean = values[:-1][loss_mask].mean().item() if loss_mask.any() else 0
+            rw_str = f", reweighted={n_reweighted}" if reweight_enabled else ""
+
+            # ── Deep probe: 5-segment breakdown for failure & success ──
+            N_SEG = 5
+            seg_labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
+
+            def _segment_stats(env_indices):
+                """Per-segment stats with mean, std, and per-env distribution."""
+                # Collect per-env per-segment values for distribution analysis
+                per_env_seg_abs = [
+                    [] for _ in range(N_SEG)
+                ]  # |adv| mean per env per seg
+                per_env_seg_v = [[] for _ in range(N_SEG)]
+                per_env_seg_delta = [[] for _ in range(N_SEG)]
+                per_env_seg_adv = [[] for _ in range(N_SEG)]
+
+                for env_idx in env_indices:
+                    env_mask = loss_mask[:, env_idx]
+                    active = env_mask.sum().item()
+                    if active < N_SEG:
+                        continue
+                    active_idx = env_mask.nonzero(as_tuple=True)[0]
+                    seg_size = len(active_idx) // N_SEG
+                    for s in range(N_SEG):
+                        start = s * seg_size
+                        end = (s + 1) * seg_size if s < N_SEG - 1 else len(active_idx)
+                        idx = active_idx[start:end]
+                        adv_seg = advantages[idx, env_idx]
+                        val_seg = values[idx, env_idx]
+                        r_seg = rewards[idx, env_idx]
+                        v_next = values[idx + 1, env_idx]
+                        d_next = dones[idx + 1, env_idx].float()
+                        delta_seg = r_seg + gamma * v_next * (1 - d_next) - val_seg
+
+                        per_env_seg_adv[s].append(adv_seg.mean().item())
+                        per_env_seg_abs[s].append(adv_seg.abs().mean().item())
+                        per_env_seg_v[s].append(val_seg.mean().item())
+                        per_env_seg_delta[s].append(delta_seg.abs().mean().item())
+
+                n_env = len(per_env_seg_abs[0]) if per_env_seg_abs[0] else 0
+                result = {}
+                for s in range(N_SEG):
+                    if not per_env_seg_abs[s]:
+                        result[s] = {
+                            "adv": 0,
+                            "abs": 0,
+                            "abs_std": 0,
+                            "abs_p90": 0,
+                            "v": 0,
+                            "v_std": 0,
+                            "delta": 0,
+                        }
+                        continue
+                    import numpy as _np
+
+                    abs_arr = _np.array(per_env_seg_abs[s])
+                    adv_arr = _np.array(per_env_seg_adv[s])
+                    v_arr = _np.array(per_env_seg_v[s])
+                    d_arr = _np.array(per_env_seg_delta[s])
+                    result[s] = {
+                        "adv": float(adv_arr.mean()),
+                        "abs": float(abs_arr.mean()),
+                        "abs_std": float(abs_arr.std()),
+                        "abs_p90": float(_np.percentile(abs_arr, 90)),
+                        "v": float(v_arr.mean()),
+                        "v_std": float(v_arr.std()),
+                        "delta": float(d_arr.mean()),
+                    }
+                return result, n_env
+
+            print(
+                f"[adv-diag] envs={n_succ}S/{n_fail}F, V_mean={v_mean:.4f}, "
+                f"succ: steps={succ_active:.0f} adv_mean={succ_mean:+.4f} |adv|_sum={succ_abs_sum:.2f}, "
+                f"fail: steps={fail_active:.0f} adv_mean={fail_mean:+.4f} |adv|_sum={fail_abs_sum:.2f}"
+                f"{rw_str}"
+            )
+
+            if fail_envs.any():
+                f_idx = fail_envs.nonzero(as_tuple=True)[0].tolist()
+                fr, fn = _segment_stats(f_idx)
+                parts = [
+                    f"{seg_labels[s]}:adv={fr[s]['adv']:+.4f}|adv|={fr[s]['abs']:.4f}±{fr[s]['abs_std']:.4f}"
+                    f"(p90={fr[s]['abs_p90']:.4f})V={fr[s]['v']:.4f}±{fr[s]['v_std']:.4f}|δ|={fr[s]['delta']:.4f}"
+                    for s in range(N_SEG)
+                ]
+                print(f"[adv-probe-fail] n={fn}, " + ", ".join(parts))
+
+            # Success segment probe omitted — focus on failure tail analysis
+        except Exception:
+            pass
 
     if normalize_advantages:
         advantages = safe_normalize(advantages, loss_mask=loss_mask)

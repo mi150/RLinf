@@ -341,6 +341,7 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    loss_mask: torch.Tensor = None  # [B, num_action_chunks] optional, for v17
 
     def __post_init__(self):
         if self.actions is not None:
@@ -361,6 +362,8 @@ class ChunkStepResult:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
             self.versions = self.versions.cpu().contiguous()
+        if self.loss_mask is not None:
+            self.loss_mask = self.loss_mask.cpu().contiguous()
 
 
 @dataclass
@@ -380,6 +383,7 @@ class Trajectory:
     prev_logprobs: torch.Tensor = None
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
+    loss_mask: torch.Tensor = None  # [T, B, num_action_chunks] optional, for v17
     forward_inputs: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
@@ -529,6 +533,10 @@ class EmbodiedRolloutResult:
         default_factory=list
     )  # trajectory_length
 
+    loss_mask: list[torch.Tensor] = field(
+        default_factory=list
+    )  # trajectory_length, optional for v17
+
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
@@ -554,6 +562,8 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.loss_mask is not None:
+            self.loss_mask.append(result.loss_mask)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -655,6 +665,8 @@ class EmbodiedRolloutResult:
             )
         if len(self.versions) > 0:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
+        if len(self.loss_mask) > 0:
+            trajectory.loss_mask = torch.stack(self.loss_mask, dim=0).cpu().contiguous()
         if len(self.forward_inputs) > 0:
             trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
             for key in trajectory.forward_inputs.keys():

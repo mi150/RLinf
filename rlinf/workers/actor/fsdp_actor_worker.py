@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import sys
 import time
 from functools import partial
 from typing import Optional
@@ -995,6 +996,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
+
+        # Fix global RNG for reproducibility (per-rank seed)
+        import random
+
+        _seed = cfg.actor.seed + self._rank
+        random.seed(_seed)
+        np.random.seed(_seed)
+        torch.manual_seed(_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_seed)
+
         self._env_group_name = cfg.env.group_name
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -1118,7 +1130,92 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
+        v17_enabled = self.cfg.env.train.get("v17_continuous_collect", {}).get(
+            "enabled", False
+        )
+        if v17_enabled:
+            # v17: loss_mask already provided by env_worker (from v17_epoch_mask).
+            # GAE handles episode boundaries via dones.
+            # Compute per-episode loss_mask_sum for masked_mean_ratio compensation
+            # (same as baseline: short success episodes get amplified loss).
+            lm = rollout_batch.get("loss_mask", None)
+            dones = rollout_batch.get("dones", None)
+            rewards = rollout_batch.get("rewards", None)
+
+            if lm is not None and dones is not None:
+                T_lm, B, C = lm.shape  # [T, B, num_action_chunks]
+                dones_main = dones[:T_lm]  # [T, B, C]
+
+                # Match baseline: chunk_level reduces loss_mask to [T, B, 1]
+                if self.cfg.algorithm.reward_type == "chunk_level":
+                    lm = lm.any(dim=-1, keepdim=True)  # [T, B, 5] → [T, B, 1]
+                    rollout_batch["loss_mask"] = lm
+
+                # Build per-step loss_mask_sum: for each step, the total valid action steps
+                # in the episode it belongs to. Scan per env using dones as episode boundary.
+                # Note: lm is chunk-level [T, B, 1], but max_episode_steps is in action steps,
+                # so multiply by num_action_chunks to match units.
+                num_ac = self.cfg.actor.model.num_action_chunks
+                loss_mask_sum = torch.zeros_like(lm, dtype=torch.float32)  # [T, B, C]
+                for ei in range(B):
+                    ep_start = 0
+                    for t in range(T_lm):
+                        if dones_main[t, ei, -1] and lm[t, ei, -1]:
+                            # End of a valid episode: count valid chunks × num_action_chunks
+                            ep_chunks = (
+                                lm[ep_start : t + 1, ei].float().sum(dim=0)
+                            )  # [C]
+                            ep_action_steps = (
+                                ep_chunks * num_ac
+                            )  # convert to action steps
+                            loss_mask_sum[ep_start : t + 1, ei] = (
+                                ep_action_steps.unsqueeze(0)
+                            )
+                            ep_start = t + 1
+                        elif dones_main[t, ei, -1] and not lm[t, ei, -1]:
+                            # Done but masked (incomplete/dummy) — skip, start new episode
+                            ep_start = t + 1
+
+                # Avoid division by zero in masked_mean_ratio: set loss_mask_sum=max_episode_steps
+                # for masked positions (they won't contribute to loss anyway, ratio=1.0).
+                max_ep_steps = float(self.cfg.env.train.max_episode_steps)
+                loss_mask_sum = torch.where(
+                    loss_mask_sum == 0,
+                    torch.full_like(loss_mask_sum, max_ep_steps),
+                    loss_mask_sum,
+                )
+                rollout_batch["loss_mask_sum"] = loss_mask_sum
+
+                # Diagnostic logging
+                valid = lm.sum().item()
+                total = lm.numel()
+                ep_ends = dones_main[:, :, -1] & lm[:, :, -1]
+                n_valid_eps = ep_ends.sum().item()
+                # Per-episode length stats from loss_mask_sum (now in action steps)
+                ep_lens = loss_mask_sum[:, :, -1][ep_ends].tolist()
+                avg_ep_len = sum(ep_lens) / len(ep_lens) if ep_lens else 0
+                # Per-episode compensation stats
+                ratios = [l / max_ep_steps for l in ep_lens if l > 0]
+                n_compensated = sum(1 for r in ratios if r < 1.0)
+                avg_ratio = sum(ratios) / len(ratios) if ratios else 0
+                min_ratio = min(ratios) if ratios else 0
+                print(
+                    f"[v17-actor] shapes: rewards={rewards.shape}, dones={dones.shape}, "
+                    f"loss_mask={lm.shape}"
+                )
+                print(
+                    f"[v17-actor] valid={valid}/{total} ({100 * valid / total:.1f}%), "
+                    f"valid_episodes={int(n_valid_eps)}, avg_ep_len={avg_ep_len:.1f}/{max_ep_steps:.0f} steps"
+                )
+                print(
+                    f"[v17-actor] compensation: {n_compensated}/{int(n_valid_eps)} eps need amplify, "
+                    f"avg_ratio={avg_ratio:.3f}, min_ratio={min_ratio:.3f} "
+                    f"(amplify up to {1 / min_ratio:.1f}x)"
+                    if min_ratio > 0
+                    else ""
+                )
+                sys.stdout.flush()
+        elif (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
         ):
@@ -1201,6 +1298,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "failure_reweight": self.cfg.algorithm.get("failure_reweight", False),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
