@@ -91,7 +91,7 @@ env:
     task_ids_filter: [0]
     collect_probe_data:
       enabled: true
-      save_dir: "/workspace/RLinf/rollouts/libero10_task0_probe_base"
+      save_dir: "rollouts/libero10_task0_probe_base"
       max_episodes: 80  # per GPU, 80 x 4 = 320 total (> 200 needed)
   eval:
     total_num_envs: 48
@@ -113,7 +113,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/workspace/RLinf/checkpoints/RLinf-Gr00t-SFT-10"
+    model_path: "/path/to/model/RLinf-Gr00t-SFT-Long"  # https://huggingface.co/RLinf/RLinf-Gr00t-SFT-Long
     precision: ${actor.model.precision}
 
 actor:
@@ -125,7 +125,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/workspace/RLinf/checkpoints/RLinf-Gr00t-SFT-10"
+    model_path: "/path/to/model/RLinf-Gr00t-SFT-Long"  # https://huggingface.co/RLinf/RLinf-Gr00t-SFT-Long
     model_type: "gr00t"
     add_value_head: True
 
