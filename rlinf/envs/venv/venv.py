@@ -30,7 +30,11 @@ from rlinf.envs.chunk_runner import stack_vector_chunk_returns
 from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
     get_env_core_group_from_env,
+    parse_env_cpu_core_groups,
 )
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
 
 gym_old_venv_step_type = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 gym_new_venv_step_type = tuple[
@@ -108,6 +112,12 @@ class EnvWorker(ABC):
     @abstractmethod
     def set_env_attr(self, key: str, value: Any) -> None:
         pass
+
+    def set_cpu_affinity(self, cpus: tuple[int, ...]) -> None:
+        raise NotImplementedError
+
+    def get_cpu_affinity(self) -> tuple[int, ...]:
+        raise NotImplementedError
 
     def send(self, action: Optional[np.ndarray]) -> None:
         """Send action signal to low-level worker.
@@ -275,6 +285,11 @@ def _worker(
                     )
                 env_returns = [env.step(action) for action in data]
                 p.send(tuple(zip(*env_returns)))
+            elif cmd == "set_cpu_affinity":
+                apply_process_cpu_affinity(tuple(data))
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
+            elif cmd == "get_cpu_affinity":
+                p.send(tuple(sorted(os.sched_getaffinity(0))))
             elif cmd == "reset":
                 retval = env.reset(**data)
                 reset_returns_info = (
@@ -338,6 +353,14 @@ class DummyEnvWorker(EnvWorker):
     def set_env_attr(self, key: str, value: Any) -> None:
         setattr(self.env.unwrapped, key, value)
 
+    def set_cpu_affinity(self, cpus: tuple[int, ...]) -> None:
+        _ = cpus
+
+    def get_cpu_affinity(self) -> tuple[int, ...]:
+        if not hasattr(os, "sched_getaffinity"):
+            return ()
+        return tuple(sorted(os.sched_getaffinity(0)))
+
     def reset(self, **kwargs: Any) -> Union[np.ndarray, tuple[np.ndarray, dict]]:
         if "seed" in kwargs:
             super().seed(kwargs["seed"])
@@ -399,6 +422,7 @@ class SubprocEnvWorker(EnvWorker):
         self.parent_remote, self.child_remote = Pipe()
         self.share_memory = share_memory
         self.buffer: Optional[Union[dict, tuple, ShArray]] = None
+        self._cpu_affinity = get_env_core_group_from_env(os.environ, local_env_index)
         if self.share_memory:
             dummy = env_fn()
             obs_space = dummy.observation_space
@@ -423,6 +447,17 @@ class SubprocEnvWorker(EnvWorker):
 
     def set_env_attr(self, key: str, value: Any) -> None:
         self.parent_remote.send(["setattr", {"key": key, "value": value}])
+
+    def set_cpu_affinity(self, cpus: tuple[int, ...]) -> None:
+        cpus = tuple(cpus)
+        if self._cpu_affinity == cpus:
+            return
+        self.parent_remote.send(["set_cpu_affinity", cpus])
+        self._cpu_affinity = tuple(self.parent_remote.recv())
+
+    def get_cpu_affinity(self) -> tuple[int, ...]:
+        self.parent_remote.send(["get_cpu_affinity", None])
+        return tuple(self.parent_remote.recv())
 
     def _decode_obs(self) -> Union[dict, tuple, np.ndarray]:
         def decode_obs(
@@ -645,6 +680,11 @@ class BaseVectorEnv(object):
         # all environments are ready in the beginning
         self.ready_id = list(range(self.env_num))
         self.is_closed = False
+        self._balanced_pair_predicted_latency_s: list[float] | None = None
+        self._env_cpu_core_groups = parse_env_cpu_core_groups(
+            os.environ.get("RLINF_ENV_CPU_CORE_GROUPS", "")
+        )
+        self._balanced_pair_logged = False
 
     def _assert_is_not_closed(self) -> None:
         assert not self.is_closed, (
@@ -888,6 +928,176 @@ class BaseVectorEnv(object):
             self.workers[j].send_chunk_step(chunk_action[i])
         env_results = [self.workers[j].recv() for j in id]
         return stack_vector_chunk_returns(env_results)
+
+    def latency_balanced_pair_chunk_step(
+        self,
+        chunk_action: np.ndarray,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+        *,
+        envs_per_core: int = 2,
+        ema_alpha: float = 0.3,
+        initial_latency_ms: Optional[float] = None,
+        dynamic_affinity: bool = True,
+    ) -> tuple[list[Any], ...]:
+        """Run local chunks with latency-balanced core-slot pairing.
+
+        The scheduler is local to this vector env. It groups envs into fixed-size
+        slots, puts slow and fast envs together by EMA latency, optionally binds
+        all envs in a slot to the same CPU core group, and executes one env per
+        slot at a time. Results are restored to the input env order.
+        """
+        self._assert_is_not_closed()
+        id = list(self._wrap_id(id))
+        if self.is_async:
+            self._assert_id(id)
+        assert len(chunk_action) == len(id)
+        if len(id) == 0:
+            raise ValueError(
+                "latency_balanced_pair_chunk_step requires at least one env"
+            )
+
+        chunk_size = int(chunk_action.shape[1])
+        if chunk_size <= 0:
+            raise ValueError(
+                f"chunk_action must contain at least one step, got {chunk_size}"
+            )
+
+        envs_per_core = int(envs_per_core)
+        if envs_per_core < 1 or envs_per_core > len(id):
+            raise ValueError(
+                "envs_per_core must be in [1, local env count], "
+                f"got envs_per_core={envs_per_core}, local env count={len(id)}"
+            )
+        if len(id) % envs_per_core != 0:
+            raise ValueError(
+                f"local env count({len(id)}) must be divisible by "
+                f"envs_per_core({envs_per_core})"
+            )
+        if not 0.0 < float(ema_alpha) <= 1.0:
+            raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
+
+        initial_latency = (
+            float(initial_latency_ms) / 1000.0
+            if initial_latency_ms is not None
+            else 1.0
+        )
+        if initial_latency <= 0.0:
+            raise ValueError(
+                "initial_latency_ms must be positive when set, "
+                f"got {initial_latency_ms}"
+            )
+        if (
+            self._balanced_pair_predicted_latency_s is None
+            or len(self._balanced_pair_predicted_latency_s) != self.env_num
+        ):
+            self._balanced_pair_predicted_latency_s = [
+                initial_latency for _ in range(self.env_num)
+            ]
+
+        slot_count = len(id) // envs_per_core
+        pair_groups = self._build_latency_balanced_groups(id, envs_per_core)
+        if dynamic_affinity and self._env_cpu_core_groups:
+            slot_cpu_core_groups = self._get_slot_cpu_core_groups(slot_count)
+            if len(slot_cpu_core_groups) < slot_count:
+                raise ValueError(
+                    "latency_balanced_pair needs at least one CPU core group per "
+                    f"slot, got {len(slot_cpu_core_groups)} groups for "
+                    f"{slot_count} slots"
+                )
+            for slot_index, group in enumerate(pair_groups):
+                core_group = slot_cpu_core_groups[slot_index]
+                for local_pos in group:
+                    self.workers[id[local_pos]].set_cpu_affinity(core_group)
+        if not self._balanced_pair_logged:
+            self._balanced_pair_logged = True
+            logger.info(
+                "latency_balanced_pair enabled: local_envs=%s, envs_per_core=%s, "
+                "slot_count=%s, cpu_groups=%s, first_groups=%s",
+                len(id),
+                envs_per_core,
+                slot_count,
+                len(self._env_cpu_core_groups),
+                self._env_cpu_core_groups[: min(8, len(self._env_cpu_core_groups))],
+            )
+
+        env_step_results: list[Any | None] = [None for _ in id]
+        for env_offset in range(envs_per_core):
+            in_flight: dict[EnvWorker, tuple[int, float]] = {}
+            for group in pair_groups:
+                if env_offset >= len(group):
+                    continue
+                local_pos = group[env_offset]
+                env_id = id[local_pos]
+                worker = self.workers[env_id]
+                worker.send_chunk_step(chunk_action[local_pos])
+                in_flight[worker] = (local_pos, time.perf_counter())
+
+            while in_flight:
+                ready_workers = self.worker_class.wait(
+                    list(in_flight), 1, self.timeout
+                )
+                if not ready_workers:
+                    continue
+                for worker in ready_workers:
+                    local_pos, start_time = in_flight.pop(worker)
+                    env_step_results[local_pos] = worker.recv()
+                    actual_latency = max(time.perf_counter() - start_time, 0.0)
+                    env_id = id[local_pos]
+                    old_latency = self._balanced_pair_predicted_latency_s[env_id]
+                    self._balanced_pair_predicted_latency_s[env_id] = (
+                        float(ema_alpha) * actual_latency
+                        + (1.0 - float(ema_alpha)) * old_latency
+                    )
+
+        env_results = [result for result in env_step_results if result is not None]
+        if len(env_results) != len(id):
+            raise RuntimeError("latency-balanced pair chunk_step missed env results")
+        return stack_vector_chunk_returns(env_results)
+
+    def _get_slot_cpu_core_groups(
+        self, slot_count: int
+    ) -> tuple[tuple[int, ...], ...]:
+        unique_groups: list[tuple[int, ...]] = []
+        seen_groups: set[tuple[int, ...]] = set()
+        for group in self._env_cpu_core_groups:
+            if group in seen_groups:
+                continue
+            unique_groups.append(group)
+            seen_groups.add(group)
+            if len(unique_groups) == slot_count:
+                return tuple(unique_groups)
+        return self._env_cpu_core_groups[:slot_count]
+
+    def _build_latency_balanced_groups(
+        self, env_ids: list[int], envs_per_core: int
+    ) -> list[list[int]]:
+        if self._balanced_pair_predicted_latency_s is None:
+            raise RuntimeError("latency predictions are not initialized")
+        slot_count = len(env_ids) // envs_per_core
+        groups: list[list[int]] = [[] for _ in range(slot_count)]
+        loads = [0.0 for _ in range(slot_count)]
+        local_positions = list(range(len(env_ids)))
+        local_positions.sort(
+            key=lambda pos: (
+                -self._balanced_pair_predicted_latency_s[env_ids[pos]],
+                pos,
+            )
+        )
+
+        for local_pos in local_positions:
+            target_slot = min(
+                (
+                    slot
+                    for slot in range(slot_count)
+                    if len(groups[slot]) < envs_per_core
+                ),
+                key=lambda slot: (loads[slot], len(groups[slot]), slot),
+            )
+            groups[target_slot].append(local_pos)
+            loads[target_slot] += self._balanced_pair_predicted_latency_s[
+                env_ids[local_pos]
+            ]
+        return groups
 
     def seed(
         self,

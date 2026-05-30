@@ -96,8 +96,6 @@ class ResourcePoolSolver:
                 core_owners[key] = pool_name
 
     def _component_local_env_count(self, worker_count: int) -> int:
-        stage_num = int(self.cfg.rollout.get("pipeline_stage_num", 1))
-        _ = stage_num
         if bool(getattr(self.cfg.runner, "only_eval", False)):
             total_envs = int(self.cfg.env.eval.total_num_envs)
         else:
@@ -105,6 +103,24 @@ class ResourcePoolSolver:
         if total_envs % worker_count != 0:
             raise ValueError("env total_num_envs must be divisible by env worker count")
         return total_envs // worker_count
+
+    def _component_pipeline_stage_num(self) -> int:
+        return int(self.cfg.rollout.get("pipeline_stage_num", 1))
+
+    def _component_envs_per_core(self) -> int:
+        if bool(getattr(self.cfg.runner, "only_eval", False)):
+            env_cfg = self.cfg.env.eval
+        else:
+            env_cfg = self.cfg.env.train
+        pair_cfg = env_cfg.get("latency_balanced_pair", {})
+        return int(pair_cfg.get("envs_per_core", 2))
+
+    def _component_uses_latency_balanced_pair(self) -> bool:
+        if bool(getattr(self.cfg.runner, "only_eval", False)):
+            env_cfg = self.cfg.env.eval
+        else:
+            env_cfg = self.cfg.env.train
+        return env_cfg.get("chunk_step_mode", None) == "latency_balanced_pair"
 
     def _solve_component(self, component: str) -> list[WorkerResourceBinding]:
         strategy = self.component_placement.get_strategy(component)
@@ -155,6 +171,16 @@ class ResourcePoolSolver:
             if request.granularity == "per_env"
             else 0
         )
+        envs_per_core = (
+            self._component_envs_per_core()
+            if component == "env" and request.granularity == "per_env"
+            else 1
+        )
+        use_latency_balanced_pair = (
+            self._component_uses_latency_balanced_pair()
+            if component == "env" and request.granularity == "per_env"
+            else False
+        )
         for node_rank in sorted(placements_by_node):
             node_placements = sorted(
                 placements_by_node[node_rank], key=lambda placement: placement.rank
@@ -171,10 +197,34 @@ class ResourcePoolSolver:
                         raise ValueError(
                             "per_env CPU binding is only valid for env component"
                         )
-                    env_cpu_core_groups = build_even_split_cpu_groups(
-                        process_cpu_cores,
-                        local_env_count,
-                    )
+                    if use_latency_balanced_pair:
+                        stage_num = self._component_pipeline_stage_num()
+                        if local_env_count % stage_num != 0:
+                            raise ValueError(
+                                "local env count must be divisible by "
+                                "pipeline_stage_num"
+                            )
+                        per_stage_env_count = local_env_count // stage_num
+                        if per_stage_env_count % envs_per_core != 0:
+                            raise ValueError(
+                                "per-stage local env count must be divisible by "
+                                "envs_per_core"
+                            )
+                        slot_count = per_stage_env_count // envs_per_core
+                        slot_cpu_core_groups = build_even_split_cpu_groups(
+                            process_cpu_cores,
+                            slot_count,
+                        )
+                        env_cpu_core_groups = tuple(
+                            slot_cpu_core_groups[index % slot_count]
+                            for _stage in range(stage_num)
+                            for index in range(per_stage_env_count)
+                        )
+                    else:
+                        env_cpu_core_groups = build_even_split_cpu_groups(
+                            process_cpu_cores,
+                            local_env_count,
+                        )
                     process_cpu_cores = effective_process_affinity(env_cpu_core_groups)
                 bindings[int(placement.rank)] = CpuBinding(
                     process_cpu_cores=process_cpu_cores,
@@ -190,15 +240,20 @@ class ResourcePoolSolver:
             return None
 
         request = self.pool_cfg.gpu.components[component]
-        if request.sm_percent == 0:
-            return None
-
         pool = self.pool_cfg.gpu.pools[request.pool]
         if placement.node_group_label != pool.node_group:
             raise ValueError(
                 f"GPU pool '{request.pool}' is scoped to node group "
                 f"'{pool.node_group}', but {component}:{placement.rank} is on "
                 f"'{placement.node_group_label}'"
+            )
+
+        if request.sm_percent == 0:
+            return GpuBinding(
+                mode="mps",
+                sm_percent=0,
+                visible_devices=tuple(placement.visible_accelerators),
+                parent_gpu=placement.local_accelerator_rank,
             )
 
         if self.pool_cfg.gpu.mode == "mps":

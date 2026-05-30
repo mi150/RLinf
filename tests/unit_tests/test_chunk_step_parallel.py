@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from rlinf.envs.chunk_runner import (
+    CHUNK_STEP_MODES,
     build_chunk_done_outputs,
     select_local_chunk_actions,
     split_env_indices,
@@ -96,6 +97,10 @@ def test_split_env_indices_rejects_too_many_shards():
         split_env_indices(2, 3)
 
 
+def test_latency_balanced_pair_mode_is_registered():
+    assert "latency_balanced_pair" in CHUNK_STEP_MODES
+
+
 def test_build_chunk_done_outputs_collapses_to_last_step():
     raw_terminations = torch.tensor(
         [[False, True, False], [False, False, False]]
@@ -168,3 +173,52 @@ def test_subproc_vector_env_chunk_step_dispatches_before_recv():
         for step_infos in infos_list
         for info in step_infos
     )
+
+
+def test_subproc_vector_env_latency_balanced_pair_restores_step_major_shape():
+    env = SubprocVectorEnv([lambda i=i: CountingEnv(i) for i in range(4)])
+    chunk_actions = np.array([[[1], [2]], [[3], [4]], [[5], [6]], [[7], [8]]])
+
+    try:
+        obs_list, rewards_list, dones_list, infos_list = (
+            env.latency_balanced_pair_chunk_step(
+                chunk_actions,
+                envs_per_core=2,
+                ema_alpha=0.5,
+                dynamic_affinity=False,
+            )
+        )
+    finally:
+        env.close()
+
+    assert len(obs_list) == 2
+    assert obs_list[0].tolist() == [[0, 1, 1], [1, 1, 3], [2, 1, 5], [3, 1, 7]]
+    assert obs_list[1].tolist() == [[0, 2, 2], [1, 2, 4], [2, 2, 6], [3, 2, 8]]
+    assert rewards_list[0].tolist() == [1.0, 13.0, 25.0, 37.0]
+    assert rewards_list[1].tolist() == [2.0, 14.0, 26.0, 38.0]
+    assert dones_list[0].tolist() == [False, False, False, False]
+    assert infos_list[1][3]["local_step"] == 2
+    assert infos_list[1][3]["action"] == 8
+
+
+def test_latency_balanced_pair_rejects_invalid_group_size():
+    env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(2)])
+    chunk_actions = np.array([[[1]], [[2]]])
+
+    try:
+        with pytest.raises(ValueError, match="envs_per_core"):
+            env.latency_balanced_pair_chunk_step(chunk_actions, envs_per_core=3)
+    finally:
+        env.close()
+
+
+def test_latency_balanced_pair_groups_slow_and_fast_envs():
+    env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(4)])
+    env._balanced_pair_predicted_latency_s = [10.0, 1.0, 8.0, 2.0]
+
+    try:
+        groups = env._build_latency_balanced_groups([0, 1, 2, 3], envs_per_core=2)
+    finally:
+        env.close()
+
+    assert groups == [[0, 1], [2, 3]]

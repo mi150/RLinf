@@ -685,6 +685,8 @@ class LiberoEnv(gym.Env):
         )
 
     def chunk_step(self, chunk_actions):
+        if self.chunk_step_mode == "latency_balanced_pair":
+            return self._chunk_step_latency_balanced_pair(chunk_actions)
         if self.chunk_step_mode == "parallel_shard":
             return self._chunk_step_parallel_shard(chunk_actions)
         return self._chunk_step_sync_time_major(chunk_actions)
@@ -756,6 +758,85 @@ class LiberoEnv(gym.Env):
             terminations_list,
             info_lists_list,
         ) = self.env.chunk_step(chunk_actions)
+
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for raw_obs, terminations, info_lists in zip(
+            raw_obs_list, terminations_list, info_lists_list
+        ):
+            self._elapsed_steps += 1
+            self.current_raw_obs = raw_obs
+            infos = list_of_dict_to_dict_of_list(info_lists)
+            terminations = np.asarray(terminations).astype(bool)
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            obs = self._wrap_obs(raw_obs)
+
+            step_reward = self._calc_step_reward(terminations)
+            infos = self._record_metrics(step_reward, terminations, infos)
+            if self.ignore_terminations:
+                infos["episode"]["success_at_end"] = to_tensor(terminations)
+                terminations[:] = False
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(to_tensor(step_reward))
+            raw_chunk_terminations.append(to_tensor(terminations))
+            raw_chunk_truncations.append(to_tensor(truncations))
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        raw_chunk_terminations = maybe_apply_ignore_terminations(
+            raw_chunk_terminations, self.ignore_terminations
+        )
+        (
+            chunk_terminations,
+            chunk_truncations,
+            past_terminations,
+            past_truncations,
+            past_dones,
+        ) = build_chunk_done_outputs(
+            raw_chunk_terminations,
+            raw_chunk_truncations,
+            collapse_to_last_step=self.auto_reset or self.ignore_terminations,
+        )
+
+        if past_dones.any() and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+            )
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _chunk_step_latency_balanced_pair(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        pair_cfg = self.cfg.get("latency_balanced_pair", {})
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.latency_balanced_pair_chunk_step(
+            chunk_actions,
+            envs_per_core=int(pair_cfg.get("envs_per_core", 2)),
+            ema_alpha=float(pair_cfg.get("ema_alpha", 0.3)),
+            initial_latency_ms=pair_cfg.get("initial_latency_ms", None),
+            dynamic_affinity=bool(pair_cfg.get("dynamic_affinity", True)),
+        )
 
         obs_list = []
         infos_list = []

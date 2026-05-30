@@ -14,7 +14,9 @@
 
 import asyncio
 import gc
+import json
 import os
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -99,6 +101,17 @@ class EnvWorker(Worker):
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         train_env_cfg = self.cfg.env.get("train", None)
         eval_env_cfg = self.cfg.env.eval
+        self.log_sim_timestamps = bool(
+            train_env_cfg.get("log_sim_timestamps", False)
+            if train_env_cfg is not None
+            else False
+        )
+        self.log_sim_affinity_interval = int(
+            train_env_cfg.get("log_sim_affinity_interval", 0)
+            if train_env_cfg is not None
+            else 0
+        )
+        self._sim_timestamp_file = None
         self.enable_offload = (
             train_env_cfg.get("enable_offload", False)
             if train_env_cfg is not None
@@ -147,6 +160,7 @@ class EnvWorker(Worker):
 
         self.log_info(f"Env worker initialized with dst_rank_map: {self.dst_rank_map}")
         self.log_info(f"Env worker initialized with src_rank_map: {self.src_rank_map}")
+        self._log_cpu_binding_status("before env setup")
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -174,12 +188,109 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+            self._log_cpu_binding_status("after train env setup")
+            self._validate_child_cpu_affinity()
             if self.reward_mode == "history_buffer":
                 self.train_history_managers = [
                     HistoryManager(self.cfg.reward, self.train_num_envs_per_stage)
                     for _ in range(self.stage_num)
                 ]
                 self.history_lengths = [{} for _ in range(self.stage_num)]
+
+    def _log_cpu_binding_status(self, phase: str) -> None:
+        binding = getattr(self, "_resource_binding", None)
+        if binding is None or binding.cpu is None:
+            return
+        process_affinity = (
+            tuple(sorted(os.sched_getaffinity(0)))
+            if hasattr(os, "sched_getaffinity")
+            else ()
+        )
+        env_groups = binding.cpu.env_cpu_core_groups
+        msg = (
+            f"Env CPU binding {phase}: process_cpu_cores="
+            f"{binding.cpu.process_cpu_cores}, process_affinity={process_affinity}, "
+            f"env_cpu_group_count={len(env_groups)}, "
+            f"first_env_cpu_groups={env_groups[: min(8, len(env_groups))]}"
+        )
+        child_affinities = self._collect_child_cpu_affinities(limit=8)
+        if child_affinities:
+            msg += f", first_child_affinities={child_affinities}"
+        self.log_info(msg)
+
+    def _collect_child_cpu_affinities(self, limit: int) -> list[tuple[int, tuple[int, ...]]]:
+        child_affinities: list[tuple[int, tuple[int, ...]]] = []
+        for env in self.env_list:
+            for local_index, worker in enumerate(self._iter_env_subworkers(env)):
+                if len(child_affinities) >= limit:
+                    return child_affinities
+                if not hasattr(worker, "get_cpu_affinity"):
+                    continue
+                child_affinities.append((local_index, worker.get_cpu_affinity()))
+        return child_affinities
+
+    def _write_sim_timestamp_event(self, event: dict[str, Any]) -> None:
+        if self._sim_timestamp_file is None:
+            output_dir = os.path.join(
+                str(self.cfg.runner.logger.log_path), "env_sim_timestamps"
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"env_rank_{self._rank}.jsonl")
+            self._sim_timestamp_file = open(path, "a", encoding="utf-8", buffering=1)
+        self._sim_timestamp_file.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def _iter_env_subworkers(self, env) -> list[Any]:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            workers = getattr(current, "workers", None)
+            if workers is not None:
+                return list(workers)
+            current = getattr(current, "env", None)
+        return []
+
+    def _validate_child_cpu_affinity(self) -> None:
+        binding = getattr(self, "_resource_binding", None)
+        if binding is None or binding.cpu is None:
+            return
+        expected_process_cores = tuple(binding.cpu.process_cpu_cores)
+        if expected_process_cores and hasattr(os, "sched_getaffinity"):
+            actual_process_cores = tuple(sorted(os.sched_getaffinity(0)))
+            if actual_process_cores != expected_process_cores:
+                raise RuntimeError(
+                    "EnvWorker CPU affinity mismatch: expected "
+                    f"{expected_process_cores}, got {actual_process_cores}"
+                )
+
+        expected_groups = tuple(binding.cpu.env_cpu_core_groups)
+        if not expected_groups:
+            return
+        checked_count = 0
+        mismatches = []
+        for env in self.env_list:
+            for worker in self._iter_env_subworkers(env):
+                if checked_count >= len(expected_groups):
+                    break
+                if not hasattr(worker, "get_cpu_affinity"):
+                    checked_count += 1
+                    continue
+                expected = tuple(expected_groups[checked_count])
+                actual = tuple(worker.get_cpu_affinity())
+                if actual != expected:
+                    mismatches.append((checked_count, expected, actual))
+                checked_count += 1
+        if checked_count != len(expected_groups):
+            raise RuntimeError(
+                "Env CPU binding validation checked "
+                f"{checked_count} envs, expected {len(expected_groups)} envs"
+            )
+        if mismatches:
+            preview = mismatches[:8]
+            raise RuntimeError(
+                "Env subprocess CPU affinity mismatch. First mismatches: "
+                f"{preview}"
+            )
 
     def _validate_env_resource_binding_supported(self) -> None:
         binding = getattr(self, "_resource_binding", None)
@@ -478,7 +589,12 @@ class EnvWorker(Worker):
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
+        self,
+        chunk_actions: torch.Tensor,
+        stage_id: int,
+        *,
+        epoch: int | None = None,
+        chunk_step_idx: int | None = None,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -494,9 +610,56 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
+        log_sim_timestamps = self.log_sim_timestamps
+        process_affinity = ()
+        child_affinities = []
+        should_sample_child_affinity = (
+            self.log_sim_affinity_interval > 0
+            and chunk_step_idx is not None
+            and chunk_step_idx % self.log_sim_affinity_interval == 0
+        )
+        if log_sim_timestamps:
+            if hasattr(os, "sched_getaffinity"):
+                process_affinity = tuple(sorted(os.sched_getaffinity(0)))
+            if should_sample_child_affinity:
+                child_affinities = self._collect_child_cpu_affinities(limit=8)
+            wall_start_ns = time.time_ns()
+            perf_start = time.perf_counter()
+            self._write_sim_timestamp_event(
+                {
+                    "event": "start",
+                    "rank": self._rank,
+                    "pid": os.getpid(),
+                    "epoch": epoch,
+                    "chunk_step": chunk_step_idx,
+                    "stage": stage_id,
+                    "local_envs": self.train_num_envs_per_stage,
+                    "wall_ns": wall_start_ns,
+                    "process_affinity": process_affinity,
+                    "child_affinity_sample": child_affinities,
+                }
+            )
+
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        if log_sim_timestamps:
+            wall_end_ns = time.time_ns()
+            duration_s = time.perf_counter() - perf_start
+            self._write_sim_timestamp_event(
+                {
+                    "event": "end",
+                    "rank": self._rank,
+                    "pid": os.getpid(),
+                    "epoch": epoch,
+                    "chunk_step": chunk_step_idx,
+                    "stage": stage_id,
+                    "local_envs": self.train_num_envs_per_stage,
+                    "wall_ns": wall_end_ns,
+                    "duration_s": duration_s,
+                    "process_affinity": process_affinity,
+                }
+            )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -1187,7 +1350,10 @@ class EnvWorker(Worker):
                         )
 
                     env_output, env_info = self.env_interact_step(
-                        rollout_result.actions, stage_id
+                        rollout_result.actions,
+                        stage_id,
+                        epoch=epoch,
+                        chunk_step_idx=chunk_step_idx,
                     )
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
