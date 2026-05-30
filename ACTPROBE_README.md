@@ -24,6 +24,19 @@ mis-fire). Instead, the probe is **retrained from scratch every PPO step**,
 interleaved with the policy update, in a background thread so it doesn't block
 the rollout.
 
+**Update frequency.** Retraining runs every `online_update.interval` PPO steps
+(default **`interval: 1`**, i.e. once per PPO step) for `online_update.epochs`
+epochs each time (default **`epochs: 50`**). With `interval: 1` the probe is
+refreshed as often as the policy, which is what keeps it from drifting; raise
+`interval` if retrain wall-clock becomes a bottleneck (it runs in a background
+thread, so a single step's retrain overlaps the next rollout).
+
+**Warmup.** For the first `warmup_steps` PPO steps (default **`warmup_steps: 2`**)
+the probe is in warmup: it still extracts features, collects labeled episodes,
+and retrains — but it is **not allowed to cut** any env. This gives it a couple
+of steps of on-distribution data before its predictions are trusted to terminate
+rollouts. Cutting begins at step `warmup_steps + 1`.
+
 The loop each PPO step:
 
 1. **Collect labeled episodes during rollout.** As envs roll out, the probe
