@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-CHUNK_STEP_MODES = {"sync_time_major", "parallel_shard"}
+CHUNK_STEP_MODES = {"sync_time_major", "parallel_shard", "latency_balanced_pair"}
 
 
 @dataclass
