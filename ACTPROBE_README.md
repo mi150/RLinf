@@ -71,9 +71,25 @@ The loop each PPO step:
    data and is *not* allowed to cut — it needs a few steps of on-distribution
    data before its cuts are trustworthy.
 
+**Spare policy (don't cut every predicted failure).** ActProbe does **not** cut
+all envs the probe flags as failing. Each step, among the flagged-failure
+candidates it cuts only a fraction `cut_ratio` (default **`cut_ratio: 0.7`**) at
+random and **spares the rest** (they become *immune* and run to natural timeout).
+At least one candidate is always spared when there are enough.
+
+Why: PPO still needs to see **complete failure trajectories**. If every predicted
+failure were cut short (`cut_ratio = 1.0`), the policy-gradient batch would
+contain only truncated failures — biasing value/advantage estimates and removing
+the full failure signal the policy learns from. Sparing ~`1 - cut_ratio` of the
+flagged envs guarantees a steady fraction of intact failure rollouts in every PPO
+update, while still cutting the majority to save env interactions. The spared
+(immune) episodes also feed real, fully-labeled failures back into the probe's
+online retrain buffer.
+
 Net effect: the probe continuously chases the drifting policy, so its failure
 predictions stay calibrated throughout training, and the early-cuts keep saving
-env interactions as the policy improves.
+env interactions as the policy improves — while a controlled fraction of failures
+is always let through to keep PPO's gradient unbiased.
 
 Relevant config (`env.train.probe_cfg.online_update`): `interval`, `epochs`,
 `buffer_size`, `recent_steps`, `min_episodes`, `base_data_path`. Implementation:
@@ -137,6 +153,8 @@ In `libero_10_autoreset_actprobe_task0_8gpu.yaml` under `env.train.probe_cfg`:
 | `initial_tau` | starting cut threshold (recalibrated online) |
 | `warmup_steps` | PPO steps before cutting starts (probe still collects) |
 | `K`, `agg` | sliding-window size / aggregation for the cut decision |
+| `cut_ratio` | fraction of flagged-failure envs to actually cut; the rest are spared to keep failures in PPO (default 0.7) |
+| `min_cut_chunk` | earliest chunk in an episode the probe may cut (avoid cutting too early) |
 | `online_update.*` | online retrain: interval, epochs, buffer, recent_steps, base data |
 
 `env.train.v17_continuous_collect.target_trajectories` controls how many
