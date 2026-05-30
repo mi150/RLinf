@@ -1619,8 +1619,16 @@ class EnvWorker(Worker):
                         else -1
                     )
                     # Chunks saved by probe cut vs letting all fail envs timeout
-                    # Each probe_cut saved (48 - cut_len) chunks compared to full timeout
-                    max_chunks = 48
+                    # Each probe_cut saved (max_chunks - cut_len) chunks vs full timeout.
+                    # max_chunks = full-episode length in chunk units = the length a
+                    # natural timeout reaches (e.g. 480 env steps / 5 = 96 chunks).
+                    # Must be derived from config, not hardcoded: a wrong constant
+                    # (e.g. 48 while episodes are 96 chunks) makes `saved` go negative
+                    # whenever cuts land past that constant, inverting the metric's sign.
+                    max_chunks = (
+                        self.cfg.env.train.max_episode_steps
+                        // self.cfg.actor.model.num_action_chunks
+                    )
                     saved_chunks = sum(max_chunks - l for l in cut_lens)
                     potential_chunks = n_fail_total * max_chunks
                     pct_saved = (
