@@ -132,11 +132,63 @@ The collect config regenerates `merged_200eps.pkl` from your own SFT rollouts.
 
 ## Logged metrics
 
-Per PPO step the env worker logs:
+The probe is a **binary failure detector** (positive class = "this episode will
+fail"). Per PPO step (per env rank / `stage`) the env worker logs three lines,
+named with standard classifier terms. Counts are over the episodes that finished
+in that step; lengths are in **chunks** (1 chunk = `num_action_chunks` env steps,
+so a 480-step episode = 96 chunks).
+
+### `[actprobe]` — per-step summary
 ```
-[actprobe] succ=.. missed=.. cut=.. cut_rate=..% tau=.. saved=../..(..%)
-[actprobe-detail] immune_succ=..(fp) never_flagged_timeout=..(blind) flagged_succ=..(near_fp)
-[probe] retrain done ..s: tau=.. (p95+margin), loss=.., NS/NF (base+online)
+[actprobe] stage=N: success=.. timeout=.. cut=.. recall=..% precision=..% FPR=..% tau=..
+           avg_len: success=.. cut=.. timeout=.. saved=S/P(..%)
 ```
-Giving recall (cut + immune_timeout), blind (missed failures), false positives,
-and env-step savings.
+| field | meaning | how it's computed |
+|-------|---------|-------------------|
+| `success` | episodes that solved the task | count of `outcome == success` (real env termination) |
+| `timeout` | episodes that ran to natural timeout (not cut) | count of `outcome == timeout` (= spared-immune failures + never-flagged failures) |
+| `cut` | episodes the probe force-cut early | count of `outcome == probe_cut` |
+| **`recall`** | of all failures, the share the probe caught | `TP / (TP + FN)` (see `[actprobe-cm]`) |
+| **`precision`** | of flagged episodes, the share that really failed | `TP_immune / (TP_immune + FP_immune)`, measured on the **spared (immune)** set — see note below |
+| **`FPR`** | false-positive rate (winners wrongly flagged) | `FP / success` |
+| `tau` | current cut threshold | `min(P95(held-out success scores) + 0.02, 0.99)`, recalibrated from scratch each step (capped at 0.99) |
+| `avg_len` | mean episode length per group (chunks) | a natural timeout reaches `max_chunks = max_episode_steps / num_action_chunks` (= 96 here) |
+| **`saved = S/P (%)`** | env-step budget saved by cutting failures | `S = Σ_cut (max_chunks − cut_len)`, `P = (cut + timeout) × max_chunks`. Positive ⇒ fewer interactions. `max_chunks` is config-derived — do **not** hardcode it (a wrong constant inverts the sign) |
+
+### `[actprobe-cm]` — confusion matrix
+```
+[actprobe-cm] stage=N: TP=.. FP=.. FN=.. TN=..
+              [TP=cut(..)+immune_fail(..), FP=on_success_immune(..)+on_success_precut(..), FN=blind_timeout(..)]
+```
+| term | meaning | composition |
+|------|---------|-------------|
+| **TP** | flagged, and it was a failure | `cut` (assumed failures) + `immune_fail` (flagged-but-spared episodes that did time out — verified) |
+| **FP** | flagged, but it succeeded | `on_success_immune` (spared then succeeded) + `on_success_precut` (succeeded before the cut landed) |
+| **FN** | failed, but never flagged | `blind_timeout` |
+| **TN** | succeeded, never flagged | `success − FP` |
+
+**Why precision uses the immune set.** Cut episodes are terminated early, so their
+true success/failure is never observed — counting them as TP would be circular.
+ActProbe therefore **spares a random `1 − cut_ratio` of flagged envs** (they run to
+natural timeout). Because sparing is *random* among flagged episodes, the spared
+set is an unbiased sample, and its precision / FP rate is an unbiased estimate for
+the cut episodes too. `recall` and `FPR` count `cut` as caught-failures (the
+standard detection-rate convention); `precision` is reported on the immune set only.
+
+### `[probe] retrain done` — online retrain summary
+```
+[probe] retrain done ..s: tau=T (p95=..,max=..+0.02), loss=.., NS/NF (base=B+online=O)
+```
+| field | meaning |
+|-------|---------|
+| `..s` | retrain wall-clock (background thread) |
+| `tau` | new threshold = `min(p95_succ + 0.02, 0.99)` |
+| `loss` | final retrain loss |
+| `NS / NF` | # success / # failure episodes in the merged training set |
+| `base=B + online=O` | B bundled base episodes + O recent on-policy episodes |
+
+> A second, **per-rollout-epoch** diagnostic line `[probe] epoch=E stage=N: ...`
+> also exists, with `flagged / cut / FP / FN / cut@`. Its `dummy_skip=../..` field is
+> **not** the probe-cut `saved` above — it is the v17 continuous-collect skip ratio
+> (chunks skipped after the per-rank trajectory target is met). The names are kept
+> distinct (`dummy_skip` vs `saved`) so the two are not conflated.

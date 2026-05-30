@@ -1558,12 +1558,15 @@ class EnvWorker(Worker):
                         if succ_done_chunks
                         else "-"
                     )
+                    # NOTE: dummy_skip is the v17 continuous-collect skip ratio (chunks
+                    # skipped after the per-rank trajectory target is met) — a DIFFERENT
+                    # quantity from the probe-cut `saved` on the per-step [actprobe] line.
                     print(
                         f"[probe] epoch={epoch} stage={stage_id}: "
                         f"done={n_natural}/{n_envs}, flagged={n_probe_flagged}, cut={n_probe_cut}, "
-                        f"fp={n_probe_fp}, missed={n_undetected_fail}, "
+                        f"FP={n_probe_fp}, FN={n_undetected_fail}, "
                         f"cut@={cut_chunk}, tau={probe_tau:.4f}, "
-                        f"saved={skipped_chunks}/{total_chunks}({pct_saved:.1f}%), "
+                        f"dummy_skip={skipped_chunks}/{total_chunks}({pct_saved:.1f}%), "
                         f"succ_chunks={succ_chunks_str}"
                     )
 
@@ -1653,17 +1656,35 @@ class EnvWorker(Worker):
                         for e in eps
                         if len(e) > 7 and e[2] == "success" and e[7] and not e[6]
                     )
+                    # ── Standard classifier metrics (positive class = "episode will fail") ──
+                    # The probe is a binary failure detector. Cut episodes have no observed
+                    # ground truth, so precision is measured on the spared (immune) set —
+                    # random sparing makes the immune set an unbiased sample of all flagged
+                    # episodes, so its precision/FP rate carries over to the cut ones.
+                    TP = n_probe_cut + immune_timeout  # flagged failures: cut + verified-immune-fail
+                    FP = immune_succ + flagged_succ    # flagged but actually succeeded
+                    FN = never_flagged_timeout         # failed but never flagged (a true miss)
+                    TN = max(0, n_success - FP)        # succeeded and never flagged
+                    recall = 100.0 * TP / (TP + FN) if (TP + FN) > 0 else 0.0
+                    precision = (  # on immune set (unbiased; cut outcomes unobserved)
+                        100.0 * immune_timeout / (immune_timeout + immune_succ)
+                        if (immune_timeout + immune_succ) > 0
+                        else 0.0
+                    )
+                    FPR = 100.0 * FP / n_success if n_success > 0 else 0.0
                     print(
                         f"[actprobe] stage={stage_id}: "
-                        f"succ={n_success}, missed={n_timeout}, cut={n_probe_cut}, "
-                        f"cut_rate={cut_rate:.1f}%, tau={_tau:.4f}, "
-                        f"avg_len: succ={avg_succ:.1f}, cut={avg_cut_len:.1f}, timeout={avg_timeout_len:.1f}, "
+                        f"success={n_success}, timeout={n_timeout}, cut={n_probe_cut}, "
+                        f"recall={recall:.1f}%, precision={precision:.1f}%, FPR={FPR:.1f}%, tau={_tau:.4f}, "
+                        f"avg_len: success={avg_succ:.1f}, cut={avg_cut_len:.1f}, timeout={avg_timeout_len:.1f}, "
                         f"saved={saved_chunks}/{potential_chunks}({pct_saved:.1f}%)"
                     )
                     print(
-                        f"[actprobe-detail] stage={stage_id}: "
-                        f"immune_succ={immune_succ}(fp), immune_timeout={immune_timeout}(data), "
-                        f"never_flagged_timeout={never_flagged_timeout}(blind), flagged_succ={flagged_succ}(near_fp)"
+                        f"[actprobe-cm] stage={stage_id}: "
+                        f"TP={TP}, FP={FP}, FN={FN}, TN={TN}  "
+                        f"[TP=cut({n_probe_cut})+immune_fail({immune_timeout}), "
+                        f"FP=on_success_immune({immune_succ})+on_success_precut({flagged_succ}), "
+                        f"FN=blind_timeout({never_flagged_timeout})]"
                     )
 
             _bv_t0 = _time.time()
