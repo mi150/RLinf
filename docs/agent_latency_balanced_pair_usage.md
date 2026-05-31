@@ -42,10 +42,10 @@ env:
 执行流程：
 
 1. 输入 `chunk_actions`，形状为 `[num_envs, chunk_step, action_dim]`。
-2. 每个 env 子进程收到自己的完整 action chunk。
-3. 子进程内部连续执行该 env 的 chunk。
-4. 父进程记录每个 env 完成 chunk 的耗时。
-5. 使用 EMA 更新该 env 的预测延迟。
+2. 按预测延迟把 env 分到多个 CPU slot。
+3. 每个 slot 先 dispatch 一个 env 子进程，子进程收到完整 action chunk。
+4. 某个 slot 的 env 完成后，立即 dispatch 同 slot 的下一个 env，不等待其他 slot。
+5. 父进程记录每个 env 完成 chunk 的耗时，并使用 EMA 更新预测延迟。
 6. 下一轮 chunk 前，根据预测延迟重新构建分组。
 7. 返回结果时按原始 env 顺序恢复，外部 API 不变。
 
@@ -67,7 +67,7 @@ env:
 - 同一 slot 内的多个 env 会绑定到同一个 CPU group。
 - 下一轮重新配对后，env 子进程的 affinity 可以动态更新。
 
-这样可以表达“一个 CPU slot 上依次跑多个 env”的调度方式。
+这样可以表达“一个 CPU slot 上以 slot-local pipeline 依次跑多个 env”的调度方式。
 
 ### 4. EnvWorker 时间戳日志
 
@@ -102,6 +102,22 @@ env:
 - 可选的子 env 进程 affinity 采样
 
 `duration_s` 可以用来分析每个 EnvWorker 的真实仿真耗时。
+
+现在同一文件还会记录子 env 粒度事件：
+
+- `event`: `subenv_start` 或 `subenv_end`
+- `local_env`: 当前 rank/stage 内的子 env 下标
+- `global_env`: 按 `rank/stage/local_env` 展开的全局 env 下标
+- `operation`: `step`、`chunk_step` 或 `latency_balanced_pair_chunk_step`
+- `vector_step`: 当前 chunk 内的 vector step 序号
+- `action_chunk_steps`: 子 env 连续执行的 action chunk 长度
+- `pair_slot` / `pair_offset`，只在 `latency_balanced_pair` 中出现
+- `child_pid` 和 `cpu_affinity`
+- `duration_s`，只在 `subenv_end` 事件中出现
+
+子 env 事件是 EnvWorker 父进程观测到的 dispatch 到 worker ready/recv
+耗时；同步 step/chunk step 会按完成顺序记录 `subenv_end`，再按原 env
+顺序恢复返回值，因此可用于分析 rank 内各 local env 的拖尾、配对和等待关系。
 
 ## 主要代码改动
 
@@ -349,6 +365,12 @@ Env CPU binding after train env setup
 ```
 
 重点看 `event=end` 的 `duration_s` 字段。这个值表示一次 env chunk step 的耗时，可用于比较 baseline 和 pairing 模式。
+
+如果要分析 rank 内 local env 差异，重点看 `event=subenv_end`：
+
+- `operation=latency_balanced_pair_chunk_step` 表示 pairing 模式下某个子 env 完整 action chunk 的耗时。
+- `operation=step` 表示 sync-time-major baseline 中某个子 env 的单步耗时；可按 `chunk_step` + `vector_step` 聚合成一个 action chunk。
+- `pair_slot` 相同的子 env 会被安排到同一个 CPU slot；`pair_offset` 表示同 slot 内第几个被 dispatch。当前实现是 slot-local pipeline，同 slot 上一个 env 完成后会立即 dispatch 下一个 env，不再等待其他 slot 的同 offset env。
 
 ### 3. resource pool 计划
 

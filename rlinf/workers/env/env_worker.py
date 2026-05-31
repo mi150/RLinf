@@ -250,6 +250,30 @@ class EnvWorker(Worker):
             current = getattr(current, "env", None)
         return []
 
+    def _set_subenv_timestamp_context(
+        self, env: Any, context: dict[str, Any] | None
+    ) -> None:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            setter = getattr(current, "set_sim_timestamp_context", None)
+            if setter is not None:
+                setter(context)
+                return
+            current = getattr(current, "env", None)
+
+    def _get_env_last_chunk_profile(self, env: Any) -> dict[str, Any] | None:
+        current = env
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            getter = getattr(current, "get_last_chunk_profile", None)
+            if getter is not None:
+                return getter()
+            current = getattr(current, "env", None)
+        return None
+
     def _validate_child_cpu_affinity(self) -> None:
         binding = getattr(self, "_resource_binding", None)
         if binding is None or binding.cpu is None:
@@ -640,26 +664,51 @@ class EnvWorker(Worker):
                 }
             )
 
-        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
-        )
+        target_env = self.env_list[stage_id]
+        subenv_timestamp_context = None
+        if log_sim_timestamps:
+            subenv_timestamp_context = {
+                "output_dir": os.path.join(
+                    str(self.cfg.runner.logger.log_path), "env_sim_timestamps"
+                ),
+                "rank": self._rank,
+                "pid": os.getpid(),
+                "epoch": epoch,
+                "chunk_step": chunk_step_idx,
+                "stage": stage_id,
+                "stage_num": self.stage_num,
+                "local_envs": self.train_num_envs_per_stage,
+            }
+        self._set_subenv_timestamp_context(target_env, subenv_timestamp_context)
+        try:
+            (
+                obs_list,
+                chunk_rewards,
+                chunk_terminations,
+                chunk_truncations,
+                infos_list,
+            ) = target_env.chunk_step(chunk_actions)
+        finally:
+            self._set_subenv_timestamp_context(target_env, None)
         if log_sim_timestamps:
             wall_end_ns = time.time_ns()
             duration_s = time.perf_counter() - perf_start
-            self._write_sim_timestamp_event(
-                {
-                    "event": "end",
-                    "rank": self._rank,
-                    "pid": os.getpid(),
-                    "epoch": epoch,
-                    "chunk_step": chunk_step_idx,
-                    "stage": stage_id,
-                    "local_envs": self.train_num_envs_per_stage,
-                    "wall_ns": wall_end_ns,
-                    "duration_s": duration_s,
-                    "process_affinity": process_affinity,
-                }
-            )
+            end_event = {
+                "event": "end",
+                "rank": self._rank,
+                "pid": os.getpid(),
+                "epoch": epoch,
+                "chunk_step": chunk_step_idx,
+                "stage": stage_id,
+                "local_envs": self.train_num_envs_per_stage,
+                "wall_ns": wall_end_ns,
+                "duration_s": duration_s,
+                "process_affinity": process_affinity,
+            }
+            chunk_profile = self._get_env_last_chunk_profile(target_env)
+            if chunk_profile:
+                end_event["chunk_profile"] = chunk_profile
+            self._write_sim_timestamp_event(end_event)
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):

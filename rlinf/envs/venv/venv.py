@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ctypes
+import json
 import os
 import time
 import warnings
@@ -685,6 +686,11 @@ class BaseVectorEnv(object):
             os.environ.get("RLINF_ENV_CPU_CORE_GROUPS", "")
         )
         self._balanced_pair_logged = False
+        self._sim_timestamp_context: dict[str, Any] | None = None
+        self._sim_timestamp_file = None
+        self._sim_vector_step_index = 0
+        self._sim_async_step_starts: dict[int, tuple[float, dict[str, Any]]] = {}
+        self._last_chunk_profile: dict[str, Any] | None = None
 
     def _assert_is_not_closed(self) -> None:
         assert not self.is_closed, (
@@ -694,6 +700,93 @@ class BaseVectorEnv(object):
     def __len__(self) -> int:
         """Return len(self), which is the number of environments."""
         return self.env_num
+
+    def set_sim_timestamp_context(self, context: dict[str, Any] | None) -> None:
+        """Set per-sub-env timestamp context for the next vector env call."""
+        self._sim_timestamp_context = dict(context) if context is not None else None
+        self._sim_vector_step_index = 0
+        self._sim_async_step_starts.clear()
+
+    def get_last_chunk_profile(self) -> dict[str, Any] | None:
+        """Return the latest vector chunk-step timing breakdown."""
+        return dict(self._last_chunk_profile) if self._last_chunk_profile else None
+
+    def _get_sim_timestamp_file(self):
+        context = self._sim_timestamp_context
+        if context is None:
+            return None
+        if self._sim_timestamp_file is None:
+            output_dir = str(context["output_dir"])
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, f"env_rank_{int(context['rank'])}.jsonl")
+            self._sim_timestamp_file = open(
+                path, "a", encoding="utf-8", buffering=1
+            )
+        return self._sim_timestamp_file
+
+    def _global_env_id(self, local_env_id: int) -> int | None:
+        context = self._sim_timestamp_context
+        if context is None:
+            return None
+        try:
+            return (
+                (
+                    int(context["rank"]) * int(context["stage_num"])
+                    + int(context["stage"])
+                )
+                * int(context["local_envs"])
+                + int(local_env_id)
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _worker_pid(self, worker: EnvWorker) -> int | None:
+        process = getattr(worker, "process", None)
+        pid = getattr(process, "pid", None)
+        return int(pid) if pid is not None else None
+
+    def _worker_cpu_affinity(self, worker: EnvWorker) -> tuple[int, ...]:
+        affinity = getattr(worker, "_cpu_affinity", None)
+        return tuple(affinity) if affinity is not None else ()
+
+    def _write_subenv_timestamp_event(
+        self,
+        event: str,
+        *,
+        local_env_id: int,
+        worker: EnvWorker,
+        operation: str,
+        perf_start: float | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        context = self._sim_timestamp_context
+        if context is None:
+            return
+        handle = self._get_sim_timestamp_file()
+        if handle is None:
+            return
+
+        wall_ns = time.time_ns()
+        record: dict[str, Any] = {
+            "event": event,
+            "rank": int(context["rank"]),
+            "pid": int(context["pid"]),
+            "child_pid": self._worker_pid(worker),
+            "epoch": context.get("epoch"),
+            "chunk_step": context.get("chunk_step"),
+            "stage": context.get("stage"),
+            "local_envs": context.get("local_envs"),
+            "local_env": int(local_env_id),
+            "global_env": self._global_env_id(int(local_env_id)),
+            "operation": operation,
+            "wall_ns": wall_ns,
+            "cpu_affinity": self._worker_cpu_affinity(worker),
+        }
+        if extra:
+            record.update(extra)
+        if perf_start is not None:
+            record["duration_s"] = max(time.perf_counter() - perf_start, 0.0)
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     def __getattribute__(self, key: str) -> Any:
         """Switch the attribute getter depending on the key.
@@ -871,22 +964,73 @@ class BaseVectorEnv(object):
         id = self._wrap_id(id)
         if not self.is_async:
             assert len(action) == len(id)
+            vector_step_index = self._sim_vector_step_index
+            start_times: dict[int, float] = {}
             for i, j in enumerate(id):
+                env_id = int(j)
+                worker = self.workers[env_id]
+                self._write_subenv_timestamp_event(
+                    "subenv_start",
+                    local_env_id=env_id,
+                    worker=worker,
+                    operation="step",
+                    extra={"vector_step": vector_step_index},
+                )
+                start_times[env_id] = time.perf_counter()
                 self.workers[j].send(action[i])
-            result = []
-            for j in id:
-                env_return = self.workers[j].recv()
-                env_return[-1]["env_id"] = j
-                result.append(env_return)
+            results: list[Any | None] = [None for _ in id]
+            in_flight = {
+                self.workers[int(env_id)]: (index, int(env_id))
+                for index, env_id in enumerate(id)
+            }
+            while in_flight:
+                ready_workers = self.worker_class.wait(
+                    list(in_flight), 1, self.timeout
+                )
+                if not ready_workers:
+                    continue
+                for worker in ready_workers:
+                    index, env_id = in_flight.pop(worker)
+                    env_return = worker.recv()
+                    self._write_subenv_timestamp_event(
+                        "subenv_end",
+                        local_env_id=env_id,
+                        worker=worker,
+                        operation="step",
+                        perf_start=start_times.get(env_id),
+                        extra={"vector_step": vector_step_index},
+                    )
+                    env_return[-1]["env_id"] = id[index]
+                    results[index] = env_return
+            result = [env_return for env_return in results if env_return is not None]
+            if len(result) != len(id):
+                raise RuntimeError("step missed env results")
+            self._sim_vector_step_index += 1
         else:
             if action is not None:
                 self._assert_id(id)
                 assert len(action) == len(id)
+                vector_step_index = self._sim_vector_step_index
                 for act, env_id in zip(action, id):
-                    self.workers[env_id].send(act)
-                    self.waiting_conn.append(self.workers[env_id])
-                    self.waiting_id.append(env_id)
+                    local_env_id = int(env_id)
+                    worker = self.workers[local_env_id]
+                    extra = {"vector_step": vector_step_index}
+                    self._write_subenv_timestamp_event(
+                        "subenv_start",
+                        local_env_id=local_env_id,
+                        worker=worker,
+                        operation="step",
+                        extra=extra,
+                    )
+                    self._sim_async_step_starts[local_env_id] = (
+                        time.perf_counter(),
+                        extra,
+                    )
+                    worker.send(act)
+                    self.waiting_conn.append(worker)
+                    self.waiting_id.append(local_env_id)
                 self.ready_id = [x for x in self.ready_id if x not in id]
+                self._sim_vector_step_index += 1
             ready_conns: list[EnvWorker] = []
             while not ready_conns:
                 ready_conns = self.worker_class.wait(
@@ -900,6 +1044,17 @@ class BaseVectorEnv(object):
                 # env_return can be (obs, reward, done, info) or
                 # (obs, reward, terminated, truncated, info)
                 env_return = conn.recv()
+                start_info = self._sim_async_step_starts.pop(int(env_id), None)
+                perf_start = start_info[0] if start_info is not None else None
+                extra = start_info[1] if start_info is not None else None
+                self._write_subenv_timestamp_event(
+                    "subenv_end",
+                    local_env_id=int(env_id),
+                    worker=conn,
+                    operation="step",
+                    perf_start=perf_start,
+                    extra=extra,
+                )
                 env_return[-1]["env_id"] = env_id  # Add `env_id` to info
                 result.append(env_return)
                 self.ready_id.append(env_id)
@@ -924,10 +1079,85 @@ class BaseVectorEnv(object):
             self._assert_id(id)
         assert len(chunk_action) == len(id)
 
+        start_times: dict[int, float] = {}
+        profile_start = time.perf_counter()
+        send_start = profile_start
         for i, j in enumerate(id):
-            self.workers[j].send_chunk_step(chunk_action[i])
-        env_results = [self.workers[j].recv() for j in id]
-        return stack_vector_chunk_returns(env_results)
+            env_id = int(j)
+            worker = self.workers[env_id]
+            extra = {
+                "action_chunk_steps": int(chunk_action[i].shape[0]),
+                "vector_step": self._sim_vector_step_index,
+            }
+            self._write_subenv_timestamp_event(
+                "subenv_start",
+                local_env_id=env_id,
+                worker=worker,
+                operation="chunk_step",
+                extra=extra,
+            )
+            start_times[env_id] = time.perf_counter()
+            worker.send_chunk_step(chunk_action[i])
+        send_end = time.perf_counter()
+        env_results: list[Any | None] = [None for _ in id]
+        in_flight = {
+            self.workers[int(env_id)]: (index, int(env_id))
+            for index, env_id in enumerate(id)
+        }
+        wait_recv_start = time.perf_counter()
+        first_ready_time: float | None = None
+        last_recv_time: float | None = None
+        while in_flight:
+            ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
+            if not ready_workers:
+                continue
+            ready_time = time.perf_counter()
+            if first_ready_time is None:
+                first_ready_time = ready_time
+            for worker in ready_workers:
+                index, env_id = in_flight.pop(worker)
+                env_results[index] = worker.recv()
+                last_recv_time = time.perf_counter()
+                self._write_subenv_timestamp_event(
+                    "subenv_end",
+                    local_env_id=env_id,
+                    worker=worker,
+                    operation="chunk_step",
+                    perf_start=start_times.get(env_id),
+                    extra={
+                        "action_chunk_steps": int(chunk_action[index].shape[0]),
+                        "vector_step": self._sim_vector_step_index,
+                    },
+                )
+        wait_recv_end = time.perf_counter()
+        self._sim_vector_step_index += 1
+        ordered_env_results = [
+            env_result for env_result in env_results if env_result is not None
+        ]
+        if len(ordered_env_results) != len(id):
+            raise RuntimeError("chunk_step missed env results")
+        stack_start = time.perf_counter()
+        stacked = stack_vector_chunk_returns(ordered_env_results)
+        stack_end = time.perf_counter()
+        self._last_chunk_profile = {
+            "operation": "chunk_step",
+            "env_count": len(id),
+            "dispatch_s": send_end - send_start,
+            "wait_recv_s": wait_recv_end - wait_recv_start,
+            "time_to_first_ready_s": (
+                first_ready_time - wait_recv_start
+                if first_ready_time is not None
+                else None
+            ),
+            "first_ready_to_last_recv_s": (
+                last_recv_time - first_ready_time
+                if first_ready_time is not None and last_recv_time is not None
+                else None
+            ),
+            "stack_s": stack_end - stack_start,
+            "total_s": stack_end - profile_start,
+        }
+        return stacked
 
     def latency_balanced_pair_chunk_step(
         self,
@@ -943,8 +1173,8 @@ class BaseVectorEnv(object):
 
         The scheduler is local to this vector env. It groups envs into fixed-size
         slots, puts slow and fast envs together by EMA latency, optionally binds
-        all envs in a slot to the same CPU core group, and executes one env per
-        slot at a time. Results are restored to the input env order.
+        all envs in a slot to the same CPU core group, and runs each slot as an
+        independent pipeline. Results are restored to the input env order.
         """
         self._assert_is_not_closed()
         id = list(self._wrap_id(id))
@@ -995,7 +1225,11 @@ class BaseVectorEnv(object):
             ]
 
         slot_count = len(id) // envs_per_core
+        profile_start = time.perf_counter()
+        group_start = profile_start
         pair_groups = self._build_latency_balanced_groups(id, envs_per_core)
+        group_end = time.perf_counter()
+        affinity_start = group_end
         if dynamic_affinity and self._env_cpu_core_groups:
             slot_cpu_core_groups = self._get_slot_cpu_core_groups(slot_count)
             if len(slot_cpu_core_groups) < slot_count:
@@ -1008,6 +1242,7 @@ class BaseVectorEnv(object):
                 core_group = slot_cpu_core_groups[slot_index]
                 for local_pos in group:
                     self.workers[id[local_pos]].set_cpu_affinity(core_group)
+        affinity_end = time.perf_counter()
         if not self._balanced_pair_logged:
             self._balanced_pair_logged = True
             logger.info(
@@ -1021,38 +1256,128 @@ class BaseVectorEnv(object):
             )
 
         env_step_results: list[Any | None] = [None for _ in id]
-        for env_offset in range(envs_per_core):
-            in_flight: dict[EnvWorker, tuple[int, float]] = {}
-            for group in pair_groups:
-                if env_offset >= len(group):
-                    continue
-                local_pos = group[env_offset]
-                env_id = id[local_pos]
-                worker = self.workers[env_id]
-                worker.send_chunk_step(chunk_action[local_pos])
-                in_flight[worker] = (local_pos, time.perf_counter())
+        in_flight: dict[EnvWorker, tuple[int, int, int, float, dict[str, Any]]] = {}
+        dispatch_call_time_s = 0.0
+        wait_call_time_s = 0.0
+        recv_call_time_s = 0.0
+        first_ready_time: float | None = None
+        last_recv_time: float | None = None
 
-            while in_flight:
-                ready_workers = self.worker_class.wait(
-                    list(in_flight), 1, self.timeout
+        def dispatch_slot_env(slot_index: int, pair_offset: int) -> None:
+            nonlocal dispatch_call_time_s
+            group = pair_groups[slot_index]
+            if pair_offset >= len(group):
+                return
+            local_pos = group[pair_offset]
+            env_id = id[local_pos]
+            worker = self.workers[env_id]
+            extra = {
+                "action_chunk_steps": chunk_size,
+                "pair_offset": pair_offset,
+                "pair_slot": slot_index,
+                "predicted_latency_s": self._balanced_pair_predicted_latency_s[
+                    env_id
+                ],
+                "vector_step": self._sim_vector_step_index,
+            }
+            self._write_subenv_timestamp_event(
+                "subenv_start",
+                local_env_id=int(env_id),
+                worker=worker,
+                operation="latency_balanced_pair_chunk_step",
+                extra=extra,
+            )
+            send_start = time.perf_counter()
+            worker.send_chunk_step(chunk_action[local_pos])
+            send_end = time.perf_counter()
+            dispatch_call_time_s += send_end - send_start
+            in_flight[worker] = (
+                local_pos,
+                slot_index,
+                pair_offset,
+                time.perf_counter(),
+                extra,
+            )
+
+        initial_dispatch_start = time.perf_counter()
+        for slot_index in range(slot_count):
+            dispatch_slot_env(slot_index, 0)
+        initial_dispatch_end = time.perf_counter()
+
+        wait_recv_start = time.perf_counter()
+        while in_flight:
+            wait_start = time.perf_counter()
+            ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
+            wait_end = time.perf_counter()
+            wait_call_time_s += wait_end - wait_start
+            if not ready_workers:
+                continue
+            if first_ready_time is None:
+                first_ready_time = wait_end
+            for worker in ready_workers:
+                local_pos, slot_index, pair_offset, start_time, extra = in_flight.pop(
+                    worker
                 )
-                if not ready_workers:
-                    continue
-                for worker in ready_workers:
-                    local_pos, start_time = in_flight.pop(worker)
-                    env_step_results[local_pos] = worker.recv()
-                    actual_latency = max(time.perf_counter() - start_time, 0.0)
-                    env_id = id[local_pos]
-                    old_latency = self._balanced_pair_predicted_latency_s[env_id]
-                    self._balanced_pair_predicted_latency_s[env_id] = (
-                        float(ema_alpha) * actual_latency
-                        + (1.0 - float(ema_alpha)) * old_latency
-                    )
+                recv_start = time.perf_counter()
+                env_step_results[local_pos] = worker.recv()
+                recv_end = time.perf_counter()
+                recv_call_time_s += recv_end - recv_start
+                last_recv_time = recv_end
+                actual_latency = max(time.perf_counter() - start_time, 0.0)
+                env_id = id[local_pos]
+                old_latency = self._balanced_pair_predicted_latency_s[env_id]
+                self._balanced_pair_predicted_latency_s[env_id] = (
+                    float(ema_alpha) * actual_latency
+                    + (1.0 - float(ema_alpha)) * old_latency
+                )
+                end_extra = dict(extra)
+                end_extra["updated_predicted_latency_s"] = (
+                    self._balanced_pair_predicted_latency_s[env_id]
+                )
+                self._write_subenv_timestamp_event(
+                    "subenv_end",
+                    local_env_id=int(env_id),
+                    worker=worker,
+                    operation="latency_balanced_pair_chunk_step",
+                    perf_start=start_time,
+                    extra=end_extra,
+                )
+                dispatch_slot_env(slot_index, pair_offset + 1)
+        wait_recv_end = time.perf_counter()
 
         env_results = [result for result in env_step_results if result is not None]
         if len(env_results) != len(id):
             raise RuntimeError("latency-balanced pair chunk_step missed env results")
-        return stack_vector_chunk_returns(env_results)
+        self._sim_vector_step_index += 1
+        stack_start = time.perf_counter()
+        stacked = stack_vector_chunk_returns(env_results)
+        stack_end = time.perf_counter()
+        self._last_chunk_profile = {
+            "operation": "latency_balanced_pair_chunk_step",
+            "env_count": len(id),
+            "envs_per_core": envs_per_core,
+            "slot_count": slot_count,
+            "group_s": group_end - group_start,
+            "affinity_s": affinity_end - affinity_start,
+            "initial_dispatch_s": initial_dispatch_end - initial_dispatch_start,
+            "dispatch_call_s": dispatch_call_time_s,
+            "wait_recv_s": wait_recv_end - wait_recv_start,
+            "wait_call_s": wait_call_time_s,
+            "recv_call_s": recv_call_time_s,
+            "time_to_first_ready_s": (
+                first_ready_time - wait_recv_start
+                if first_ready_time is not None
+                else None
+            ),
+            "first_ready_to_last_recv_s": (
+                last_recv_time - first_ready_time
+                if first_ready_time is not None and last_recv_time is not None
+                else None
+            ),
+            "stack_s": stack_end - stack_start,
+            "total_s": stack_end - profile_start,
+        }
+        return stacked
 
     def _get_slot_cpu_core_groups(
         self, slot_count: int
@@ -1141,6 +1466,9 @@ class BaseVectorEnv(object):
         self._assert_is_not_closed()
         for w in self.workers:
             w.close()
+        if self._sim_timestamp_file is not None:
+            self._sim_timestamp_file.close()
+            self._sim_timestamp_file = None
         self.is_closed = True
 
 
