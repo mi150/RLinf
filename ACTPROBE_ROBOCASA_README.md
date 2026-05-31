@@ -5,19 +5,17 @@ Port of the LIBERO/GR00T ActProbe (autoreset + probe-based early-cut, see
 probe predicts which rollout episodes will fail mid-rollout and force-cuts them,
 saving environment interactions.
 
-**Status (honest):** the **early-cut mechanism is validated** on the long-horizon,
-multi-step task **PnPSinkToCounter** — the online-retrained probe cuts ~98% of
-failures with **zero false positives** and saves ~82% of failure-episode
-interactions. The RL itself (PPO on pi0.5) is **not yet tuned for RoboCasa** — over
-a short run the task success rate does not improve (drifts down); making RL actually
-raise SR is future work, separate from the cut mechanism.
+**Status.** The early-cut mechanism is validated on the long-horizon, multi-step
+task **PnPSinkToCounter**: the online-retrained probe cuts ~98% of failures with
+zero false positives and saves ~82% of failure-episode interactions. RL training
+itself (PPO on pi0.5) is not yet tuned for RoboCasa — over a short run the task
+success rate does not improve. Tuning RL to raise SR is future work, separate from
+the cut mechanism.
 
-Why PnPSinkToCounter and not a simpler task: on a short task (e.g. TurnSinkSpout,
-successes ~4 chunks) the probe barely has to predict — successes finish before a cut
-would even fire, so "still running ⇒ failure" almost works. PnPSinkToCounter is a
-**genuine test**: successes run ~10 chunks and failures ~32, so success and failure
-trajectories overlap in length and the probe must truly predict failure mid-rollout.
-It still does — see the result below.
+PnPSinkToCounter is a long, multi-step task in which successful and failed
+trajectories overlap in length (successes ~10 chunks, failures ~32), so the probe
+cannot use episode length as a proxy for the outcome and must predict failure from
+the action-chunk and end-effector features mid-rollout.
 
 ---
 
@@ -70,9 +68,9 @@ at `temperature_eval=0.6` most tasks collapse to ~0% SR; collect at
 RoboCasa well, and very unevenly: pick-into-a-container tasks (`PnPCounterToMicrowave`,
 `PnPMicrowaveToCounter`) stay near 0–6% even at temperature 1.0 (an init-state
 distribution mismatch — the policy was trained on human-demo starts, RLinf resets
-randomly), while open-target pick-and-place is much better. `PnPSinkToCounter` is
-the sweet spot: long, multi-step, **~24% SR** at temperature 1.0 — enough success
-samples and long-enough trajectories for a meaningful probe.
+randomly), while open-target pick-and-place performs substantially better. `PnPSinkToCounter`
+reaches ~24% SR at temperature 1.0, providing enough success samples and
+long-horizon trajectories for a meaningful probe.
 
 ### 2. Generate the 8-feat base data for online retrain
 
@@ -100,12 +98,13 @@ Logged metrics are the same as LIBERO (`[actprobe]` / `[actprobe-cm]`).
 | env-steps saved | **~81–86%** |
 | mean cut position | **chunk 7.8 (≈157 env steps)** |
 
-Episode lengths in this task: successes ~10.3 chunks (≈206 steps), failures time out
-at 32 chunks (640 steps). The probe cuts a flagged failure at **chunk ~7.8 — 25% of
-the way to timeout, and *earlier* than the average success finishes — yet with zero
-false positives.** That is the point: it isn't waiting for winners to resolve and
-cutting the rest; it genuinely predicts failure from the action-chunk + eef features
-on overlapping-length trajectories, saving ~75% of each failed episode's steps.
+In this task, successes run ~10.3 chunks (≈206 steps) and failures time out at 32
+chunks (640 steps). The probe cuts flagged failures at chunk ~7.8 — 25% of the
+timeout horizon, and earlier than the average success completes — with zero false
+positives. Because the success and failure length distributions overlap, episode
+length is not a usable proxy for the outcome; the probe predicts failure from the
+action-chunk and end-effector features, saving ~75% of each failed episode's
+interactions.
 
 ---
 
