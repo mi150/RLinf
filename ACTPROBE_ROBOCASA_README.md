@@ -96,10 +96,8 @@ Logged metrics are the same as LIBERO (`[actprobe]` / `[actprobe-cm]`).
 In this task, successes run ~10.3 chunks (≈206 steps) and failures time out at 32
 chunks (640 steps). The probe cuts flagged failures at chunk ~7.8 — 25% of the
 timeout horizon, and earlier than the average success completes — with zero false
-positives. Because the success and failure length distributions overlap, episode
-length is not a usable proxy for the outcome; the probe predicts failure from the
-action-chunk and end-effector features, saving ~75% of each failed episode's
-interactions.
+positives. The probe predicts failure from the action-chunk and end-effector
+features, saving ~75% of each failed episode's interactions.
 
 ---
 
