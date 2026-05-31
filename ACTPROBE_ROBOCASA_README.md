@@ -12,11 +12,6 @@ itself (PPO on pi0.5) is not yet tuned for RoboCasa — over a short run the tas
 success rate does not improve. Tuning RL to raise SR is future work, separate from
 the cut mechanism.
 
-PnPSinkToCounter is a long, multi-step task in which successful and failed
-trajectories overlap in length (successes ~10 chunks, failures ~32), so the probe
-cannot use episode length as a proxy for the outcome and must predict failure from
-the action-chunk and end-effector features mid-rollout.
-
 ---
 
 ## What's here
