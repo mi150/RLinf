@@ -42,7 +42,7 @@ algorithm:
   reward_coef: 1.0
 
   rollout_epoch: 1   # v17/v19: 1 long epoch, auto_reset + continuous collect
-  eval_rollout_epoch: 60   # ensure 100/rank reachable (collection stops at max_episodes)
+  eval_rollout_epoch: 80
   reward_type: chunk_level
   logprob_type: chunk_level
   entropy_type: token_level
@@ -85,8 +85,8 @@ env:
 
   train:
     total_num_envs: 64
-    task_names: ["TurnSinkSpout"]
-    max_episode_steps: 480
+    task_names: ["PnPSinkToCounter"]
+    max_episode_steps: 640
     max_steps_per_rollout_epoch: 3840  # 480 x 8
     group_size: ${algorithm.group_size}
     reward_coef: ${algorithm.reward_coef}
@@ -103,7 +103,7 @@ env:
     auto_reset: True          # done envs reset and keep collecting more episodes
     collect_rollout:
       enabled: false           # train-mode collect OFF; collection happens in eval (see env.eval.collect_rollout)
-      save_dir: "checkpoints/probe_robocasa/rollout_collect_turnsinkspout"
+      save_dir: "checkpoints/probe_robocasa/rollout_collect_pnpsinktocounter"
       max_episodes: 100        # per rank; 4 ranks -> ~400 total, plenty
       n_action_dims: 7
     v17_continuous_collect:
@@ -145,19 +145,19 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
-    total_num_envs: 8     # must be divisible by #env processes (4 GPUs here); 8/4=2
-    task_names: ["TurnSinkSpout"]
+    total_num_envs: 8
+    task_names: ["PnPSinkToCounter"]
     auto_reset: True
     ignore_terminations: False   # collection: record real success terminations (else SR=0, all fixed-length)
-    max_episode_steps: 480
-    max_steps_per_rollout_epoch: 480
+    max_episode_steps: 640
+    max_steps_per_rollout_epoch: 640
     use_fixed_reset_state_ids: False    # random reset states (the ~56% SR distribution; fixed/ordered gave 0%)
     use_ordered_reset_state_ids: False
     is_eval: True
     collect_rollout:           # eval rollout-data collection (the one switch)
       enabled: true
-      save_dir: "checkpoints/probe_robocasa/rollout_collect_turnsinkspout_eval"
-      max_episodes: 100        # per rank; 4 ranks -> ~400 total
+      save_dir: "checkpoints/probe_robocasa/rollout_collect_pnpsinktocounter"
+      max_episodes: 100       # 4 ranks -> ~400 total
       n_action_dims: 7
     state_space: 16d          # match pi05 SFT ckpt (16-dim state)
     image_space: 3views

@@ -1,16 +1,23 @@
 # ActProbe on RoboCasa + pi0.5
 
 Port of the LIBERO/GR00T ActProbe (autoreset + probe-based early-cut, see
-`ACTPROBE_README.md`) to **RoboCasa + pi0.5 (OpenPI)**. The failure-detection
+`ACTPROBE_LIBERO_README.md`) to **RoboCasa + pi0.5 (OpenPI)**. The failure-detection
 probe predicts which rollout episodes will fail mid-rollout and force-cuts them,
 saving environment interactions.
 
-**Status (honest):** the **early-cut mechanism is validated** on RoboCasa
-TurnSinkSpout — the online-retrained probe cuts ~98% of failures with **zero
-false positives** and saves ~90% of failure-episode interactions. The RL itself
-(PPO on pi0.5) is **not yet tuned for RoboCasa** — over a short run the task
-success rate does not improve (drifts down); making RL actually raise SR is
-future work, separate from the cut mechanism.
+**Status (honest):** the **early-cut mechanism is validated** on the long-horizon,
+multi-step task **PnPSinkToCounter** — the online-retrained probe cuts ~98% of
+failures with **zero false positives** and saves ~82% of failure-episode
+interactions. The RL itself (PPO on pi0.5) is **not yet tuned for RoboCasa** — over
+a short run the task success rate does not improve (drifts down); making RL actually
+raise SR is future work, separate from the cut mechanism.
+
+Why PnPSinkToCounter and not a simpler task: on a short task (e.g. TurnSinkSpout,
+successes ~4 chunks) the probe barely has to predict — successes finish before a cut
+would even fire, so "still running ⇒ failure" almost works. PnPSinkToCounter is a
+**genuine test**: successes run ~10 chunks and failures ~32, so success and failure
+trajectories overlap in length and the probe must truly predict failure mid-rollout.
+It still does — see the result below.
 
 ---
 
@@ -26,17 +33,17 @@ future work, separate from the cut mechanism.
 - **Eval-mode rollout-data collection** (the OOM-free way to collect probe
   training data) — see below. Touches `env_worker.py` / `huggingface_worker.py`.
 - **`rlinf/models/embodiment/openpi/`** — pi0.5 RoboCasa dataconfig + value head.
-- Bundled (`checkpoints/probe_robocasa/`): `turnsinkspout_8feat_eef_seed2_absts.pt`
-  (+ 2-feat variant) and `robocasa_base_8feat_turnsinkspout.pkl`.
+- Bundled (`checkpoints/probe_robocasa/`): `pnpsinktocounter_8feat_eef_seed1_absts.pt`
+  (+ 2-feat variant) and `robocasa_base_8feat_pnpsinktocounter.pkl`.
 
 ---
 
 ## Pipeline
 
 ```
-1. collect rollout data   -> robocasa_turnsinkspout_collect_eval.yaml  (only_eval, no OOM)
-2. train a probe offline  -> (your trainer) -> turnsinkspout_8feat_eef_seed2_absts.pt
-3. run actprobe RL        -> robocasa_turnsinkspout_actprobe.yaml      (probe cuts + online retrain)
+1. collect rollout data   -> robocasa_pnpsinktocounter_collect.yaml   (only_eval, no OOM)
+2. train a probe offline  -> (your trainer) -> pnpsinktocounter_8feat_eef_seed1_absts.pt
+3. run actprobe RL        -> robocasa_pnpsinktocounter_actprobe.yaml   (probe cuts + online retrain)
 ```
 
 ### 1. Collecting rollout data in eval (no OOM)
@@ -50,17 +57,22 @@ and `only_eval` uses the initial checkpoint, i.e. the step-0 policy. Off by
 default → the eval path is unchanged for everyone else.
 
 ```bash
-bash examples/embodiment/run_embodiment.sh robocasa_turnsinkspout_collect_eval ROBOCASA
+bash examples/embodiment/run_embodiment.sh robocasa_pnpsinktocounter_collect ROBOCASA
 ```
 Writes per-rank `rollout_rank{N}.pkl`, each episode:
 `{action_chunk (M,50,7), eef_pos (M,3), success, task_id, instruction, length}`.
 
 **Important — sampling temperature.** The pi0.5 RoboCasa policy is miscalibrated:
-at `temperature_eval=0.6` TurnSinkSpout collapses to 0% SR; at **`temperature=1.0`**
-(the train-rollout sampling) it gives ~53–59% SR. Collect with `temperature_eval:
-1.0` to get a success/failure mix. (Hard tasks like TurnOffStove only reach ~9%
-even at 1.0 — they additionally need camera-resolution / init-state alignment;
-TurnSinkSpout is position-insensitive and so temperature-limited only.)
+at `temperature_eval=0.6` most tasks collapse to ~0% SR; collect at
+**`temperature=1.0`** (the train-rollout sampling) to get a success/failure mix.
+
+**Important — task choice.** The converted pi0.5 checkpoint only does a subset of
+RoboCasa well, and very unevenly: pick-into-a-container tasks (`PnPCounterToMicrowave`,
+`PnPMicrowaveToCounter`) stay near 0–6% even at temperature 1.0 (an init-state
+distribution mismatch — the policy was trained on human-demo starts, RLinf resets
+randomly), while open-target pick-and-place is much better. `PnPSinkToCounter` is
+the sweet spot: long, multi-step, **~24% SR** at temperature 1.0 — enough success
+samples and long-enough trajectories for a meaningful probe.
 
 ### 2. Generate the 8-feat base data for online retrain
 
@@ -71,7 +83,7 @@ vx,vy,vz, step]`) that online retrain mixes with the live buffer.
 ### 3. Run actprobe RL
 
 ```bash
-bash examples/embodiment/run_embodiment.sh robocasa_turnsinkspout_actprobe ROBOCASA
+bash examples/embodiment/run_embodiment.sh robocasa_pnpsinktocounter_actprobe ROBOCASA
 ```
 `env.train.probe_cfg` loads the bundled 8-feat probe; `warmup_steps=2` (no cut for
 2 steps), then the probe cuts flagged failures and retrains online each PPO step.
@@ -79,16 +91,21 @@ Logged metrics are the same as LIBERO (`[actprobe]` / `[actprobe-cm]`).
 
 ---
 
-## Validation result (TurnSinkSpout, 8-feat, steps 3–6)
+## Validation result (PnPSinkToCounter, 8-feat, steps 3–6)
 
 | metric | value |
 |--------|-------|
-| recall (failures cut) | **~98–100%** |
+| recall (failures cut) | **~97–100%** |
 | false positives (winners cut) | **0** |
-| env-steps saved | **~89–91%** |
+| env-steps saved | **~81–86%** |
+| mean cut position | **chunk 7.8 (≈157 env steps)** |
 
-The probe cuts failures at chunk ~4.4 (successes finish naturally at ~4.0), so it
-lets winners finish and cuts only the long-running failures.
+Episode lengths in this task: successes ~10.3 chunks (≈206 steps), failures time out
+at 32 chunks (640 steps). The probe cuts a flagged failure at **chunk ~7.8 — 25% of
+the way to timeout, and *earlier* than the average success finishes — yet with zero
+false positives.** That is the point: it isn't waiting for winners to resolve and
+cutting the rest; it genuinely predicts failure from the action-chunk + eef features
+on overlapping-length trajectories, saving ~75% of each failed episode's steps.
 
 ---
 
