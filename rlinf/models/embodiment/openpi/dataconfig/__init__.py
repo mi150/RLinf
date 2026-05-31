@@ -278,6 +278,27 @@ _CONFIGS = [
         num_train_steps=100_000,
     ),
     TrainConfig(
+        # Matches the SFT ckpt produced by zhangxinyue's openpi05
+        # `my_pi05_robocasa_pretrain` (Pi0Config(pi05=True) -> action_horizon=50,
+        # discrete_state_input=True, max_token_len=200), trained on a 16-dim state
+        # / 12-dim action / 2-view RoboCasa PandaOmron dataset.
+        name="pi05_robocasa",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotRobocasaDataConfig(
+            repo_id="train/robocasa",
+            state_space="16d",
+            action_space="12d",
+            image_space="2views",
+            base_config=DataConfig(prompt_from_task=False),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base/params"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=100_000,
+    ),
+    TrainConfig(
         name="pi0_aloha_robotwin",
         model=pi0_config.Pi0Config(discrete_state_input=False),
         data=LeRobotAlohaDataConfig(

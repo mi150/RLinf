@@ -98,6 +98,12 @@ class EnvWorker(Worker):
         self.enable_offload = self.cfg.env.train.get("enable_offload", False)
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         self.enable_eval = self.cfg.runner.val_check_interval > 0 or self.only_eval
+        # Optional: receive the full predicted action chunk in eval so robocasa
+        # rollout-data collection works in pure-inference eval. Off by default.
+        _eval_collect_cfg = self.cfg.env.eval.get("collect_rollout", None)
+        self._eval_collect = bool(
+            _eval_collect_cfg and _eval_collect_cfg.get("enabled", False)
+        )
         if not self.only_eval:
             self.train_num_envs_per_stage = (
                 self.cfg.env.train.total_num_envs // self._world_size // self.stage_num
@@ -447,10 +453,14 @@ class EnvWorker(Worker):
         return env_output, env_info
 
     def env_evaluate_step(
-        self, raw_actions: torch.Tensor, stage_id: int
+        self, raw_actions: torch.Tensor, stage_id: int, full_chunk=None
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to evaluate the environment.
+
+        full_chunk: optional full predicted action chunk (chains[:, -1]); when
+        provided (eval rollout-data collection), it is forwarded to robocasa's
+        chunk_step so the collect buffer fills.
         """
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
@@ -463,9 +473,16 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            self.eval_env_list[stage_id].chunk_step(chunk_actions)
-        )
+        if self.cfg.env.eval.env_type == "robocasa" and full_chunk is not None:
+            obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
+                self.eval_env_list[stage_id].chunk_step(
+                    chunk_actions, full_chunk=full_chunk
+                )
+            )
+        else:
+            obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
+                self.eval_env_list[stage_id].chunk_step(chunk_actions)
+            )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
@@ -608,6 +625,26 @@ class EnvWorker(Worker):
             f"Expected concatenated action size {expected_total_size}, got {chunk_action.shape[0]}."
         )
         return chunk_action
+
+    def recv_full_chunk(self, input_channel: Channel, mode="eval") -> np.ndarray:
+        """Receive the full predicted action chunk (chains[:, -1]) on the side
+        channel paired with :meth:`recv_chunk_actions`. Only used when eval
+        rollout-data collection is enabled. Returns ``[num_envs_per_stage, ...]``.
+        """
+        src_ranks_and_sizes = self.src_rank_map[f"rollout_{mode}"]
+        full_chunk = []
+        for src_rank, _ in src_ranks_and_sizes:
+            fc_i = input_channel.get(
+                key=CommMapper.build_channel_key(
+                    src_rank, self._rank, extra=f"{mode}_fullchunk"
+                ),
+            )
+            if isinstance(fc_i, torch.Tensor):
+                fc_i = fc_i.detach().cpu().numpy()
+            else:
+                fc_i = np.asarray(fc_i)
+            full_chunk.append(fc_i)
+        return np.concatenate(full_chunk, axis=0)
 
     @Worker.timer("recv_rollout_results")
     def recv_rollout_results(
@@ -2072,8 +2109,13 @@ class EnvWorker(Worker):
                     raw_chunk_actions = self.recv_chunk_actions(
                         input_channel, mode="eval"
                     )
+                    full_chunk = (
+                        self.recv_full_chunk(input_channel, mode="eval")
+                        if self._eval_collect
+                        else None
+                    )
                     env_output, env_info = self.env_evaluate_step(
-                        raw_chunk_actions, stage_id
+                        raw_chunk_actions, stage_id, full_chunk=full_chunk
                     )
 
                     for key, value in env_info.items():

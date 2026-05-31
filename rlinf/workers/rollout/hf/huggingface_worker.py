@@ -81,6 +81,13 @@ class MultiStepRolloutWorker(Worker):
         )
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
         self.enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
+        # Optional: forward the predicted action chunk (chains[:,-1]) to the env
+        # during eval so robocasa rollout-data collection works in pure-inference
+        # eval (no actor train -> no OOM). Off by default => eval path unchanged.
+        _eval_collect_cfg = cfg.env.eval.get("collect_rollout", None)
+        self._eval_collect = bool(
+            _eval_collect_cfg and _eval_collect_cfg.get("enabled", False)
+        )
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
@@ -476,8 +483,13 @@ class MultiStepRolloutWorker(Worker):
             for _ in range(self.n_eval_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(env_output["obs"], mode="eval")
+                    actions, result = self.predict(env_output["obs"], mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
+                    if self._eval_collect:
+                        # final denoising step = full predicted action chunk
+                        chains = result.get("forward_inputs", {}).get("chains", None)
+                        full_chunk = chains[:, -1] if chains is not None else None
+                        self.send_full_chunk(output_channel, full_chunk, mode="eval")
 
         if self.enable_offload:
             self.offload_model()
@@ -632,6 +644,32 @@ class MultiStepRolloutWorker(Worker):
                 chunk_action_i,
                 key=CommMapper.build_channel_key(
                     self._rank, dst_rank, extra=f"{mode}_actions"
+                ),
+                async_op=True,
+            )
+
+    def send_full_chunk(
+        self,
+        output_channel: Channel,
+        full_chunk: torch.Tensor | np.ndarray,
+        mode: Literal["train", "eval"] = "eval",
+    ):
+        """Send the full predicted action chunk (chains[:, -1]) on a side channel.
+
+        Used only when eval rollout-data collection is enabled; the env worker
+        forwards it to ``chunk_step(full_chunk=...)`` so the collect buffer fills.
+        Split/keyed identically to ``send_chunk_actions`` but on ``{mode}_fullchunk``.
+        """
+        dst_ranks_and_sizes = self.dst_ranks[mode]
+        split_sizes = [size for _, size in dst_ranks_and_sizes]
+        full_chunk_split = self._split_actions(full_chunk, split_sizes)
+        for (dst_rank, _), fc_i in zip(dst_ranks_and_sizes, full_chunk_split):
+            if isinstance(fc_i, torch.Tensor):
+                fc_i = fc_i.detach().cpu().contiguous()
+            output_channel.put(
+                fc_i,
+                key=CommMapper.build_channel_key(
+                    self._rank, dst_rank, extra=f"{mode}_fullchunk"
                 ),
                 async_op=True,
             )

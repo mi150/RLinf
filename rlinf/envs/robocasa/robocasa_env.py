@@ -71,6 +71,42 @@ class RobocasaEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
 
+        # ── Rollout data collection (optional, for probe training) ──
+        # Stores per-episode (action_chunk[:,:7], eef_pos, success, instruction)
+        # to train a RLinf-distribution probe. See rollout_data_format.md.
+        collect_cfg = cfg.get("collect_rollout", None)
+        self._collecting = bool(collect_cfg and collect_cfg.get("enabled", False))
+        if self._collecting:
+            import os
+
+            self._collect_save_dir = collect_cfg.get("save_dir", "/tmp/rollout_collect")
+            self._collect_max_eps = collect_cfg.get("max_episodes", 100)
+            self._collect_n_dims = collect_cfg.get("n_action_dims", 7)
+            os.makedirs(self._collect_save_dir, exist_ok=True)
+            self._collect_rank = seed_offset
+            self._collect_episodes = []  # finished episodes (list of dict)
+            self._collect_buf = [
+                {"action_chunk": [], "eef_pos": [], "instruction": ""}
+                for _ in range(self.num_envs)
+            ]
+            print(
+                f"[RobocasaEnv] rollout collection ON: save_dir={self._collect_save_dir}, "
+                f"max_eps={self._collect_max_eps}, n_dims={self._collect_n_dims}"
+            )
+
+        # ── ConfProbe (optional, v19 early-cut) ──
+        probe_cfg = cfg.get("probe_cfg", None)
+        if probe_cfg is not None and probe_cfg.get("enabled", False):
+            from rlinf.envs.robocasa.conf_probe import ConfProbe
+
+            self.probe = ConfProbe(probe_cfg, self.num_envs)
+            print(
+                f"[RobocasaEnv] ConfProbe enabled, K={self.probe.K}, "
+                f"tau={self.probe.tau:.4f}"
+            )
+        else:
+            self.probe = None
+
     @property
     def camera_names(self):
         """Set the camaera names given image_space"""
@@ -137,6 +173,19 @@ class RobocasaEnv(gym.Env):
             camera_widths = self.cfg.init_params.camera_widths
             camera_heights = self.cfg.init_params.camera_heights
             robot_name = self.cfg.robot_name
+            camera_names = list(self.camera_names)
+            # Domain-randomization params aligned with the SFT/probe data collection
+            # distribution (RoboCasa human_im demos). Narrowing the random scene
+            # distribution to what the pi0.5 ckpt was trained on. None = robosuite
+            # default (full randomization).
+            dr = self.cfg.get("domain_rand", {})
+            style_ids = dr.get("style_ids", None)
+            obj_instance_split = dr.get("obj_instance_split", None)
+            generative_textures = dr.get("generative_textures", None)
+            randomize_cameras = dr.get("randomize_cameras", False)
+            layout_ids = dr.get("layout_ids", None)
+            if style_ids is not None:
+                style_ids = list(style_ids)
 
             def env_fn(
                 task=task_name,
@@ -144,6 +193,12 @@ class RobocasaEnv(gym.Env):
                 width=camera_widths,
                 height=camera_heights,
                 robot=robot_name,
+                camera_names=camera_names,
+                style_ids=style_ids,
+                obj_instance_split=obj_instance_split,
+                generative_textures=generative_textures,
+                randomize_cameras=randomize_cameras,
+                layout_ids=layout_ids,
             ):
                 """Factory function to create a robosuite environment in subprocess."""
                 import robosuite
@@ -154,11 +209,11 @@ class RobocasaEnv(gym.Env):
                     robot=robot,
                 )
 
-                env = robosuite.make(
+                make_kwargs = dict(
                     env_name=task,
                     robots=robot,
                     controller_configs=controller_config,
-                    camera_names=self.camera_names,
+                    camera_names=camera_names,
                     camera_widths=width,
                     camera_heights=height,
                     has_renderer=False,
@@ -171,6 +226,19 @@ class RobocasaEnv(gym.Env):
                     translucent_robot=False,
                     render_camera="robot0_agentview_center",  # Use same camera as observation
                 )
+                # Align scene distribution with collection demos when specified
+                if style_ids is not None:
+                    make_kwargs["style_ids"] = style_ids
+                if layout_ids is not None:
+                    make_kwargs["layout_ids"] = layout_ids
+                if obj_instance_split is not None:
+                    make_kwargs["obj_instance_split"] = obj_instance_split
+                if generative_textures is not None:
+                    make_kwargs["generative_textures"] = generative_textures
+                if randomize_cameras:
+                    make_kwargs["randomize_cameras"] = randomize_cameras
+
+                env = robosuite.make(**make_kwargs)
                 return env
 
             env_fns.append(env_fn)
@@ -297,8 +365,9 @@ class RobocasaEnv(gym.Env):
         extracted_obs = self._extract_image_and_state(obs_list)
         task_description_list = self._extract_task_description(info_list)
 
+        n = len(extracted_obs["robot0_agentview_left_image"])
         images_and_states_list = []
-        for idx in range(self.num_envs):
+        for idx in range(n):
             images_and_states = {
                 "robot0_agentview_left_image": extracted_obs[
                     "robot0_agentview_left_image"
@@ -355,7 +424,18 @@ class RobocasaEnv(gym.Env):
         # Use libero's SubprocVectorEnv reset interface
         raw_obs, info_list = self.env.reset(id=env_idx)
 
-        obs = self._wrap_obs(raw_obs, info_list)
+        # Scatter partial reset results into a full-size buffer so _wrap_obs always
+        # sees num_envs entries (auto_reset passes a subset of envs). Mirrors LIBERO.
+        if len(env_idx) == self.num_envs:
+            obs = self._wrap_obs(raw_obs, info_list)
+        else:
+            if getattr(self, "_last_raw_obs", None) is None:
+                self._last_raw_obs = [None] * self.num_envs
+                self._last_info = [{} for _ in range(self.num_envs)]
+            for i, ei in enumerate(env_idx):
+                self._last_raw_obs[ei] = raw_obs[i]
+                self._last_info[ei] = info_list[i]
+            obs = self._wrap_obs(self._last_raw_obs, self._last_info)
         self._reset_metrics(env_idx)
         infos = {}
         return obs, infos
@@ -388,6 +468,10 @@ class RobocasaEnv(gym.Env):
         raw_obs, rewards, dones, info_lists = self.env.step(actions)
         infos = list_of_dict_to_dict_of_list(info_lists)
 
+        # Cache full raw obs so partial auto_reset can scatter into a full buffer
+        self._last_raw_obs = list(raw_obs)
+        self._last_info = list(info_lists)
+
         # Extract success from infos
         terminations = np.array(
             [info.get("success", False) for info in info_lists]
@@ -415,8 +499,9 @@ class RobocasaEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, full_chunk=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
+        # full_chunk: [num_envs, action_horizon, action_dim] full prediction for probe
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -449,10 +534,39 @@ class RobocasaEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
+        # ── Rollout data collection (optional) ──
+        if self._collecting and full_chunk is not None:
+            self._collect_chunk(full_chunk, obs_list, past_terminations, past_dones)
+
+        # ── Probe inference (optional, v19) ──
+        # Score the chunk that just executed (using this episode's carried hidden
+        # state) BEFORE resetting done envs. Results are NOT injected into infos
+        # (Channel serialization); env_worker reads env.probe.predicted_fail.
+        if self.probe is not None and full_chunk is not None:
+            # set lang-cond from the real instruction the policy received (once).
+            # obs["task_descriptions"] is a per-env list of lang strings.
+            if self.probe._lang_emb is None:
+                instrs = obs_list[-1].get("task_descriptions", None)
+                if instrs and len(instrs) > 0 and instrs[0]:
+                    self.probe.ensure_lang(instrs[0])
+            # chunk-start eef pos (states[:, :3]) for the 8-feat probe; matches
+            # the eef_pos stored during rollout-data collection (_collect_chunk).
+            eef_now = None
+            if obs_list and isinstance(obs_list[0], dict) and "states" in obs_list[0]:
+                _st = obs_list[0]["states"]
+                _st = _st.cpu().numpy() if hasattr(_st, "cpu") else np.asarray(_st)
+                eef_now = _st[:, :3]
+            feats = self.probe.extract_features(full_chunk, eef_pos=eef_now)
+            self.probe.predict(feats)
+
         if past_dones.any() and self.auto_reset:
+            done_np = past_dones.cpu().numpy()
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(
-                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
+                done_np, obs_list[-1], infos_list[-1]
             )
+            # reset probe state for naturally-done envs (new episode starts fresh)
+            if self.probe is not None:
+                self.probe.reset_env_hidden(np.where(done_np)[0])
 
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
@@ -463,12 +577,91 @@ class RobocasaEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+
         return (
             obs_list,
             chunk_rewards,
             chunk_terminations,
             chunk_truncations,
             infos_list,
+        )
+
+    def force_cut_envs(self, env_indices, do_reset=True):
+        """Force-cut specified envs (v17/v19). Returns reset obs if do_reset=True.
+
+        Args:
+            env_indices: numpy array of env indices to cut
+            do_reset: True (probe cut) → reset env + probe state; False → mark only
+        Returns:
+            reset obs dict if do_reset else None
+        """
+        env_indices = np.atleast_1d(env_indices)
+        if len(env_indices) == 0:
+            return None
+        if do_reset:
+            obs, _infos = self.reset(env_idx=env_indices)
+            if self.probe is not None:
+                self.probe.reset_env_hidden(env_indices)
+            return obs
+        return None
+
+    def _collect_chunk(self, full_chunk, obs_list, terminations, dones):
+        """Accumulate per-env (action_chunk[:,:7], eef_pos) each chunk step;
+        on episode done, package into _collect_episodes with success label."""
+        if len(self._collect_episodes) >= self._collect_max_eps:
+            return
+        nd = self._collect_n_dims
+        fc = np.asarray(full_chunk, dtype=np.float32)  # (E, 50, D)
+        # eef_pos at chunk-start: states[:, :3] from the first sub-step obs
+        first_obs = obs_list[0]
+        states = first_obs["states"]
+        if isinstance(states, torch.Tensor):
+            states = states.cpu().numpy()
+        else:
+            states = np.asarray(states)
+        term_np = terminations.cpu().numpy()
+        done_np = dones.cpu().numpy()
+        instrs = obs_list[-1].get("task_descriptions", [""] * self.num_envs)
+        for ei in range(self.num_envs):
+            buf = self._collect_buf[ei]
+            buf["action_chunk"].append(fc[ei, :, :nd].copy())  # (50, nd)
+            buf["eef_pos"].append(np.asarray(states[ei][:3], dtype=np.float32))
+            if not buf["instruction"] and ei < len(instrs) and instrs[ei]:
+                buf["instruction"] = instrs[ei]
+            if done_np[ei]:
+                M = len(buf["action_chunk"])
+                if M >= 3 and len(self._collect_episodes) < self._collect_max_eps:
+                    self._collect_episodes.append(
+                        {
+                            "action_chunk": np.stack(buf["action_chunk"], axis=0),  # (M,50,nd)
+                            "eef_pos": np.stack(buf["eef_pos"], axis=0),  # (M,3)
+                            "success": bool(term_np[ei]),
+                            "task_id": self.task_names[self.task_ids[ei]],
+                            "instruction": buf["instruction"],
+                            "length": M,
+                        }
+                    )
+                self._collect_buf[ei] = {
+                    "action_chunk": [],
+                    "eef_pos": [],
+                    "instruction": "",
+                }
+        if len(self._collect_episodes) >= self._collect_max_eps:
+            self._save_collect()
+
+    def _save_collect(self):
+        import os
+        import pickle
+
+        path = os.path.join(
+            self._collect_save_dir, f"rollout_rank{self._collect_rank}.pkl"
+        )
+        with open(path, "wb") as f:
+            pickle.dump(self._collect_episodes, f)
+        n_s = sum(1 for e in self._collect_episodes if e["success"])
+        print(
+            f"[RobocasaEnv] saved {len(self._collect_episodes)} eps to {path} "
+            f"({n_s}S/{len(self._collect_episodes) - n_s}F)"
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
@@ -496,5 +689,11 @@ class RobocasaEnv(gym.Env):
 
     def close(self):
         """Close all environments."""
+        # Flush any collected rollout episodes not yet saved (run ended before
+        # reaching max_episodes).
+        if getattr(self, "_collecting", False) and getattr(
+            self, "_collect_episodes", None
+        ):
+            self._save_collect()
         if hasattr(self, "env"):
             self.env.close()
