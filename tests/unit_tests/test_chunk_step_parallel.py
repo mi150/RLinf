@@ -1,3 +1,4 @@
+import json
 import time
 
 import numpy as np
@@ -81,6 +82,16 @@ class BarrierEnv:
         pass
 
 
+class SleepEnv(CountingEnv):
+    def __init__(self, env_id: int, sleep_s: float):
+        super().__init__(env_id)
+        self.sleep_s = sleep_s
+
+    def step(self, action):
+        time.sleep(self.sleep_s)
+        return super().step(action)
+
+
 def test_split_env_indices_and_select_local_actions():
     shards = split_env_indices(5, 2)
 
@@ -145,6 +156,51 @@ def test_dummy_vector_env_chunk_step_restores_step_major_shape():
     env.close()
 
 
+def test_vector_env_chunk_step_logs_subenv_timestamps(tmp_path):
+    env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(2)])
+    chunk_actions = np.array([[[1], [2]], [[3], [4]]])
+    output_dir = tmp_path / "env_sim_timestamps"
+    env.set_sim_timestamp_context(
+        {
+            "output_dir": str(output_dir),
+            "rank": 3,
+            "pid": 12345,
+            "epoch": 5,
+            "chunk_step": 7,
+            "stage": 1,
+            "stage_num": 2,
+            "local_envs": 2,
+        }
+    )
+
+    try:
+        env.chunk_step(chunk_actions)
+    finally:
+        env.set_sim_timestamp_context(None)
+        env.close()
+
+    events = [
+        json.loads(line)
+        for line in (output_dir / "env_rank_3.jsonl").read_text().splitlines()
+    ]
+    starts = [event for event in events if event["event"] == "subenv_start"]
+    ends = [event for event in events if event["event"] == "subenv_end"]
+
+    assert [event["local_env"] for event in starts] == [0, 1]
+    assert [event["global_env"] for event in starts] == [14, 15]
+    assert all(event["operation"] == "chunk_step" for event in starts + ends)
+    assert all(event["action_chunk_steps"] == 2 for event in starts + ends)
+    assert all(event["vector_step"] == 0 for event in starts + ends)
+    assert all(event["duration_s"] >= 0.0 for event in ends)
+    profile = env.get_last_chunk_profile()
+    assert profile is not None
+    assert profile["operation"] == "chunk_step"
+    assert profile["env_count"] == 2
+    assert profile["dispatch_s"] >= 0.0
+    assert profile["wait_recv_s"] >= 0.0
+    assert profile["stack_s"] >= 0.0
+
+
 def test_subproc_vector_env_chunk_step_dispatches_before_recv():
     mp = pytest.importorskip("multiprocessing")
     num_envs = 2
@@ -199,6 +255,71 @@ def test_subproc_vector_env_latency_balanced_pair_restores_step_major_shape():
     assert dones_list[0].tolist() == [False, False, False, False]
     assert infos_list[1][3]["local_step"] == 2
     assert infos_list[1][3]["action"] == 8
+
+
+def test_latency_balanced_pair_runs_slot_local_pipeline(tmp_path):
+    env = SubprocVectorEnv(
+        [
+            lambda: SleepEnv(0, 0.02),
+            lambda: SleepEnv(1, 0.02),
+            lambda: SleepEnv(2, 0.30),
+            lambda: SleepEnv(3, 0.02),
+        ]
+    )
+    env._balanced_pair_predicted_latency_s = [10.0, 1.0, 8.0, 2.0]
+    chunk_actions = np.array([[[1]], [[2]], [[3]], [[4]]])
+    output_dir = tmp_path / "env_sim_timestamps"
+    env.set_sim_timestamp_context(
+        {
+            "output_dir": str(output_dir),
+            "rank": 0,
+            "pid": 12345,
+            "epoch": 0,
+            "chunk_step": 0,
+            "stage": 0,
+            "stage_num": 1,
+            "local_envs": 4,
+        }
+    )
+
+    try:
+        env.latency_balanced_pair_chunk_step(
+            chunk_actions,
+            envs_per_core=2,
+            ema_alpha=0.5,
+            dynamic_affinity=False,
+        )
+    finally:
+        env.set_sim_timestamp_context(None)
+        env.close()
+
+    events = [
+        json.loads(line)
+        for line in (output_dir / "env_rank_0.jsonl").read_text().splitlines()
+    ]
+    starts = {
+        event["local_env"]: event
+        for event in events
+        if event["event"] == "subenv_start"
+    }
+    ends = {
+        event["local_env"]: event
+        for event in events
+        if event["event"] == "subenv_end"
+    }
+
+    assert starts[1]["pair_slot"] == starts[0]["pair_slot"]
+    assert starts[1]["pair_offset"] == 1
+    assert starts[2]["pair_slot"] != starts[0]["pair_slot"]
+    assert starts[1]["wall_ns"] < ends[2]["wall_ns"]
+    profile = env.get_last_chunk_profile()
+    assert profile is not None
+    assert profile["operation"] == "latency_balanced_pair_chunk_step"
+    assert profile["env_count"] == 4
+    assert profile["envs_per_core"] == 2
+    assert profile["slot_count"] == 2
+    assert profile["wait_call_s"] >= 0.0
+    assert profile["recv_call_s"] >= 0.0
 
 
 def test_latency_balanced_pair_rejects_invalid_group_size():
