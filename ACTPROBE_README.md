@@ -72,6 +72,27 @@ extraction, `collect_episode`, `maybe_retrain`, `_retrain_worker`,
 
 ---
 
+## Validation
+
+A 10-step end-to-end run on **LIBERO-10 task 0** (GR00T-N1.5, 4 GPUs). This run
+uses a reduced rollout (`target_trajectories=64`) for a fast functional check, so
+late-step probe stats are noisy; the trends are what matter, not exact late values.
+
+| step | task SR | recall | precision | FPR | env-steps saved |
+|-----:|--------:|-------:|----------:|----:|----------------:|
+| 1–2 (warmup) | 16→25% | →32% | ~90% | <10% | 0% (collect only, no cut) |
+| 3  | 25% | 58% | 94% | 3% | **+16%** |
+| 6  | 35% | 96% | 93% | 3% | +27% |
+| 8  | 74% | 91% | 88% | 1% | +37% |
+| 10 | 76% | 100% | 69%\* | 3% | **+42%** |
+
+\* Late-step precision is small-sample noise: once SR is high there are very few
+failures left, so the immune validation set is tiny. Recall stays high and the
+absolute FP count is ~5. For clean paper-grade curves, run full
+`target_trajectories=128` (slower; this run traded statistical resolution for speed).
+
+---
+
 ## Dependencies
 
 | Item | Where | Used by |
