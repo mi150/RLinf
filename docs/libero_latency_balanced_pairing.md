@@ -1,5 +1,11 @@
 # LIBERO Latency-Balanced Pairing Chunk Step
 
+> 历史说明：本文档记录早期 `latency_balanced_pair` / `envs_per_core=2`
+> 实验设计。当前代码已收敛为三种保留方案：不绑定 CPU 不调度、绑定 CPU 不调度、
+> 以及 `envs_per_core=1 + dynamic_affinity=true + core_donation_enabled=true`
+> 的 core donation v2。当前使用方式请参考
+> `docs/agent_latency_balanced_pair_usage.md`。
+
 本文档说明 `examples/embodiment/config/0libero_pairing_test.yaml` 中使用的
 `latency_balanced_pair` chunk step 模式。这个模式已经在当前代码中实现，目标是把
 每个 env 的 action chunk 当作调度单元，根据历史 chunk step 耗时把 env 动态拼成

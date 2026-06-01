@@ -49,7 +49,7 @@ def test_default_solver_builds_env_per_env_cpu_groups() -> None:
     assert bindings["env"][1].cpu.env_cpu_core_groups == ((4, 5), (6, 7))
 
 
-def test_default_solver_shares_env_cpu_groups_for_latency_balanced_pair() -> None:
+def test_default_solver_assigns_one_env_per_core_for_core_donation_v2() -> None:
     cfg = OmegaConf.create(
         {
             "cluster": {
@@ -61,7 +61,7 @@ def test_default_solver_shares_env_cpu_groups_for_latency_balanced_pair() -> Non
                     "enabled": True,
                     "cpu": {
                         "enabled": True,
-                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-3"}},
                         "components": {
                             "env": {"pool": "env_cpu", "granularity": "per_env"}
                         },
@@ -72,7 +72,11 @@ def test_default_solver_shares_env_cpu_groups_for_latency_balanced_pair() -> Non
                 "train": {
                     "total_num_envs": 4,
                     "chunk_step_mode": "latency_balanced_pair",
-                    "latency_balanced_pair": {"envs_per_core": 2},
+                    "latency_balanced_pair": {
+                        "envs_per_core": 1,
+                        "dynamic_affinity": True,
+                        "core_donation_enabled": True,
+                    },
                 },
                 "eval": {"total_num_envs": 4},
             },
@@ -86,11 +90,11 @@ def test_default_solver_shares_env_cpu_groups_for_latency_balanced_pair() -> Non
 
     bindings = ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
 
-    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1)
-    assert bindings["env"][0].cpu.env_cpu_core_groups == ((0,), (1,), (0,), (1,))
+    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1, 2, 3)
+    assert bindings["env"][0].cpu.env_cpu_core_groups == ((0,), (1,), (2,), (3,))
 
 
-def test_default_solver_uses_per_stage_slots_for_latency_balanced_pair() -> None:
+def test_default_solver_uses_per_stage_slots_for_core_donation_v2() -> None:
     cfg = OmegaConf.create(
         {
             "cluster": {
@@ -102,7 +106,7 @@ def test_default_solver_uses_per_stage_slots_for_latency_balanced_pair() -> None
                     "enabled": True,
                     "cpu": {
                         "enabled": True,
-                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-3"}},
                         "components": {
                             "env": {"pool": "env_cpu", "granularity": "per_env"}
                         },
@@ -113,7 +117,11 @@ def test_default_solver_uses_per_stage_slots_for_latency_balanced_pair() -> None
                 "train": {
                     "total_num_envs": 8,
                     "chunk_step_mode": "latency_balanced_pair",
-                    "latency_balanced_pair": {"envs_per_core": 2},
+                    "latency_balanced_pair": {
+                        "envs_per_core": 1,
+                        "dynamic_affinity": True,
+                        "core_donation_enabled": True,
+                    },
                 },
                 "eval": {"total_num_envs": 8},
             },
@@ -127,20 +135,22 @@ def test_default_solver_uses_per_stage_slots_for_latency_balanced_pair() -> None
 
     bindings = ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
 
-    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1)
+    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1, 2, 3)
     assert bindings["env"][0].cpu.env_cpu_core_groups == (
         (0,),
         (1,),
+        (2,),
+        (3,),
         (0,),
         (1,),
-        (0,),
-        (1,),
-        (0,),
-        (1,),
+        (2,),
+        (3,),
     )
 
 
-def test_default_solver_reuses_per_stage_slots_for_one_env_per_core() -> None:
+def test_default_solver_reuses_per_stage_slots_when_core_pool_is_smaller_than_envs() -> (
+    None
+):
     cfg = OmegaConf.create(
         {
             "cluster": {
@@ -163,7 +173,11 @@ def test_default_solver_reuses_per_stage_slots_for_one_env_per_core() -> None:
                 "train": {
                     "total_num_envs": 4,
                     "chunk_step_mode": "latency_balanced_pair",
-                    "latency_balanced_pair": {"envs_per_core": 1},
+                    "latency_balanced_pair": {
+                        "envs_per_core": 1,
+                        "dynamic_affinity": True,
+                        "core_donation_enabled": True,
+                    },
                 },
                 "eval": {"total_num_envs": 4},
             },

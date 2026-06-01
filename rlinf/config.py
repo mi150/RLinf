@@ -869,19 +869,14 @@ def validate_embodied_cfg(cfg):
         )
         if mode == "latency_balanced_pair":
             pair_cfg = env_cfg.get("latency_balanced_pair", {})
-            envs_per_core = int(pair_cfg.get("envs_per_core", 2))
+            envs_per_core = int(pair_cfg.get("envs_per_core", 1))
             pair_ema_alpha = float(pair_cfg.get("ema_alpha", 0.3))
-            assert envs_per_core >= 1, (
-                f"{cfg_path}.latency_balanced_pair.envs_per_core must be >= 1, "
-                f"got {envs_per_core}"
-            )
-            assert envs_per_core <= local_num_envs, (
-                f"{cfg_path}.latency_balanced_pair.envs_per_core({envs_per_core}) "
-                f"must be <= local env num({local_num_envs})"
-            )
-            assert local_num_envs % envs_per_core == 0, (
-                f"{cfg_path} local env num({local_num_envs}) must be divisible by "
-                f"latency_balanced_pair.envs_per_core({envs_per_core})"
+            dynamic_affinity = bool(pair_cfg.get("dynamic_affinity", True))
+            core_donation_enabled = bool(pair_cfg.get("core_donation_enabled", True))
+            assert envs_per_core == 1 and dynamic_affinity and core_donation_enabled, (
+                f"{cfg_path}.latency_balanced_pair only supports core donation "
+                "v2: envs_per_core=1, dynamic_affinity=True, "
+                "core_donation_enabled=True"
             )
             assert 0.0 < pair_ema_alpha <= 1.0, (
                 f"{cfg_path}.latency_balanced_pair.ema_alpha must be in (0, 1], "
@@ -893,14 +888,23 @@ def validate_embodied_cfg(cfg):
                     f"{cfg_path}.latency_balanced_pair.initial_latency_ms must be "
                     f"positive when set, got {initial_latency_ms}"
                 )
+            core_donation_max_extra_groups = int(
+                pair_cfg.get("core_donation_max_extra_groups", 1)
+            )
+            assert core_donation_max_extra_groups >= 0, (
+                f"{cfg_path}.latency_balanced_pair.core_donation_max_extra_groups "
+                f"must be >= 0, got {core_donation_max_extra_groups}"
+            )
             with open_dict(env_cfg):
                 env_cfg.latency_balanced_pair = OmegaConf.create(
                     {
                         "envs_per_core": envs_per_core,
                         "ema_alpha": pair_ema_alpha,
                         "initial_latency_ms": initial_latency_ms,
-                        "dynamic_affinity": bool(
-                            pair_cfg.get("dynamic_affinity", True)
+                        "dynamic_affinity": dynamic_affinity,
+                        "core_donation_enabled": core_donation_enabled,
+                        "core_donation_max_extra_groups": (
+                            core_donation_max_extra_groups
                         ),
                     }
                 )

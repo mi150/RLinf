@@ -57,6 +57,23 @@ _NP_TO_CT = {
 }
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Convert nested numpy-heavy values into JSON-serializable data."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, set):
+        return [_to_jsonable(item) for item in sorted(value, key=repr)]
+    return value
+
+
 def deprecation(msg: str) -> None:
     """Deprecation warning wrapper."""
     warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
@@ -719,9 +736,7 @@ class BaseVectorEnv(object):
             output_dir = str(context["output_dir"])
             os.makedirs(output_dir, exist_ok=True)
             path = os.path.join(output_dir, f"env_rank_{int(context['rank'])}.jsonl")
-            self._sim_timestamp_file = open(
-                path, "a", encoding="utf-8", buffering=1
-            )
+            self._sim_timestamp_file = open(path, "a", encoding="utf-8", buffering=1)
         return self._sim_timestamp_file
 
     def _global_env_id(self, local_env_id: int) -> int | None:
@@ -730,13 +745,8 @@ class BaseVectorEnv(object):
             return None
         try:
             return (
-                (
-                    int(context["rank"]) * int(context["stage_num"])
-                    + int(context["stage"])
-                )
-                * int(context["local_envs"])
-                + int(local_env_id)
-            )
+                int(context["rank"]) * int(context["stage_num"]) + int(context["stage"])
+            ) * int(context["local_envs"]) + int(local_env_id)
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -748,6 +758,19 @@ class BaseVectorEnv(object):
     def _worker_cpu_affinity(self, worker: EnvWorker) -> tuple[int, ...]:
         affinity = getattr(worker, "_cpu_affinity", None)
         return tuple(affinity) if affinity is not None else ()
+
+    def _set_worker_process_cpu_affinity(
+        self, worker: EnvWorker, cpus: tuple[int, ...]
+    ) -> bool:
+        """Set a subprocess worker's affinity without using its command pipe."""
+        process = getattr(worker, "process", None)
+        pid = getattr(process, "pid", None)
+        if pid is None or not hasattr(os, "sched_setaffinity"):
+            return False
+        os.sched_setaffinity(int(pid), set(cpus))
+        if hasattr(worker, "_cpu_affinity"):
+            worker._cpu_affinity = tuple(cpus)
+        return True
 
     def _write_subenv_timestamp_event(
         self,
@@ -783,10 +806,10 @@ class BaseVectorEnv(object):
             "cpu_affinity": self._worker_cpu_affinity(worker),
         }
         if extra:
-            record.update(extra)
+            record.update(_to_jsonable(extra))
         if perf_start is not None:
             record["duration_s"] = max(time.perf_counter() - perf_start, 0.0)
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
 
     def __getattribute__(self, key: str) -> Any:
         """Switch the attribute getter depending on the key.
@@ -984,9 +1007,7 @@ class BaseVectorEnv(object):
                 for index, env_id in enumerate(id)
             }
             while in_flight:
-                ready_workers = self.worker_class.wait(
-                    list(in_flight), 1, self.timeout
-                )
+                ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
                 if not ready_workers:
                     continue
                 for worker in ready_workers:
@@ -1164,17 +1185,18 @@ class BaseVectorEnv(object):
         chunk_action: np.ndarray,
         id: Optional[Union[int, list[int], np.ndarray]] = None,
         *,
-        envs_per_core: int = 2,
+        envs_per_core: int = 1,
         ema_alpha: float = 0.3,
         initial_latency_ms: Optional[float] = None,
         dynamic_affinity: bool = True,
+        core_donation_enabled: bool = True,
+        core_donation_max_extra_groups: int = 1,
     ) -> tuple[list[Any], ...]:
-        """Run local chunks with latency-balanced core-slot pairing.
+        """Run local chunks with core donation v2 scheduling.
 
-        The scheduler is local to this vector env. It groups envs into fixed-size
-        slots, puts slow and fast envs together by EMA latency, optionally binds
-        all envs in a slot to the same CPU core group, and runs each slot as an
-        independent pipeline. Results are restored to the input env order.
+        This is the only supported latency-balanced mode. Each env has its own
+        base CPU core group. When an env finishes, its group can be temporarily
+        donated to a slower in-flight env, then restored before returning.
         """
         self._assert_is_not_closed()
         id = list(self._wrap_id(id))
@@ -1193,18 +1215,30 @@ class BaseVectorEnv(object):
             )
 
         envs_per_core = int(envs_per_core)
-        if envs_per_core < 1 or envs_per_core > len(id):
+        if (
+            envs_per_core != 1
+            or not bool(dynamic_affinity)
+            or not bool(core_donation_enabled)
+        ):
             raise ValueError(
-                "envs_per_core must be in [1, local env count], "
-                f"got envs_per_core={envs_per_core}, local env count={len(id)}"
+                "latency_balanced_pair only supports core donation v2: "
+                "envs_per_core=1, dynamic_affinity=True, "
+                "core_donation_enabled=True"
             )
-        if len(id) % envs_per_core != 0:
+        if not self._env_cpu_core_groups:
             raise ValueError(
-                f"local env count({len(id)}) must be divisible by "
-                f"envs_per_core({envs_per_core})"
+                "latency_balanced_pair core donation v2 requires per-env CPU "
+                "core groups. Use sync_time_major for the no-CPU-binding "
+                "baseline."
             )
         if not 0.0 < float(ema_alpha) <= 1.0:
             raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
+        core_donation_max_extra_groups = int(core_donation_max_extra_groups)
+        if core_donation_max_extra_groups < 0:
+            raise ValueError(
+                "core_donation_max_extra_groups must be >= 0, "
+                f"got {core_donation_max_extra_groups}"
+            )
 
         initial_latency = (
             float(initial_latency_ms) / 1000.0
@@ -1230,6 +1264,11 @@ class BaseVectorEnv(object):
         pair_groups = self._build_latency_balanced_groups(id, envs_per_core)
         group_end = time.perf_counter()
         affinity_start = group_end
+        slot_cpu_core_groups: tuple[tuple[int, ...], ...] = ()
+        base_affinity_by_worker: dict[EnvWorker, tuple[int, ...]] = {}
+        active_affinity_by_worker: dict[EnvWorker, tuple[int, ...]] = {}
+        extra_groups_by_worker: dict[EnvWorker, int] = {}
+        running_workers_by_core_group: dict[tuple[int, ...], set[EnvWorker]] = {}
         if dynamic_affinity and self._env_cpu_core_groups:
             slot_cpu_core_groups = self._get_slot_cpu_core_groups(slot_count)
             if len(slot_cpu_core_groups) < slot_count:
@@ -1241,7 +1280,14 @@ class BaseVectorEnv(object):
             for slot_index, group in enumerate(pair_groups):
                 core_group = slot_cpu_core_groups[slot_index]
                 for local_pos in group:
-                    self.workers[id[local_pos]].set_cpu_affinity(core_group)
+                    worker = self.workers[id[local_pos]]
+                    worker.set_cpu_affinity(core_group)
+                    base_affinity_by_worker[worker] = core_group
+                    active_affinity_by_worker[worker] = core_group
+                    extra_groups_by_worker[worker] = 0
+                    running_workers_by_core_group.setdefault(core_group, set()).add(
+                        worker
+                    )
         affinity_end = time.perf_counter()
         if not self._balanced_pair_logged:
             self._balanced_pair_logged = True
@@ -1260,8 +1306,78 @@ class BaseVectorEnv(object):
         dispatch_call_time_s = 0.0
         wait_call_time_s = 0.0
         recv_call_time_s = 0.0
+        core_donation_time_s = 0.0
+        core_donation_restore_time_s = 0.0
+        core_donation_count = 0
         first_ready_time: float | None = None
         last_recv_time: float | None = None
+
+        donation_enabled = (
+            bool(core_donation_enabled)
+            and dynamic_affinity
+            and bool(slot_cpu_core_groups)
+            and core_donation_max_extra_groups > 0
+        )
+
+        def restore_donated_core_groups() -> None:
+            nonlocal core_donation_restore_time_s
+            if not donation_enabled:
+                return
+            restore_start = time.perf_counter()
+            for worker, base_affinity in base_affinity_by_worker.items():
+                if (
+                    active_affinity_by_worker.get(worker, base_affinity)
+                    != base_affinity
+                ):
+                    if not self._set_worker_process_cpu_affinity(worker, base_affinity):
+                        worker.set_cpu_affinity(base_affinity)
+                    active_affinity_by_worker[worker] = base_affinity
+            core_donation_restore_time_s = time.perf_counter() - restore_start
+
+        def donate_finished_core_group(finished_worker: EnvWorker) -> None:
+            nonlocal core_donation_count, core_donation_time_s
+            if not donation_enabled or not in_flight:
+                return
+            donated_group = base_affinity_by_worker.get(finished_worker, ())
+            if not donated_group:
+                return
+            running_workers = running_workers_by_core_group.get(donated_group)
+            if running_workers:
+                running_workers.discard(finished_worker)
+                if running_workers:
+                    return
+            donation_targets = sorted(
+                in_flight.items(),
+                key=lambda item: (
+                    -self._balanced_pair_predicted_latency_s[id[item[1][0]]],
+                    item[1][0],
+                ),
+            )
+            for target_worker, (local_pos, *_rest) in donation_targets:
+                if extra_groups_by_worker.get(target_worker, 0) >= (
+                    core_donation_max_extra_groups
+                ):
+                    continue
+                current_affinity = active_affinity_by_worker.get(
+                    target_worker,
+                    base_affinity_by_worker.get(target_worker, ()),
+                )
+                new_affinity = tuple(sorted(set(current_affinity) | set(donated_group)))
+                if new_affinity == current_affinity:
+                    continue
+                donation_start = time.perf_counter()
+                if not self._set_worker_process_cpu_affinity(
+                    target_worker, new_affinity
+                ):
+                    target_worker.set_cpu_affinity(new_affinity)
+                donation_end = time.perf_counter()
+                core_donation_time_s += donation_end - donation_start
+                active_affinity_by_worker[target_worker] = new_affinity
+                extra_groups_by_worker[target_worker] = (
+                    extra_groups_by_worker.get(target_worker, 0) + 1
+                )
+                core_donation_count += 1
+                return
 
         def dispatch_slot_env(slot_index: int, pair_offset: int) -> None:
             nonlocal dispatch_call_time_s
@@ -1275,9 +1391,7 @@ class BaseVectorEnv(object):
                 "action_chunk_steps": chunk_size,
                 "pair_offset": pair_offset,
                 "pair_slot": slot_index,
-                "predicted_latency_s": self._balanced_pair_predicted_latency_s[
-                    env_id
-                ],
+                "predicted_latency_s": self._balanced_pair_predicted_latency_s[env_id],
                 "vector_step": self._sim_vector_step_index,
             }
             self._write_subenv_timestamp_event(
@@ -1305,44 +1419,52 @@ class BaseVectorEnv(object):
         initial_dispatch_end = time.perf_counter()
 
         wait_recv_start = time.perf_counter()
-        while in_flight:
-            wait_start = time.perf_counter()
-            ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
-            wait_end = time.perf_counter()
-            wait_call_time_s += wait_end - wait_start
-            if not ready_workers:
-                continue
-            if first_ready_time is None:
-                first_ready_time = wait_end
-            for worker in ready_workers:
-                local_pos, slot_index, pair_offset, start_time, extra = in_flight.pop(
-                    worker
-                )
-                recv_start = time.perf_counter()
-                env_step_results[local_pos] = worker.recv()
-                recv_end = time.perf_counter()
-                recv_call_time_s += recv_end - recv_start
-                last_recv_time = recv_end
-                actual_latency = max(time.perf_counter() - start_time, 0.0)
-                env_id = id[local_pos]
-                old_latency = self._balanced_pair_predicted_latency_s[env_id]
-                self._balanced_pair_predicted_latency_s[env_id] = (
-                    float(ema_alpha) * actual_latency
-                    + (1.0 - float(ema_alpha)) * old_latency
-                )
-                end_extra = dict(extra)
-                end_extra["updated_predicted_latency_s"] = (
-                    self._balanced_pair_predicted_latency_s[env_id]
-                )
-                self._write_subenv_timestamp_event(
-                    "subenv_end",
-                    local_env_id=int(env_id),
-                    worker=worker,
-                    operation="latency_balanced_pair_chunk_step",
-                    perf_start=start_time,
-                    extra=end_extra,
-                )
-                dispatch_slot_env(slot_index, pair_offset + 1)
+        try:
+            while in_flight:
+                wait_start = time.perf_counter()
+                ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
+                wait_end = time.perf_counter()
+                wait_call_time_s += wait_end - wait_start
+                if not ready_workers:
+                    continue
+                if first_ready_time is None:
+                    first_ready_time = wait_end
+                for worker in ready_workers:
+                    (
+                        local_pos,
+                        slot_index,
+                        pair_offset,
+                        start_time,
+                        extra,
+                    ) = in_flight.pop(worker)
+                    recv_start = time.perf_counter()
+                    env_step_results[local_pos] = worker.recv()
+                    recv_end = time.perf_counter()
+                    recv_call_time_s += recv_end - recv_start
+                    last_recv_time = recv_end
+                    actual_latency = max(time.perf_counter() - start_time, 0.0)
+                    env_id = id[local_pos]
+                    old_latency = self._balanced_pair_predicted_latency_s[env_id]
+                    self._balanced_pair_predicted_latency_s[env_id] = (
+                        float(ema_alpha) * actual_latency
+                        + (1.0 - float(ema_alpha)) * old_latency
+                    )
+                    end_extra = dict(extra)
+                    end_extra["updated_predicted_latency_s"] = (
+                        self._balanced_pair_predicted_latency_s[env_id]
+                    )
+                    self._write_subenv_timestamp_event(
+                        "subenv_end",
+                        local_env_id=int(env_id),
+                        worker=worker,
+                        operation="latency_balanced_pair_chunk_step",
+                        perf_start=start_time,
+                        extra=end_extra,
+                    )
+                    donate_finished_core_group(worker)
+                    dispatch_slot_env(slot_index, pair_offset + 1)
+        finally:
+            restore_donated_core_groups()
         wait_recv_end = time.perf_counter()
 
         env_results = [result for result in env_step_results if result is not None]
@@ -1364,6 +1486,10 @@ class BaseVectorEnv(object):
             "wait_recv_s": wait_recv_end - wait_recv_start,
             "wait_call_s": wait_call_time_s,
             "recv_call_s": recv_call_time_s,
+            "core_donation_enabled": donation_enabled,
+            "core_donation_count": core_donation_count,
+            "core_donation_s": core_donation_time_s,
+            "core_donation_restore_s": core_donation_restore_time_s,
             "time_to_first_ready_s": (
                 first_ready_time - wait_recv_start
                 if first_ready_time is not None
@@ -1379,9 +1505,7 @@ class BaseVectorEnv(object):
         }
         return stacked
 
-    def _get_slot_cpu_core_groups(
-        self, slot_count: int
-    ) -> tuple[tuple[int, ...], ...]:
+    def _get_slot_cpu_core_groups(self, slot_count: int) -> tuple[tuple[int, ...], ...]:
         unique_groups: list[tuple[int, ...]] = []
         seen_groups: set[tuple[int, ...]] = set()
         for group in self._env_cpu_core_groups:

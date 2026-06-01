@@ -570,10 +570,14 @@ class RobocasaEnv(gym.Env):
             info_lists_list,
         ) = self.env.latency_balanced_pair_chunk_step(
             chunk_actions,
-            envs_per_core=int(pair_cfg.get("envs_per_core", 2)),
+            envs_per_core=int(pair_cfg.get("envs_per_core", 1)),
             ema_alpha=float(pair_cfg.get("ema_alpha", 0.3)),
             initial_latency_ms=pair_cfg.get("initial_latency_ms", None),
             dynamic_affinity=bool(pair_cfg.get("dynamic_affinity", True)),
+            core_donation_enabled=bool(pair_cfg.get("core_donation_enabled", True)),
+            core_donation_max_extra_groups=int(
+                pair_cfg.get("core_donation_max_extra_groups", 1)
+            ),
         )
 
         obs_list = []

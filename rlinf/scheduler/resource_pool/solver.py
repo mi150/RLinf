@@ -113,7 +113,7 @@ class ResourcePoolSolver:
         else:
             env_cfg = self.cfg.env.train
         pair_cfg = env_cfg.get("latency_balanced_pair", {})
-        return int(pair_cfg.get("envs_per_core", 2))
+        return int(pair_cfg.get("envs_per_core", 1))
 
     def _component_uses_latency_balanced_pair(self) -> bool:
         if bool(getattr(self.cfg.runner, "only_eval", False)):

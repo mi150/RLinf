@@ -121,7 +121,9 @@ env:
       envs_per_core: 1
       ema_alpha: 0.3
       initial_latency_ms: null
-      dynamic_affinity: False
+      dynamic_affinity: True
+      core_donation_enabled: True
+      core_donation_max_extra_groups: 1
 
   eval:
     total_num_envs: 500

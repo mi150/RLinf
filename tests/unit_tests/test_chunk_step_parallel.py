@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import numpy as np
@@ -64,8 +65,7 @@ class BarrierEnv:
         while True:
             with self.arrivals.get_lock():
                 arrived = sum(
-                    self.arrivals[offset + env_id]
-                    for env_id in range(self.num_envs)
+                    self.arrivals[offset + env_id] for env_id in range(self.num_envs)
                 )
             if arrived == self.num_envs:
                 break
@@ -92,6 +92,50 @@ class SleepEnv(CountingEnv):
         return super().step(action)
 
 
+class ScriptedWorker:
+    ready_queue = []
+
+    def __init__(self, env_id: int):
+        self.env_id = env_id
+        self.result = (
+            [np.array([env_id, 1])],
+            [float(env_id)],
+            [False],
+            [{"env_id": env_id}],
+        )
+        self.affinity_calls = []
+
+    def send_chunk_step(self, _chunk_action):
+        ScriptedWorker.ready_queue.append(self)
+
+    def recv(self):
+        return self.result
+
+    def set_cpu_affinity(self, cpus):
+        self.affinity_calls.append(tuple(cpus))
+
+    @staticmethod
+    def wait(workers, _wait_num, _timeout=None):
+        for worker in reversed(ScriptedWorker.ready_queue):
+            if worker in workers:
+                ScriptedWorker.ready_queue.remove(worker)
+                return [worker]
+        return []
+
+
+class FailingRecvWorker(ScriptedWorker):
+    def recv(self):
+        if self.env_id == 0:
+            raise RuntimeError("scripted recv failure")
+        return super().recv()
+
+
+class PidBackedScriptedWorker(ScriptedWorker):
+    def __init__(self, env_id: int, pid: int):
+        super().__init__(env_id)
+        self.process = type("FakeProcess", (), {"pid": pid})()
+
+
 def test_split_env_indices_and_select_local_actions():
     shards = split_env_indices(5, 2)
 
@@ -113,9 +157,7 @@ def test_latency_balanced_pair_mode_is_registered():
 
 
 def test_build_chunk_done_outputs_collapses_to_last_step():
-    raw_terminations = torch.tensor(
-        [[False, True, False], [False, False, False]]
-    )
+    raw_terminations = torch.tensor([[False, True, False], [False, False, False]])
     raw_truncations = torch.tensor([[False, False, False], [True, False, True]])
 
     (
@@ -201,6 +243,52 @@ def test_vector_env_chunk_step_logs_subenv_timestamps(tmp_path):
     assert profile["stack_s"] >= 0.0
 
 
+def test_vector_env_chunk_timestamp_events_are_json_serializable(tmp_path):
+    env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(2)])
+    output_dir = tmp_path / "env_sim_timestamps"
+    env.set_sim_timestamp_context(
+        {
+            "output_dir": str(output_dir),
+            "rank": 3,
+            "pid": 12345,
+            "epoch": 5,
+            "chunk_step": 7,
+            "stage": 1,
+            "stage_num": 2,
+            "local_envs": 2,
+        }
+    )
+
+    try:
+        fake_worker = type(
+            "FakeWorker",
+            (),
+            {
+                "process": type("FakeProcess", (), {"pid": 4321})(),
+                "_cpu_affinity": (7, 8),
+            },
+        )()
+        env._write_subenv_timestamp_event(
+            "end",
+            local_env_id=0,
+            worker=fake_worker,
+            operation="chunk_step",
+            extra={
+                "cpu_affinity": np.array([1, 2]),
+                "nested": {"items": [np.array([3]), np.int64(4)]},
+            },
+        )
+    finally:
+        env.set_sim_timestamp_context(None)
+        env.close()
+
+    line = (output_dir / "env_rank_3.jsonl").read_text().strip()
+    record = json.loads(line)
+    assert record["cpu_affinity"] == [1, 2]
+    assert record["nested"]["items"][0] == [3]
+    assert record["nested"]["items"][1] == 4
+
+
 def test_subproc_vector_env_chunk_step_dispatches_before_recv():
     mp = pytest.importorskip("multiprocessing")
     num_envs = 2
@@ -216,48 +304,46 @@ def test_subproc_vector_env_chunk_step_dispatches_before_recv():
     chunk_actions = np.array([[[1], [2]], [[3], [4]]])
 
     try:
-        obs_list, _rewards_list, _dones_list, infos_list = env.chunk_step(
-            chunk_actions
-        )
+        obs_list, _rewards_list, _dones_list, infos_list = env.chunk_step(chunk_actions)
     finally:
         env.close()
 
     assert obs_list[0].tolist() == [[0, 1, 1], [1, 1, 3]]
     assert obs_list[1].tolist() == [[0, 2, 2], [1, 2, 4]]
     assert all(
-        not info["barrier_timeout"]
-        for step_infos in infos_list
-        for info in step_infos
+        not info["barrier_timeout"] for step_infos in infos_list for info in step_infos
     )
 
 
 def test_subproc_vector_env_latency_balanced_pair_restores_step_major_shape():
-    env = SubprocVectorEnv([lambda i=i: CountingEnv(i) for i in range(4)])
-    chunk_actions = np.array([[[1], [2]], [[3], [4]], [[5], [6]], [[7], [8]]])
+    env = SubprocVectorEnv([lambda i=i: CountingEnv(i) for i in range(2)])
+    env._env_cpu_core_groups = ((0,), (1,))
+    chunk_actions = np.array([[[1], [2]], [[3], [4]]])
 
     try:
         obs_list, rewards_list, dones_list, infos_list = (
             env.latency_balanced_pair_chunk_step(
                 chunk_actions,
-                envs_per_core=2,
+                envs_per_core=1,
                 ema_alpha=0.5,
-                dynamic_affinity=False,
+                dynamic_affinity=True,
+                core_donation_enabled=True,
             )
         )
     finally:
         env.close()
 
     assert len(obs_list) == 2
-    assert obs_list[0].tolist() == [[0, 1, 1], [1, 1, 3], [2, 1, 5], [3, 1, 7]]
-    assert obs_list[1].tolist() == [[0, 2, 2], [1, 2, 4], [2, 2, 6], [3, 2, 8]]
-    assert rewards_list[0].tolist() == [1.0, 13.0, 25.0, 37.0]
-    assert rewards_list[1].tolist() == [2.0, 14.0, 26.0, 38.0]
-    assert dones_list[0].tolist() == [False, False, False, False]
-    assert infos_list[1][3]["local_step"] == 2
-    assert infos_list[1][3]["action"] == 8
+    assert obs_list[0].tolist() == [[0, 1, 1], [1, 1, 3]]
+    assert obs_list[1].tolist() == [[0, 2, 2], [1, 2, 4]]
+    assert rewards_list[0].tolist() == [1.0, 13.0]
+    assert rewards_list[1].tolist() == [2.0, 14.0]
+    assert dones_list[0].tolist() == [False, False]
+    assert infos_list[1][1]["local_step"] == 2
+    assert infos_list[1][1]["action"] == 4
 
 
-def test_latency_balanced_pair_runs_slot_local_pipeline(tmp_path):
+def test_latency_balanced_pair_runs_core_donation_v2_path(tmp_path):
     env = SubprocVectorEnv(
         [
             lambda: SleepEnv(0, 0.02),
@@ -266,6 +352,7 @@ def test_latency_balanced_pair_runs_slot_local_pipeline(tmp_path):
             lambda: SleepEnv(3, 0.02),
         ]
     )
+    env._env_cpu_core_groups = ((0,), (1,), (2,), (3,))
     env._balanced_pair_predicted_latency_s = [10.0, 1.0, 8.0, 2.0]
     chunk_actions = np.array([[[1]], [[2]], [[3]], [[4]]])
     output_dir = tmp_path / "env_sim_timestamps"
@@ -285,9 +372,10 @@ def test_latency_balanced_pair_runs_slot_local_pipeline(tmp_path):
     try:
         env.latency_balanced_pair_chunk_step(
             chunk_actions,
-            envs_per_core=2,
+            envs_per_core=1,
             ema_alpha=0.5,
-            dynamic_affinity=False,
+            dynamic_affinity=True,
+            core_donation_enabled=True,
         )
     finally:
         env.set_sim_timestamp_context(None)
@@ -303,43 +391,154 @@ def test_latency_balanced_pair_runs_slot_local_pipeline(tmp_path):
         if event["event"] == "subenv_start"
     }
     ends = {
-        event["local_env"]: event
-        for event in events
-        if event["event"] == "subenv_end"
+        event["local_env"]: event for event in events if event["event"] == "subenv_end"
     }
 
-    assert starts[1]["pair_slot"] == starts[0]["pair_slot"]
-    assert starts[1]["pair_offset"] == 1
-    assert starts[2]["pair_slot"] != starts[0]["pair_slot"]
-    assert starts[1]["wall_ns"] < ends[2]["wall_ns"]
+    assert all(starts[env_id]["pair_offset"] == 0 for env_id in range(4))
+    assert {starts[env_id]["pair_slot"] for env_id in range(4)} == {0, 1, 2, 3}
+    assert all(
+        event["operation"] == "latency_balanced_pair_chunk_step"
+        for event in ends.values()
+    )
     profile = env.get_last_chunk_profile()
     assert profile is not None
     assert profile["operation"] == "latency_balanced_pair_chunk_step"
     assert profile["env_count"] == 4
-    assert profile["envs_per_core"] == 2
-    assert profile["slot_count"] == 2
+    assert profile["envs_per_core"] == 1
+    assert profile["slot_count"] == 4
     assert profile["wait_call_s"] >= 0.0
     assert profile["recv_call_s"] >= 0.0
 
 
-def test_latency_balanced_pair_rejects_invalid_group_size():
+def test_latency_balanced_pair_donates_finished_core_groups():
+    env = SubprocVectorEnv.__new__(SubprocVectorEnv)
+    env.is_async = False
+    env.env_num = 2
+    env.workers = [ScriptedWorker(0), ScriptedWorker(1)]
+    env.worker_class = ScriptedWorker
+    env.timeout = None
+    env.is_closed = False
+    env._sim_vector_step_index = 0
+    env._sim_timestamp_context = None
+    env._last_chunk_profile = None
+    env._balanced_pair_predicted_latency_s = [10.0, 1.0]
+    env._env_cpu_core_groups = ((0,), (1,))
+    env._balanced_pair_logged = True
+    ScriptedWorker.ready_queue = []
+    chunk_actions = np.array([[[1]], [[2]]])
+
+    env.latency_balanced_pair_chunk_step(
+        chunk_actions,
+        envs_per_core=1,
+        ema_alpha=0.5,
+        dynamic_affinity=True,
+        core_donation_enabled=True,
+        core_donation_max_extra_groups=1,
+    )
+
+    assert env.workers[0].affinity_calls == [(0,), (0, 1), (0,)]
+    assert env.workers[1].affinity_calls == [(1,)]
+    profile = env.get_last_chunk_profile()
+    assert profile is not None
+    assert profile["core_donation_count"] == 1
+    assert profile["core_donation_restore_s"] >= 0.0
+
+
+def test_latency_balanced_pair_restores_donated_cores_on_error():
+    env = SubprocVectorEnv.__new__(SubprocVectorEnv)
+    env.is_async = False
+    env.env_num = 2
+    env.workers = [FailingRecvWorker(0), FailingRecvWorker(1)]
+    env.worker_class = FailingRecvWorker
+    env.timeout = None
+    env.is_closed = False
+    env._sim_vector_step_index = 0
+    env._sim_timestamp_context = None
+    env._last_chunk_profile = None
+    env._balanced_pair_predicted_latency_s = [10.0, 1.0]
+    env._env_cpu_core_groups = ((0,), (1,))
+    env._balanced_pair_logged = True
+    ScriptedWorker.ready_queue = []
+    chunk_actions = np.array([[[1]], [[2]]])
+
+    with pytest.raises(RuntimeError, match="scripted recv failure"):
+        env.latency_balanced_pair_chunk_step(
+            chunk_actions,
+            envs_per_core=1,
+            ema_alpha=0.5,
+            dynamic_affinity=True,
+            core_donation_enabled=True,
+            core_donation_max_extra_groups=1,
+        )
+
+    assert env.workers[0].affinity_calls == [(0,), (0, 1), (0,)]
+
+
+def test_latency_balanced_pair_donation_uses_pid_affinity_without_pipe(monkeypatch):
+    affinity_calls = []
+
+    def fake_sched_setaffinity(pid, cpus):
+        affinity_calls.append((pid, tuple(sorted(cpus))))
+
+    monkeypatch.setattr(os, "sched_setaffinity", fake_sched_setaffinity)
+
+    env = SubprocVectorEnv.__new__(SubprocVectorEnv)
+    env.is_async = False
+    env.env_num = 2
+    env.workers = [PidBackedScriptedWorker(0, 1000), PidBackedScriptedWorker(1, 1001)]
+    env.worker_class = PidBackedScriptedWorker
+    env.timeout = None
+    env.is_closed = False
+    env._sim_vector_step_index = 0
+    env._sim_timestamp_context = None
+    env._last_chunk_profile = None
+    env._balanced_pair_predicted_latency_s = [10.0, 1.0]
+    env._env_cpu_core_groups = ((0,), (1,))
+    env._balanced_pair_logged = True
+    ScriptedWorker.ready_queue = []
+    chunk_actions = np.array([[[1]], [[2]]])
+
+    env.latency_balanced_pair_chunk_step(
+        chunk_actions,
+        envs_per_core=1,
+        ema_alpha=0.5,
+        dynamic_affinity=True,
+        core_donation_enabled=True,
+        core_donation_max_extra_groups=1,
+    )
+
+    assert env.workers[0].affinity_calls == [(0,)]
+    assert env.workers[1].affinity_calls == [(1,)]
+    assert affinity_calls == [(1000, (0, 1)), (1000, (0,))]
+
+
+def test_latency_balanced_pair_rejects_non_core_donation_v2_modes():
     env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(2)])
     chunk_actions = np.array([[[1]], [[2]]])
 
     try:
-        with pytest.raises(ValueError, match="envs_per_core"):
+        with pytest.raises(ValueError, match="core donation v2"):
             env.latency_balanced_pair_chunk_step(chunk_actions, envs_per_core=3)
+        with pytest.raises(ValueError, match="core donation v2"):
+            env.latency_balanced_pair_chunk_step(
+                chunk_actions,
+                envs_per_core=1,
+                dynamic_affinity=False,
+                core_donation_enabled=True,
+            )
+        with pytest.raises(ValueError, match="core donation v2"):
+            env.latency_balanced_pair_chunk_step(
+                chunk_actions,
+                envs_per_core=1,
+                dynamic_affinity=True,
+                core_donation_enabled=False,
+            )
+        with pytest.raises(ValueError, match="requires per-env CPU core groups"):
+            env.latency_balanced_pair_chunk_step(
+                chunk_actions,
+                envs_per_core=1,
+                dynamic_affinity=True,
+                core_donation_enabled=True,
+            )
     finally:
         env.close()
-
-
-def test_latency_balanced_pair_groups_slow_and_fast_envs():
-    env = DummyVectorEnv([lambda i=i: CountingEnv(i) for i in range(4)])
-    env._balanced_pair_predicted_latency_s = [10.0, 1.0, 8.0, 2.0]
-
-    try:
-        groups = env._build_latency_balanced_groups([0, 1, 2, 3], envs_per_core=2)
-    finally:
-        env.close()
-
-    assert groups == [[0, 1], [2, 3]]
