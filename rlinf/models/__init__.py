@@ -218,7 +218,6 @@ def get_model(cfg: DictConfig):
         Worker.torch_platform is not None
         and Worker.torch_platform.is_available()
         and cfg.get("load_to_device", True)
-        and SupportedModel(model_type) != SupportedModel.DREAMZERO
     ):
         model = model.to(Worker.torch_device_type)
 

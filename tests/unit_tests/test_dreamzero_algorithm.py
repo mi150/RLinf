@@ -398,6 +398,31 @@ def test_dreamzero_default_forward_uses_main_action_head_rl_loss():
     assert metrics["dreamzero/raw_action_loss"] == torch.tensor(30.0)
 
 
+def test_dreamzero_policy_syncs_action_head_device_helpers():
+    dreamzero_policy_module = pytest.importorskip(
+        "rlinf.models.embodiment.dreamzero.dreamzero_policy"
+    )
+    DreamZeroPolicy = dreamzero_policy_module.DreamZeroPolicy
+
+    class FakeActionHead:
+        _device = "meta"
+        _vae_device_ready = True
+
+    class FakeDreamZeroPolicy(DreamZeroPolicy):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.action_head = FakeActionHead()
+
+    policy = FakeDreamZeroPolicy()
+    policy._sync_action_head_device()
+
+    assert policy.action_head._device == str(policy.weight.device)
+    assert policy.action_head._vae_device_ready is False
+    assert policy.action_head.trt_engine is None
+    assert policy.action_head.trt_context is None
+
+
 def test_dreamzero_prepare_world_model_inputs_accepts_flat_state_keys():
     dreamzero_policy_module = pytest.importorskip(
         "rlinf.models.embodiment.dreamzero.dreamzero_policy"
@@ -583,6 +608,50 @@ def test_dreamzero_advantage_uses_unified_registry_entry():
     assert result["advantages"].shape == rewards.shape
     assert result["returns"].shape == rewards.shape
     assert torch.all(result["advantages"][loss_mask] >= 0)
+
+
+def test_dreamzero_loader_disables_torch_compile_from_env(monkeypatch):
+    dreamzero_model_module = pytest.importorskip("rlinf.models.embodiment.dreamzero")
+
+    monkeypatch.setenv("DREAMZERO_DISABLE_TORCH_COMPILE", "1")
+
+    def fn(x):
+        return x
+
+    original_compile = torch.compile
+    try:
+        dreamzero_model_module._disable_torch_compile_for_dreamzero()
+        assert torch.compile(fn) is fn
+        assert torch.compile()(fn) is fn
+        assert dreamzero_model_module._dreamzero_disable_torch_compile() is True
+    finally:
+        monkeypatch.setattr(torch, "compile", original_compile)
+
+
+def test_dreamzero_libero_observation_transform_builds_inference_modalities():
+    transforms = pytest.importorskip(
+        "rlinf.data.datasets.dreamzero.data_transforms.observation"
+    )
+
+    transform = transforms.DreamZeroLiberoObservationTransform(num_history_frames=4)
+    env_obs = {
+        "main_images": torch.zeros(2, 256, 256, 3, dtype=torch.uint8),
+        "wrist_images": torch.ones(2, 256, 256, 3, dtype=torch.uint8),
+        "states": torch.zeros(2, 8, dtype=torch.float32),
+        "task_descriptions": ["pick up the bowl", "open the drawer"],
+    }
+
+    converted = transform.convert(env_obs)
+
+    assert converted["video.image"].shape == (2, 1, 256, 256, 3)
+    assert converted["video.wrist_image"].shape == (2, 1, 256, 256, 3)
+    assert converted["state.state"].shape == (2, 1, 8)
+    assert converted["state.joint_position"].shape == (2, 1, 7)
+    assert converted["state.gripper_position"].shape == (2, 1, 1)
+    assert converted["annotation.language.task_description"] == [
+        "pick up the bowl",
+        "open the drawer",
+    ]
 
 
 def test_build_dreamzero_forward_inputs_preserves_batch_time_layout():

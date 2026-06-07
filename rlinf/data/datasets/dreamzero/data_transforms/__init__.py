@@ -31,6 +31,12 @@ from rlinf.data.datasets.dreamzero.data_transforms.libero_sim import (
 from rlinf.data.datasets.dreamzero.data_transforms.oxe_droid import (
     OxeDroidDataTransform,
 )
+from rlinf.data.datasets.dreamzero.data_transforms.observation import (
+    DreamZeroDroidObservationTransform,
+    DreamZeroLiberoObservationTransform,
+    DreamZeroObservationTransform,
+    build_dreamzero_observation_transform,
+)
 
 _EMBODIMENT_REGISTRY: dict[str, type[DreamZeroEmbodimentTransform]] = {
     LiberoSimDataTransform.TAG: LiberoSimDataTransform,
@@ -51,6 +57,10 @@ __all__ = [
     "format_training_prompt",
     "normalize_instruction_text",
     "rollout_obs_layout_for_embodiment",
+    "DreamZeroDroidObservationTransform",
+    "DreamZeroLiberoObservationTransform",
+    "DreamZeroObservationTransform",
+    "build_dreamzero_observation_transform",
 ]
 
 

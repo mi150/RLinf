@@ -12,35 +12,79 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+import os
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import numpy as np
 import torch
-from groot.vla.model.dreamzero.base_vla import VLA
+from groot.vla.data.transform import ComposedModalityTransform
+from groot.vla.model.dreamzero.base_vla import VLA, VLAConfig
 from tianshou.data import Batch
+from transformers.configuration_utils import PretrainedConfig
 
 from rlinf.algorithms.dreamzero import set_dreamzero_loss_payload
 from rlinf.data.datasets.dreamzero.data_transforms import (
-    collect_dreamzero_dataset_keys,
-    convert_rollout_env_obs,
-    rollout_obs_layout_for_embodiment,
+    DreamZeroObservationTransform,
 )
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
-from rlinf.models.embodiment.dreamzero.dreamzero_config import DreamZeroConfig
 from rlinf.models.embodiment.dreamzero.world_model import DreamZeroWorldModel
+from rlinf.utils.logging import get_logger
+
+
+@dataclass
+class DreamZeroConfig(VLAConfig):
+    model_type = "dreamzero"
+    backbone_cfg: PretrainedConfig = field(
+        default=None, metadata={"help": "Backbone configuration."}
+    )
+
+    action_head_cfg: PretrainedConfig = field(
+        default=None, metadata={"help": "Action head configuration."}
+    )
+
+    action_horizon: int = field(default=None, metadata={"help": "Action horizon."})
+
+    action_dim: int = field(default=None, metadata={"help": "Action dimension."})
+    compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
+
+    env_action_dim: int = field(
+        default=None, metadata={"help": "Environment action dimension."}
+    )
+    num_action_chunks: int = field(
+        default=16, metadata={"help": "Number of action chunks."}
+    )
+
+    relative_action: bool = field(default=False, metadata={"help": "Relative action."})
+    relative_action_per_horizon: bool = field(
+        default=False, metadata={"help": "Relative action per horizon."}
+    )
+    relative_action_keys: list = field(
+        default_factory=list, metadata={"help": "Relative action keys."}
+    )
+
+    data_transforms: ComposedModalityTransform = field(
+        default=None,
+        metadata={
+            "help": "Transforming data modalities, e.g. video frame augmentation or action normalization."
+        },
+    )
+
+    gradient_checkpointing: bool = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class DreamZeroPolicy(VLA, BasePolicy):
     """Lightweight DreamZero action model: IdentityBackbone + WANPolicyHead."""
 
-    # CausalWanModel has to be wrapped to avoid a FSDP2 bug
-    # when using with gradient checkpointing
     _no_split_modules = [
         "T5SelfAttention",  # text encoder
         "AttentionBlock",  # vae
-        "CausalWanModel",  # action head
-        "CausalWanAttentionBlock",  # action head layer
+        "CausalWanAttentionBlock",  # action head
     ]
 
     def __init__(
@@ -49,144 +93,32 @@ class DreamZeroPolicy(VLA, BasePolicy):
     ):
         super().__init__(config)
         self.config = config
-        embodiment_tag = config.embodiment_tag
-        if embodiment_tag is None:
-            raise ValueError(
-                "DreamZeroPolicy requires config.embodiment_tag (set in get_model)."
-            )
-        self._rollout_obs_layout = rollout_obs_layout_for_embodiment(embodiment_tag)
-        _, _, action_keys, _ = collect_dreamzero_dataset_keys(
-            config.data_transforms, embodiment_tag
-        )
-        self._action_keys = tuple(action_keys)
-        self.world_model: DreamZeroWorldModel | None = None
-
-    @staticmethod
-    def _tree_to_device(value: Any, device: torch.device) -> Any:
-        if torch.is_tensor(value):
-            return value.to(device)
-        if isinstance(value, list):
-            return [DreamZeroPolicy._tree_to_device(item, device) for item in value]
-        if isinstance(value, tuple):
-            return tuple(DreamZeroPolicy._tree_to_device(item, device) for item in value)
-        if isinstance(value, dict):
-            return {
-                key: DreamZeroPolicy._tree_to_device(item, device)
-                for key, item in value.items()
-            }
-        return value
-
-    def _patch_action_head_cache_device(self) -> None:
-        action_head = getattr(self, "action_head", None)
-        if action_head is None or getattr(
-            action_head, "_rlinf_cache_device_patch_applied", False
-        ):
-            return
-        run_diffusion_steps = getattr(action_head, "_run_diffusion_steps", None)
-        if run_diffusion_steps is None:
-            return
-
-        def _run_diffusion_steps_device_guard(*args, **kwargs):
-            noisy_input = kwargs.get("noisy_input")
-            if noisy_input is None and args:
-                noisy_input = args[0]
-            if torch.is_tensor(noisy_input):
-                device = noisy_input.device
-                for cache_key in ("kv_caches", "crossattn_caches"):
-                    if cache_key in kwargs:
-                        kwargs[cache_key] = self._tree_to_device(
-                            kwargs[cache_key], device
-                        )
-            return run_diffusion_steps(*args, **kwargs)
-
-        action_head._run_diffusion_steps = _run_diffusion_steps_device_guard
-        action_head._rlinf_cache_device_patch_applied = True
-
-    # This method is called in FSDPModelManager.setup_model_and_optimizer
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
         try:
             diffusion_model = getattr(getattr(self, "action_head", None), "model", None)
-            enabled = True
-            use_reentrant = gradient_checkpointing_kwargs.get("use_reentrant", True)
-
-            if diffusion_model is None:
-                raise ValueError("DreamZero policy must have action_head.")
-
-            if hasattr(diffusion_model, "_set_gradient_checkpointing"):
-                diffusion_model._set_gradient_checkpointing(diffusion_model, enabled)
-            elif hasattr(diffusion_model, "gradient_checkpointing"):
-                diffusion_model.gradient_checkpointing = enabled
-
-            setattr(
-                diffusion_model, "gradient_checkpointing_use_reentrant", use_reentrant
-            )
-
-            logging.warning(
-                "DreamZero gradient checkpointing is enabled. If you encounter errors "
-                "or memory leaks, consider: (1) upgrading to PyTorch 2.10 or later; "
-                "(2) using use_reentrant=True to avoid issues when CUDA graphs and "
-                "gradient checkpointing are used together."
-            )
-
+            enabled = self.config.gradient_checkpointing
+            if diffusion_model is not None:
+                if hasattr(diffusion_model, "_set_gradient_checkpointing"):
+                    diffusion_model._set_gradient_checkpointing(
+                        diffusion_model, enabled
+                    )
+                elif hasattr(diffusion_model, "gradient_checkpointing"):
+                    diffusion_model.gradient_checkpointing = enabled
         except Exception:
             pass
+        self.world_model: DreamZeroWorldModel | None = None
+        self.observation_transform: DreamZeroObservationTransform | None = getattr(
+            config, "observation_transform", None
+        )
 
     def apply(self, batch: Batch, **kwargs) -> Batch:
-        """Run the forward modality pipeline on rollout observations.
-
-        Input ``batch.obs`` is already in DreamZero modality keys (e.g.
-        ``video.image``, ``state.state``, language key) from
-        ``_observation_convert``. This method delegates to
-        ``config.data_transforms``, built in ``get_model`` from Hydra cfg and
-        ``metadata.json`` (via ``load_dreamzero_dataset_metadata`` +
-        ``data_transforms.set_metadata``).
-
-        Pipeline (libero_sim example, see ``libero_sim._build_composed_transform``):
-
-        1. Video / state / action preprocessing and normalization
-           (``StateActionTransform`` uses q99 stats from metadata).
-        2. ``ConcatTransform.apply``: concat per-key tensors into flat
-           ``state`` / ``action`` vectors. Per-key widths come from metadata
-           (e.g. ``action.actions`` shape ``[7]`` for Libero).
-        3. ``DreamTransform.apply``: pad state/action to ``max_state_dim`` /
-           ``max_action_dim`` (typically 32 from yaml) so the WAN action head
-           always sees a fixed width. Extra padded dims are zeros and masked
-           during training; at inference the model still outputs width 32.
-
-        The returned ``batch.normalized_obs`` is the dict consumed by
-        ``lazy_joint_video_action_causal`` (tokens, video, padded actions, etc.).
-        """
+        """Normalize inputs"""
         obs = batch.obs
         normalized_input = self.config.data_transforms(obs)
         batch.normalized_obs = normalized_input
         return batch
 
     def unapply(self, batch: Batch, obs: Optional[dict] = None, **kwargs):
-        """Invert model actions back to environment-scale per-modality tensors.
-
-        ``batch.normalized_action`` is ``action_pred`` from the WAN head, shape
-        ``[..., max_action_dim]`` (e.g. 32), matching the padded width from
-        ``DreamTransform.apply``. Environment DOF is smaller (e.g. Libero 7);
-        that width is **not** taken from Hydra ``action_dim`` on the policy—it
-        comes from ``metadata.json`` loaded at build time:
-
-        - ``get_model`` calls ``data_transforms.set_metadata(metadata)``.
-        - ``ConcatTransform.set_metadata`` sets ``action_dims["action.actions"]``
-          from ``metadata.modalities.action.<key>.shape[0]`` (7 for libero_sim).
-        - On ``unapply``, transforms run in reverse order:
-          ``DreamTransform.unapply`` (passthrough) →
-          ``ConcatTransform.unapply`` slices ``[..., 0:env_dim]`` per
-          ``action_concat_order`` → ``StateActionTransform.unapply`` reverses
-          q99 normalization.
-
-        Output is a dict like ``{"action.actions": tensor}`` with **env** width
-        (7 for Libero). ``predict_action_batch`` then merges keys via
-        ``_actions_from_unapply`` for the sim.
-
-        If ``relative_action`` / ``relative_action_per_horizon`` is enabled,
-        optionally adds the last ``state.*`` from ``obs`` (converted rollout
-        obs passed from ``predict_action_batch``) to obtain absolute actions.
-        """
+        """Unnormalize actions and convert relative actions to absolute if needed"""
         unnormalized_action = self.config.data_transforms.unapply(
             {"action": batch.normalized_action.cpu()}
         )
@@ -262,7 +194,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         batch.act = unnormalized_action
         return batch
 
-    def _process_batch(self, batch: Batch) -> dict[str, Any]:
+    def _process_batch(self, batch: Batch) -> Batch:
         """Process batch."""
         self._sync_action_head_device()
         # Normalize / transform
@@ -283,7 +215,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
         return normalized_input
 
     def _sync_action_head_device(self) -> None:
-        """Keep DreamZero action-head helper tensors on this worker's device."""
         action_head = getattr(self, "action_head", None)
         if action_head is None:
             return
@@ -296,7 +227,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
             action_head._device = str(device)
             if hasattr(action_head, "_vae_device_ready"):
                 action_head._vae_device_ready = False
-        self._patch_action_head_cache_device()
+        if not hasattr(action_head, "trt_engine"):
+            action_head.trt_engine = None
+        if not hasattr(action_head, "trt_context"):
+            action_head.trt_context = None
 
     @staticmethod
     def _to_tensor(value: Any, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -304,6 +238,85 @@ class DreamZeroPolicy(VLA, BasePolicy):
         if dtype is not None and tensor.is_floating_point():
             tensor = tensor.to(dtype=dtype)
         return tensor
+
+    @staticmethod
+    def _action_debug_stats(value: Any) -> dict[str, Any]:
+        arr = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+        arr = np.asarray(arr)
+        flat = arr.astype(np.float32, copy=False).reshape(-1)
+        if flat.size == 0:
+            return {"shape": tuple(arr.shape), "empty": True}
+        return {
+            "shape": tuple(arr.shape),
+            "min": float(np.nanmin(flat)),
+            "max": float(np.nanmax(flat)),
+            "mean": float(np.nanmean(flat)),
+            "std": float(np.nanstd(flat)),
+            "sample": arr.reshape(-1, arr.shape[-1])[:2].tolist()
+            if arr.ndim > 0
+            else arr.tolist(),
+        }
+
+    def _debug_action_payload(
+        self,
+        *,
+        normalized_action: torch.Tensor,
+        unnormalized_action: dict[str, Any],
+        env_actions: np.ndarray,
+    ) -> None:
+        if os.getenv("DREAMZERO_DEBUG_ACTIONS", "0").lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return
+        if getattr(self, "_debug_action_logged", 0) >= int(
+            os.getenv("DREAMZERO_DEBUG_ACTIONS_LIMIT", "3")
+        ):
+            return
+        self._debug_action_logged = getattr(self, "_debug_action_logged", 0) + 1
+        logger = get_logger()
+        logger.info(
+            "[DreamZero action debug] normalized_action=%s",
+            self._action_debug_stats(normalized_action),
+        )
+        for key, value in sorted(unnormalized_action.items()):
+            if hasattr(value, "shape"):
+                logger.info(
+                    "[DreamZero action debug] unnormalized %s=%s",
+                    key,
+                    self._action_debug_stats(value),
+                )
+        logger.info(
+            "[DreamZero action debug] env_actions=%s gripper_counts=%s",
+            self._action_debug_stats(env_actions),
+            {
+                str(k): int(v)
+                for k, v in zip(
+                    *np.unique(env_actions[..., -1].reshape(-1), return_counts=True)
+                )
+            },
+        )
+
+    @staticmethod
+    def _map_gripper_for_env(actions: np.ndarray) -> np.ndarray:
+        mode = os.getenv("DREAMZERO_GRIPPER_MODE", "pm1").lower()
+        raw = actions[..., -1].copy()
+        if mode in ("pm1", "plus_minus_one", "default"):
+            actions[..., -1] = np.where(raw > 0, 1.0, -1.0).astype(actions.dtype)
+        elif mode in ("zero_one", "01"):
+            actions[..., -1] = np.where(raw > 0.5, 1.0, 0.0).astype(actions.dtype)
+        elif mode in ("flip_pm1", "pm1_flip"):
+            actions[..., -1] = np.where(raw > 0, -1.0, 1.0).astype(actions.dtype)
+        elif mode in ("raw", "none"):
+            actions[..., -1] = raw.astype(actions.dtype)
+        else:
+            raise ValueError(
+                "Unsupported DREAMZERO_GRIPPER_MODE="
+                f"{mode!r}; use pm1, zero_one, flip_pm1, or raw."
+            )
+        return actions
 
     def _flatten_rl_tensor_payload(
         self, normalized_input: dict[str, Any]
@@ -333,11 +346,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             return images
         if images.shape[1] > target_frames:
             return images[:, -target_frames:]
-        repeat_shape = (
-            images.shape[0],
-            target_frames - images.shape[1],
-            *images.shape[2:],
-        )
+        repeat_shape = (images.shape[0], target_frames - images.shape[1], *images.shape[2:])
         pad = images[:, :1].expand(repeat_shape)
         return torch.cat([pad, images], dim=1)
 
@@ -379,38 +388,78 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 return fallback
         return fallback
 
-    def _observation_convert(self, env_obs: dict) -> dict:
-        """Map RLinf rollout observations to DreamZero modality keys."""
-        return convert_rollout_env_obs(self.config.embodiment_tag, env_obs)
-
-    def _actions_from_unapply(self, act_dict: dict[str, Any]) -> np.ndarray:
-        """Concatenate per-key unnormalized actions in dataset concat order."""
-        parts: list[np.ndarray] = []
-        for key in self._action_keys:
-            if key not in act_dict:
-                raise KeyError(
-                    f"Unnormalized action missing {key!r}; "
-                    f"available keys: {sorted(act_dict)}."
+    def _extract_env_actions(self, act: dict[str, Any]) -> np.ndarray:
+        if "action.actions" in act:
+            actions = act["action.actions"]
+        elif "action" in act:
+            actions = act["action"]
+        else:
+            action_keys = [
+                key
+                for key in ("action.joint_position", "action.gripper_position")
+                if key in act
+            ]
+            if not action_keys:
+                action_keys = sorted(
+                    key
+                    for key, value in act.items()
+                    if key.startswith("action.") and hasattr(value, "shape")
                 )
-            value = act_dict[key]
-            if torch.is_tensor(value):
-                value = value.detach().cpu().numpy()
-            parts.append(np.asarray(value))
-        if len(parts) == 1:
-            return parts[0]
-        return np.concatenate(parts, axis=-1)
+            if not action_keys:
+                raise KeyError(f"No action tensors found in DreamZero output: {list(act.keys())}")
+            tensors = [act[key] for key in action_keys]
+            if any(torch.is_tensor(tensor) for tensor in tensors):
+                tensors = [
+                    tensor if torch.is_tensor(tensor) else torch.as_tensor(tensor)
+                    for tensor in tensors
+                ]
+                actions = torch.cat(tensors, dim=-1)
+            else:
+                actions = np.concatenate(tensors, axis=-1)
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
+        actions = np.asarray(actions, dtype=np.float32)
+        env_action_dim = self.config.env_action_dim
+        if env_action_dim is not None and actions.shape[-1] != env_action_dim:
+            if actions.shape[-1] > env_action_dim and env_action_dim >= 2:
+                actions = np.concatenate(
+                    [actions[..., : env_action_dim - 1], actions[..., -1:]], axis=-1
+                )
+            elif actions.shape[-1] > env_action_dim:
+                actions = actions[..., :env_action_dim]
+            else:
+                padded = np.zeros((*actions.shape[:-1], env_action_dim), dtype=actions.dtype)
+                padded[..., : actions.shape[-1]] = actions
+                actions = padded
+        num_action_chunks = self.config.num_action_chunks
+        if num_action_chunks is not None and actions.ndim >= 3:
+            actions = actions[:, :num_action_chunks, :]
+        return actions
+
+    def _observation_convert(self, env_obs: dict) -> dict:
+        """Convert environment observation to DreamZero model input."""
+        if self.observation_transform is None:
+            raise RuntimeError(
+                "DreamZeroPolicy requires config.observation_transform for env "
+                "observation conversion."
+            )
+        converted_obs = self.observation_transform.convert(env_obs)
+        prompts = converted_obs.get("annotation.language.task_description", [])
+        if os.getenv("DREAMZERO_DEBUG_LANGUAGE", "0").lower() in ("1", "true", "yes"):
+            preview = list(prompts)[: min(2, len(prompts))]
+            get_logger().info("[DreamZero language] task_descriptions=%s", preview)
+        return converted_obs
 
     def predict_action_batch(self, env_obs, mode, **kwargs) -> np.ndarray:
         """
         input:
             env_obs:
                 - main_images: [B,H,W,C] uint8
-                - wrist_images: [B,H,W,C] (optional, embodiment-specific)
-                - extra_view_images: [B,N,H,W,C] (optional, e.g. oxe_droid)
+                - extra_view_images: [B,H,W,C]
                 - states: [B,D]
                 - task_descriptions: list[str] or None
         output:
-            actions: np.ndarray [B, num_action_chunks, action_dim]
+            actions: np.ndarray [B, num_action_chunks, 8]  # 6ee + 1 gripper
             result: dict  # compatible with rollout interface"""
 
         converted_obs = self._observation_convert(env_obs)
@@ -422,24 +471,28 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
         normalized_action = model_pred["action_pred"].float()
 
-        batch = self.unapply(
-            Batch(normalized_action=normalized_action),
-            obs=converted_obs,
+        # Unnormalize actions (pass obs for relative action normalization)
+        unnormalized_action = self.config.data_transforms.unapply(
+            {"action": normalized_action.cpu()}
         )
-        actions = self._actions_from_unapply(batch.act)
+        batch.act = unnormalized_action
 
-        if self._rollout_obs_layout.binarize_gripper:
-            actions[..., -1] = np.where(actions[..., -1] > 0, 1.0, -1.0).astype(
-                actions.dtype
-            )
-
-        flat = (
-            torch.as_tensor(actions, dtype=torch.float32)
-            .reshape(actions.shape[0], -1)
-            .cpu()
+        actions = self._extract_env_actions(batch.act)
+        actions = self._map_gripper_for_env(actions)
+        self._debug_action_payload(
+            normalized_action=normalized_action,
+            unnormalized_action=batch.act,
+            env_actions=actions,
         )
+
+        assert actions.shape[-1] == self.config.env_action_dim, (
+            f"Action shape mismatch: {actions.shape} != {self.config.env_action_dim}"
+        )
+
+        env_action_tensor = torch.as_tensor(actions, dtype=torch.float32).cpu()
+        flat_env_action = env_action_tensor.reshape(actions.shape[0], -1)
         real_action_dim = self._infer_real_action_dim(
-            min(normalized_action.shape[-1], actions.shape[-1])
+            min(normalized_action.shape[-1], actions.shape[-1] + 1)
         )
         action_mask = torch.zeros_like(normalized_action, dtype=torch.bool)
         action_mask[..., :real_action_dim] = True
@@ -450,7 +503,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             normalized_action.shape[0], dtype=torch.bool
         )
         forward_inputs = {
-            "action": flat,
+            "action": flat_env_action,
             "model_action": normalized_action.cpu()
             .reshape(normalized_action.shape[0], -1)
             .contiguous(),
@@ -458,8 +511,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         forward_inputs.update(self._flatten_rl_tensor_payload(rl_input))
         forward_inputs = self._normalize_forward_payload_for_rollout(forward_inputs)
         result = {
-            "prev_logprobs": torch.zeros_like(flat, dtype=torch.float32),
-            "prev_values": torch.zeros((flat.shape[0], 1), dtype=torch.float32),
+            "prev_logprobs": torch.zeros_like(flat_env_action, dtype=torch.float32),
+            "prev_values": torch.zeros((flat_env_action.shape[0], 1), dtype=torch.float32),
             "forward_inputs": forward_inputs,
         }
         return actions, result
@@ -473,10 +526,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data=None, **kwargs):
-        # Mark the start of each training iteration so PyTorch knows when
-        # to reclaim memory held by CUDA graphs from the previous iteration.
-        torch.compiler.cudagraph_mark_step_begin()
-
         if data is None:
             data = kwargs.get("data")
         if data is None:
@@ -516,7 +565,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         if kwargs.get("compute_entropy", False):
             result["entropy"] = torch.zeros_like(actions, dtype=torch.float32)
         if kwargs.get("compute_values", False):
-            result["values"] = world_model.value_model(outputs["posterior_features"].detach())
+            values = world_model.value_model(outputs["posterior_features"].detach())
+            result["values"] = values
         return result
 
     def rl_forward(
@@ -581,6 +631,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     extra_metrics["dreamzero/base_loss"] = outputs["loss"].detach()
 
         action_loss = torch.stack(action_losses)
+
         losses = {"action_loss": action_loss}
         metrics = {
             "dreamzero/raw_action_loss": action_loss.detach().mean(),
@@ -694,11 +745,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
             )
         actions = self._flatten_world_model_time_axes(actions, "actions")
         curr_obs["states"] = self._align_world_model_states_to_actions(
-            curr_obs["states"], actions
+            curr_obs["states"], actions, "curr_obs"
         )
         if next_obs is not None:
             next_obs["states"] = self._align_world_model_states_to_actions(
-                next_obs["states"], actions
+                next_obs["states"], actions, "next_obs"
             )
         if curr_obs["states"].shape[1] == 1 and actions.shape[1] > 1:
             curr_obs["states"] = curr_obs["states"].expand(
@@ -751,7 +802,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
     @staticmethod
     def _flatten_world_model_time_axes(tensor: torch.Tensor, name: str) -> torch.Tensor:
-        if tensor.ndim <= 3:
+        if tensor.ndim < 3:
+            return tensor
+        if tensor.ndim == 3:
             return tensor
         return tensor.reshape(tensor.shape[0], -1, tensor.shape[-1])
 
@@ -759,6 +812,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
     def _align_world_model_states_to_actions(
         states: torch.Tensor,
         actions: torch.Tensor,
+        name: str,
     ) -> torch.Tensor:
         if states.ndim != 3 or actions.ndim != 3:
             return states
