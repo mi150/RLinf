@@ -110,10 +110,299 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     return ret_dict
 
 
-def process_nested_dict_for_train(nested_dict, shuffle_id):
+def filter_dreamzero_lora_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    enabled: bool,
+) -> dict[str, torch.Tensor]:
+    if not enabled:
+        return state_dict
+
+    trainable_prefixes = (
+        "action_head.model.base_model.model.action_decoder.",
+        "action_head.model.base_model.model.action_encoder.",
+        "action_head.model.base_model.model.state_encoder.",
+    )
+    filtered = {
+        key: value
+        for key, value in state_dict.items()
+        if ".lora_" in key.lower() or key.startswith(trainable_prefixes)
+    }
+    if not filtered:
+        raise ValueError("DreamZero LoRA rollout state_dict filter matched no keys.")
+    return filtered
+
+
+def get_dreamzero_loss_action_dim(model_cfg, loss_type: str) -> int:
+    action_dim = model_cfg.get("action_dim", 7)
+    model_type = model_cfg.get("model_type")
+    if (
+        SupportedModel(model_type) == SupportedModel.DREAMZERO
+        and loss_type != "dreamzero_action_head_rl"
+    ):
+        return model_cfg.get("env_action_dim", action_dim)
+    return action_dim
+
+
+def strip_dreamzero_action_head_payload(
+    forward_inputs: dict[str, torch.Tensor] | None,
+) -> dict[str, torch.Tensor] | None:
+    if forward_inputs is None:
+        return None
+    world_model_keys = {
+        "curr_states",
+        "next_states",
+        "actions",
+        "rewards",
+        "dones",
+    }
+    return {
+        key: value
+        for key, value in forward_inputs.items()
+        if key in world_model_keys
+    }
+
+
+def get_dreamzero_train_rollout_size(
+    rollout_batch: dict[str, torch.Tensor],
+    loss_type: str,
+    *,
+    is_flattened: bool = False,
+) -> int:
+    if loss_type != "dreamzero_world_model_proxy":
+        prev_logprobs = rollout_batch["prev_logprobs"]
+        if is_flattened:
+            return prev_logprobs.shape[0]
+        return prev_logprobs.shape[0] * prev_logprobs.shape[1]
+
+    forward_inputs = rollout_batch.get("forward_inputs", {})
+    actions = forward_inputs.get("actions", None)
+    if actions is None:
+        actions = rollout_batch.get("actions", None)
+    if actions is None:
+        raise KeyError(
+            "DreamZero world-model proxy rollout batch requires transition "
+            "actions before actor training."
+        )
+    if is_flattened:
+        return actions.shape[0]
+    return actions.shape[0] * actions.shape[1]
+
+
+def ensure_dreamzero_world_model_forward_inputs(
+    batch: dict[str, torch.Tensor],
+    forward_inputs: dict[str, torch.Tensor] | None,
+    env_action_dim: int | None = None,
+) -> dict[str, torch.Tensor] | None:
+    forward_inputs = strip_dreamzero_action_head_payload(forward_inputs) or {}
+
+    def _restore_flat_actions(actions: torch.Tensor) -> torch.Tensor:
+        if actions.ndim != 2 or not env_action_dim:
+            return actions
+        if actions.shape[-1] == env_action_dim:
+            return actions
+        if actions.shape[-1] % env_action_dim != 0:
+            return actions
+        return actions.reshape(actions.shape[0], -1, env_action_dim)
+
+    def _align_states_to_actions(
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if (
+            states.ndim == 2
+            and actions.ndim == 3
+            and env_action_dim
+            and states.shape[-1] == actions.shape[1] * env_action_dim
+        ):
+            states = states.reshape(states.shape[0], actions.shape[1], -1)
+        if states.ndim == actions.ndim - 1:
+            states = states.unsqueeze(1).expand(
+                states.shape[0], actions.shape[1], *states.shape[1:]
+            )
+        if (
+            states.ndim == actions.ndim
+            and states.shape[1] != actions.shape[1]
+            and states.shape[-1] == actions.shape[1]
+        ):
+            states = states.transpose(1, 2).contiguous()
+        if states.ndim != actions.ndim:
+            raise ValueError(
+                f"DreamZero {name} states must align with actions; "
+                f"got states={tuple(states.shape)}, actions={tuple(actions.shape)}."
+            )
+        return states
+
+    def _normalize_existing_payload(
+        inputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        normalized = dict(inputs)
+        actions = normalized.get("actions")
+        if torch.is_tensor(actions):
+            normalized["actions"] = _restore_flat_actions(actions)
+            actions = normalized["actions"]
+        for key in ("curr_states", "next_states"):
+            value = normalized.get(key)
+            if torch.is_tensor(value):
+                if torch.is_tensor(actions):
+                    normalized[key] = _align_states_to_actions(
+                        value,
+                        actions,
+                        key,
+                    )
+                elif value.ndim == 2:
+                    normalized[key] = value.unsqueeze(1)
+        for key in ("rewards", "dones"):
+            value = normalized.get(key)
+            if not torch.is_tensor(value):
+                continue
+            if torch.is_tensor(actions) and value.ndim == 2:
+                if value.shape[-1] == actions.shape[1]:
+                    normalized[key] = value.unsqueeze(-1)
+                elif value.shape[-1] == 1 and actions.ndim == 3:
+                    normalized[key] = value.unsqueeze(1).expand(
+                        value.shape[0],
+                        actions.shape[1],
+                        value.shape[-1],
+                    )
+                    continue
+            if value.ndim == 2:
+                normalized[key] = value.unsqueeze(-1)
+            if normalized[key].ndim == 2:
+                normalized[key] = normalized[key].unsqueeze(1)
+        return normalized
+
+    can_rebuild_from_batch = {"curr_obs", "next_obs", "actions", "rewards", "dones"} <= set(
+        batch
+    )
+    if "curr_states" in forward_inputs and "next_states" in forward_inputs:
+        normalized = _normalize_existing_payload(forward_inputs)
+        if not can_rebuild_from_batch:
+            return normalized
+        existing_actions = normalized.get("actions")
+        batch_actions = batch["actions"]
+        if (
+            torch.is_tensor(existing_actions)
+            and existing_actions.shape == batch_actions.shape
+        ):
+            return normalized
+
+    if not can_rebuild_from_batch:
+        raise KeyError(
+            "DreamZero world-model proxy cannot rebuild forward inputs from "
+            "micro-batch. Set rollout.collect_transitions=true so actor "
+            "training receives curr_obs and next_obs."
+        )
+
+    actions = batch["actions"]
+    dones = batch["dones"]
+    if dones.shape[0] == actions.shape[0] + 1:
+        dones = dones[1:]
+
+    def _states(obs: dict[str, torch.Tensor], name: str) -> torch.Tensor:
+        return _align_states_to_actions(obs["states"], actions, name)
+
+    forward_inputs.update(
+        {
+            "curr_states": _states(batch["curr_obs"], "current"),
+            "next_states": _states(batch["next_obs"], "next"),
+            "actions": actions,
+            "rewards": batch["rewards"].unsqueeze(-1),
+            "dones": dones.unsqueeze(-1),
+        }
+    )
+    return forward_inputs
+
+
+def build_dreamzero_forward_inputs(
+    rollout_batch: dict[str, torch.Tensor],
+    preserve_action_head_payload: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Build DreamZero RL inputs while preserving model-native payloads."""
+
+    def _clamp_action_head_input(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.clamp(-1.0, 1.0) if torch.is_floating_point(tensor) else tensor
+
+    def _expand_obs_to_action_chunks(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim < 3:
+            raise ValueError(
+                "DreamZero observation tensors must have shape [chunk_step, batch, ...], "
+                f"got {tuple(tensor.shape)}."
+            )
+        chunk_size = actions.shape[2]
+        return tensor.unsqueeze(2).expand(
+            tensor.shape[0], tensor.shape[1], chunk_size, *tensor.shape[2:]
+        )
+
+    def _expand_single_frame_video_for_action_head(
+        images: torch.Tensor, actions: torch.Tensor
+    ) -> torch.Tensor:
+        if images.ndim < 5:
+            return images
+        if images.shape[2] != 1:
+            return images
+        action_steps = actions.shape[-2]
+        if action_steps <= 0:
+            return images
+        num_action_per_block = 24
+        num_frame_per_block = 2
+        blocks = max(1, action_steps // num_action_per_block)
+        target_frames = blocks * num_frame_per_block * 4 + 1
+        return images.expand(*images.shape[:2], target_frames, *images.shape[3:])
+
+    actions = rollout_batch["actions"]
+    rewards = rollout_batch["rewards"]
+    dones = rollout_batch["dones"]
+    if dones.shape[0] == actions.shape[0] + 1:
+        dones = dones[1:]
+
+    forward_inputs = dict(rollout_batch.get("forward_inputs", {}))
+    forward_inputs.update(
+        {
+            "curr_states": _expand_obs_to_action_chunks(
+                rollout_batch["curr_obs"]["states"]
+            ),
+            "next_states": _expand_obs_to_action_chunks(
+                rollout_batch["next_obs"]["states"]
+            ),
+            "actions": actions,
+            "rewards": rewards.unsqueeze(-1),
+            "dones": dones.unsqueeze(-1),
+        }
+    )
+    if "model_action" in forward_inputs:
+        forward_inputs["model_action"] = forward_inputs["model_action"].reshape(
+            *actions.shape[:2],
+            -1,
+        )
+        forward_inputs["model_action"] = _clamp_action_head_input(
+            forward_inputs["model_action"]
+        )
+    if not preserve_action_head_payload:
+        forward_inputs = strip_dreamzero_action_head_payload(forward_inputs)
+    if preserve_action_head_payload and "dreamzero_rl.action" in forward_inputs:
+        forward_inputs["dreamzero_rl.action"] = _clamp_action_head_input(
+            forward_inputs["dreamzero_rl.action"]
+        )
+        if "dreamzero_rl.images" in forward_inputs:
+            forward_inputs["dreamzero_rl.images"] = (
+                _expand_single_frame_video_for_action_head(
+                    forward_inputs["dreamzero_rl.images"],
+                    forward_inputs["dreamzero_rl.action"],
+                )
+            )
+    return forward_inputs
+
+
+def process_nested_dict_for_train(nested_dict, shuffle_id, trim_rollout_fields=True):
     ret_dict = {}
     for key, value in nested_dict.items():
-        if key in ["dones", "terminations", "truncations", "prev_values"]:
+        if trim_rollout_fields and key in [
+            "dones",
+            "terminations",
+            "truncations",
+            "prev_values",
+        ]:
             value = value[:-1]
         if "env_info" in key:
             raise NotImplementedError
@@ -122,7 +411,11 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
         if isinstance(value, torch.Tensor):
             ret_dict[key] = value.reshape(-1, *value.shape[2:])[shuffle_id]
         elif isinstance(value, dict):
-            ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
+            ret_dict[key] = process_nested_dict_for_train(
+                value,
+                shuffle_id,
+                trim_rollout_fields=key != "forward_inputs",
+            )
     return ret_dict
 
 
@@ -1024,7 +1317,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return model
 
     def get_rollout_state_dict(self) -> dict:
-        return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        if any(key.startswith("world_model.") for key in state_dict):
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if not key.startswith("world_model.")
+            }
+        state_dict = filter_dreamzero_lora_state_dict(
+            state_dict,
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+            and bool(self.cfg.actor.model.get("is_lora", False)),
+        )
+        return state_dict
 
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
@@ -1121,6 +1426,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
+
+        if (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+            and "curr_obs" in rollout_batch
+            and "next_obs" in rollout_batch
+        ):
+            preserve_action_head_payload = (
+                self.cfg.algorithm.get("loss_type", "dreamzero")
+                == "dreamzero_action_head_rl"
+            )
+            rollout_batch["forward_inputs"] = build_dreamzero_forward_inputs(
+                rollout_batch,
+                preserve_action_head_payload=preserve_action_head_payload,
+            )
+            if not preserve_action_head_payload:
+                rollout_batch.pop("curr_obs", None)
+                rollout_batch.pop("next_obs", None)
 
         if (
             not self.cfg.env.train.auto_reset
@@ -1340,9 +1662,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_optimizer(self.device)
 
         self.model.train()
-        rollout_size = (
-            self.rollout_batch["prev_logprobs"].shape[0]
-            * self.rollout_batch["prev_logprobs"].shape[1]
+        rollout_size = get_dreamzero_train_rollout_size(
+            self.rollout_batch,
+            self.cfg.algorithm.get("loss_type", ""),
         )
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
@@ -1367,7 +1689,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        rollout_size = get_dreamzero_train_rollout_size(
+            self.rollout_batch,
+            self.cfg.algorithm.get("loss_type", ""),
+            is_flattened=True,
+        )
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
@@ -1414,6 +1740,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     loss_mask_sum = batch.get("loss_mask_sum", None)
 
                     forward_inputs = batch.get("forward_inputs", None)
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                        and self.cfg.algorithm.get("loss_type", "dreamzero")
+                        != "dreamzero_action_head_rl"
+                    ):
+                        forward_inputs = ensure_dreamzero_world_model_forward_inputs(
+                            batch,
+                            forward_inputs,
+                            env_action_dim=self.cfg.actor.model.get(
+                                "env_action_dim", None
+                            ),
+                        )
 
                     kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1450,11 +1789,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
+                    loss_action_dim = get_dreamzero_loss_action_dim(
+                        self.cfg.actor.model,
+                        self.cfg.algorithm.loss_type,
+                    )
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                        "single_action_dim": loss_action_dim,
                         "logprobs": output_dict["logprobs"],
                         "values": output_dict.get("values", None),
                         "old_logprobs": prev_logprobs,
@@ -1472,6 +1815,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
                     }
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        kwargs["dreamzero_advantage_weight_mode"] = (
+                            self.cfg.algorithm.get(
+                                "dreamzero_advantage_weight_mode", "positive"
+                            )
+                        )
+                        kwargs["dreamzero_action_loss_scale"] = (
+                            self.cfg.algorithm.get(
+                                "dreamzero_action_loss_scale", 1.0
+                            )
+                        )
                     loss, metrics_data = policy_loss(**kwargs)
 
                     entropy_loss = torch.tensor(

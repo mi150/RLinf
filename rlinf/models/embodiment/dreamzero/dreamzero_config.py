@@ -225,6 +225,9 @@ class DreamZeroConfig(VLAConfig):
     action_horizon: int = field(default=None, metadata={"help": "Action horizon."})
 
     action_dim: int = field(default=None, metadata={"help": "Action dimension."})
+    env_action_dim: int = field(
+        default=None, metadata={"help": "Environment action dimension."}
+    )
 
     num_action_chunks: int = field(
         default=16, metadata={"help": "Number of action chunks."}

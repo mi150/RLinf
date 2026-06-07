@@ -181,7 +181,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             state_dict = {
                 k.replace(".base_layer.", "."): v for k, v in state_dict.items()
             }
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=False, assign=True)
     else:
         loc = str(model_path) if model_path is not None else "model_path=null"
         get_logger().warning(

@@ -170,10 +170,13 @@ def openai_gelu(x):
     return gelu_impl(x)
 
 
-try:
-    jit_fuser = torch.compile
-except Exception:
+if os.getenv("TORCH_COMPILE_DISABLE", "0").lower() in ("1", "true", "yes", "on"):
     jit_fuser = torch.jit.script
+else:
+    try:
+        jit_fuser = torch.compile
+    except Exception:
+        jit_fuser = torch.jit.script
 
 
 @jit_fuser

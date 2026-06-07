@@ -11,6 +11,7 @@ vae_pretrained_path: null
 metadata_json_path: null
 
 action_dim: 32
+env_action_dim: 7
 
 state_horizon: 1
 action_horizon: 24

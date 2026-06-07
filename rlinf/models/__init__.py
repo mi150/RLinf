@@ -218,10 +218,11 @@ def get_model(cfg: DictConfig):
         Worker.torch_platform is not None
         and Worker.torch_platform.is_available()
         and cfg.get("load_to_device", True)
+        and SupportedModel(model_type) != SupportedModel.DREAMZERO
     ):
         model = model.to(Worker.torch_device_type)
 
-    if cfg.is_lora:
+    if cfg.is_lora and SupportedModel(model_type) != SupportedModel.DREAMZERO:
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
