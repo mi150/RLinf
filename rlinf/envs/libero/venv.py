@@ -124,7 +124,20 @@ def _worker(
                     raise NotImplementedError(
                         "chunk_step does not support shared-memory observations"
                     )
-                env_returns = [env.step(action) for action in data]
+                action_repeat = 1
+                if isinstance(data, tuple):
+                    data, action_repeat = data
+                action_repeat = int(action_repeat)
+                if action_repeat < 1:
+                    raise ValueError(
+                        "action_repeat_per_chunk_step must be >= 1, "
+                        f"got {action_repeat}"
+                    )
+                env_returns = []
+                for action in data:
+                    for _ in range(action_repeat):
+                        env_return = env.step(action)
+                    env_returns.append(env_return)
                 p.send(tuple(zip(*env_returns)))
             elif cmd == "set_cpu_affinity":
                 apply_process_cpu_affinity(tuple(data))

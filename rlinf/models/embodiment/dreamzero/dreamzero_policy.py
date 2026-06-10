@@ -420,6 +420,13 @@ class DreamZeroPolicy(VLA, BasePolicy):
             actions = actions.detach().cpu().numpy()
         actions = np.asarray(actions, dtype=np.float32)
         env_action_dim = self.config.env_action_dim
+        if (
+            env_action_dim is not None
+            and actions.ndim == 3
+            and actions.shape[-2] == env_action_dim
+            and actions.shape[-1] != env_action_dim
+        ):
+            actions = np.swapaxes(actions, -1, -2)
         if env_action_dim is not None and actions.shape[-1] != env_action_dim:
             if actions.shape[-1] > env_action_dim and env_action_dim >= 2:
                 actions = np.concatenate(
