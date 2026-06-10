@@ -17,7 +17,9 @@
 Based on metaworld/venv.py implementation, adapted for Robocasa/Robosuite environments.
 """
 
+import json
 import os
+import time
 from multiprocessing import Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, Optional, Union
@@ -34,7 +36,7 @@ from rlinf.envs.venv import (
     SubprocVectorEnv,
     _setup_buf,
 )
-from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity
+from rlinf.envs.venv.venv import _apply_subproc_env_cpu_affinity, _to_jsonable
 from rlinf.scheduler.resource_pool.cpu_binding import (
     apply_process_cpu_affinity,
     get_env_core_group_from_env,
@@ -153,6 +155,28 @@ def _worker(
         env_return = tuple(env_return)
         return env_return
 
+    def _step_with_timing(env, action, *, chunk_action_index=None, repeat_index=None):
+        wall_start_ns = time.time_ns()
+        perf_start = time.perf_counter()
+        env_return = env.step(action)
+        duration_s = max(time.perf_counter() - perf_start, 0.0)
+        wall_end_ns = time.time_ns()
+        env_return = list(env_return)
+        info = env_return[-1]
+        timing = {
+            "local_env": int(local_env_index),
+            "duration_s": duration_s,
+            "wall_start_ns": wall_start_ns,
+            "wall_end_ns": wall_end_ns,
+        }
+        if chunk_action_index is not None:
+            timing["chunk_action_index"] = int(chunk_action_index)
+        if repeat_index is not None:
+            timing["repeat_index"] = int(repeat_index)
+        info.setdefault("robocasa_step_timings", []).append(timing)
+        env_return[-1] = info
+        return tuple(env_return)
+
     parent.close()
     if local_env_index >= 0:
         _apply_subproc_env_cpu_affinity(local_env_index)
@@ -166,7 +190,7 @@ def _worker(
                 break
             if cmd == "step":
                 # Robosuite returns (obs, reward, done, info), not 5 values like gymnasium
-                env_return = env.step(data)
+                env_return = _step_with_timing(env, data)
                 if obs_bufs is not None:
                     _encode_obs(env_return[0], obs_bufs)
                     env_return = (None, *env_return[1:])
@@ -182,13 +206,37 @@ def _worker(
                     raise NotImplementedError(
                         "chunk_step does not support shared-memory observations"
                     )
+                action_repeat = 1
+                if isinstance(data, tuple):
+                    data, action_repeat = data
+                action_repeat = int(action_repeat)
+                if action_repeat < 1:
+                    raise ValueError(
+                        "action_repeat_per_chunk_step must be >= 1, "
+                        f"got {action_repeat}"
+                    )
                 env_returns = []
-                for action in data:
-                    env_return = env.step(action)
-                    if hasattr(env, "_check_success"):
-                        env_return = _check_success(env, env_return)
-                    if hasattr(env, "get_ep_meta"):
-                        env_return = get_ep_meta(env, env_return)
+                for chunk_action_index, action in enumerate(data):
+                    step_timings = []
+                    for repeat_index in range(action_repeat):
+                        env_return = _step_with_timing(
+                            env,
+                            action,
+                            chunk_action_index=chunk_action_index,
+                            repeat_index=repeat_index,
+                        )
+                        step_timings.extend(
+                            env_return[-1].get("robocasa_step_timings", [])
+                        )
+                        if hasattr(env, "_check_success"):
+                            env_return = _check_success(env, env_return)
+                        if hasattr(env, "get_ep_meta"):
+                            env_return = get_ep_meta(env, env_return)
+                    env_return = list(env_return)
+                    info = env_return[-1]
+                    info["robocasa_step_timings"] = step_timings
+                    env_return[-1] = info
+                    env_return = tuple(env_return)
                     env_returns.append(env_return)
                 p.send(tuple(zip(*env_returns)))
             elif cmd == "set_cpu_affinity":
@@ -335,3 +383,38 @@ class RobocasaSubprocEnv(SubprocVectorEnv):
             worker.get_mujoco_diagnostics(max_contacts, include_model_names)
             for worker in self.workers
         ]
+
+    def record_robocasa_step_timing_events(
+        self,
+        info_lists: list[dict[str, Any]],
+        *,
+        vector_step: int,
+    ) -> None:
+        """Write one timestamp row per real RoboCasa env.step call."""
+        context = getattr(self, "_sim_timestamp_context", None)
+        if context is None:
+            return
+        handle = self._get_sim_timestamp_file()
+        if handle is None:
+            return
+        for info in info_lists:
+            for timing in info.get("robocasa_step_timings", []):
+                local_env = int(timing.get("local_env", -1))
+                record = {
+                    "event": "robocasa_env_step",
+                    "rank": int(context["rank"]),
+                    "pid": int(context["pid"]),
+                    "epoch": context.get("epoch"),
+                    "chunk_step": context.get("chunk_step"),
+                    "stage": context.get("stage"),
+                    "local_env": local_env,
+                    "global_env": self._global_env_id(local_env),
+                    "operation": "robocasa_step",
+                    "vector_step": int(vector_step),
+                    "chunk_action_index": timing.get("chunk_action_index"),
+                    "repeat_index": timing.get("repeat_index"),
+                    "duration_s": timing.get("duration_s"),
+                    "wall_start_ns": timing.get("wall_start_ns"),
+                    "wall_end_ns": timing.get("wall_end_ns"),
+                }
+                handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")

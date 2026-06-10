@@ -301,7 +301,20 @@ def _worker(
                     raise NotImplementedError(
                         "chunk_step does not support shared-memory observations"
                     )
-                env_returns = [env.step(action) for action in data]
+                action_repeat = 1
+                if isinstance(data, tuple):
+                    data, action_repeat = data
+                action_repeat = int(action_repeat)
+                if action_repeat < 1:
+                    raise ValueError(
+                        "action_repeat_per_chunk_step must be >= 1, "
+                        f"got {action_repeat}"
+                    )
+                env_returns = []
+                for action in data:
+                    for _ in range(action_repeat):
+                        env_return = env.step(action)
+                    env_returns.append(env_return)
                 p.send(tuple(zip(*env_returns)))
             elif cmd == "set_cpu_affinity":
                 apply_process_cpu_affinity(tuple(data))
@@ -520,7 +533,9 @@ class SubprocEnvWorker(EnvWorker):
         else:
             self.parent_remote.send(["step", action])
 
-    def send_chunk_step(self, chunk_action: np.ndarray) -> None:
+    def send_chunk_step(
+        self, chunk_action: np.ndarray | tuple[np.ndarray, int]
+    ) -> None:
         self.parent_remote.send(["chunk_step", chunk_action])
 
     def recv(
@@ -699,10 +714,12 @@ class BaseVectorEnv(object):
         self.ready_id = list(range(self.env_num))
         self.is_closed = False
         self._balanced_pair_predicted_latency_s: list[float] | None = None
+        self._bin_packing_predicted_latency_s: list[float] | None = None
         self._env_cpu_core_groups = parse_env_cpu_core_groups(
             os.environ.get("RLINF_ENV_CPU_CORE_GROUPS", "")
         )
         self._balanced_pair_logged = False
+        self._bin_packing_logged = False
         self._sim_timestamp_context: dict[str, Any] | None = None
         self._sim_timestamp_file = None
         self._sim_vector_step_index = 0
@@ -1185,6 +1202,7 @@ class BaseVectorEnv(object):
         chunk_action: np.ndarray,
         id: Optional[Union[int, list[int], np.ndarray]] = None,
         *,
+        action_repeat_per_chunk_step: int = 1,
         envs_per_core: int = 1,
         ema_alpha: float = 0.3,
         initial_latency_ms: Optional[float] = None,
@@ -1212,6 +1230,12 @@ class BaseVectorEnv(object):
         if chunk_size <= 0:
             raise ValueError(
                 f"chunk_action must contain at least one step, got {chunk_size}"
+            )
+        action_repeat_per_chunk_step = int(action_repeat_per_chunk_step)
+        if action_repeat_per_chunk_step < 1:
+            raise ValueError(
+                "action_repeat_per_chunk_step must be >= 1, "
+                f"got {action_repeat_per_chunk_step}"
             )
 
         envs_per_core = int(envs_per_core)
@@ -1389,6 +1413,7 @@ class BaseVectorEnv(object):
             worker = self.workers[env_id]
             extra = {
                 "action_chunk_steps": chunk_size,
+                "action_repeat_per_chunk_step": action_repeat_per_chunk_step,
                 "pair_offset": pair_offset,
                 "pair_slot": slot_index,
                 "predicted_latency_s": self._balanced_pair_predicted_latency_s[env_id],
@@ -1402,7 +1427,9 @@ class BaseVectorEnv(object):
                 extra=extra,
             )
             send_start = time.perf_counter()
-            worker.send_chunk_step(chunk_action[local_pos])
+            worker.send_chunk_step(
+                (chunk_action[local_pos], action_repeat_per_chunk_step)
+            )
             send_end = time.perf_counter()
             dispatch_call_time_s += send_end - send_start
             in_flight[worker] = (
@@ -1505,6 +1532,235 @@ class BaseVectorEnv(object):
         }
         return stacked
 
+    def latency_bin_packing_chunk_step(
+        self,
+        chunk_action: np.ndarray,
+        id: Optional[Union[int, list[int], np.ndarray]] = None,
+        *,
+        action_repeat_per_chunk_step: int = 1,
+        bin_count: int = 4,
+        ema_alpha: float = 0.3,
+        initial_latency_ms: Optional[float] = None,
+    ) -> tuple[list[Any], ...]:
+        """Run chunks with K-bin LPT CPU affinity scheduling."""
+        self._assert_is_not_closed()
+        id = list(self._wrap_id(id))
+        if self.is_async:
+            self._assert_id(id)
+        assert len(chunk_action) == len(id)
+        if len(id) == 0:
+            raise ValueError("latency_bin_packing_chunk_step requires at least one env")
+
+        chunk_size = int(chunk_action.shape[1])
+        if chunk_size <= 0:
+            raise ValueError(
+                f"chunk_action must contain at least one step, got {chunk_size}"
+            )
+        action_repeat_per_chunk_step = int(action_repeat_per_chunk_step)
+        if action_repeat_per_chunk_step < 1:
+            raise ValueError(
+                "action_repeat_per_chunk_step must be >= 1, "
+                f"got {action_repeat_per_chunk_step}"
+            )
+
+        bin_count = int(bin_count)
+        if bin_count < 1:
+            raise ValueError(f"bin_count must be >= 1, got {bin_count}")
+        if bin_count > len(id):
+            raise ValueError(f"bin_count({bin_count}) must be <= env count({len(id)})")
+        if not self._env_cpu_core_groups:
+            raise ValueError(
+                "latency_bin_packing requires CPU core groups. Enable per-env "
+                "CPU binding or use sync_time_major for the no-binding baseline."
+            )
+        if not 0.0 < float(ema_alpha) <= 1.0:
+            raise ValueError(f"ema_alpha must be in (0, 1], got {ema_alpha}")
+
+        initial_latency = (
+            float(initial_latency_ms) / 1000.0
+            if initial_latency_ms is not None
+            else 1.0
+        )
+        if initial_latency <= 0.0:
+            raise ValueError(
+                "initial_latency_ms must be positive when set, "
+                f"got {initial_latency_ms}"
+            )
+        if (
+            self._bin_packing_predicted_latency_s is None
+            or len(self._bin_packing_predicted_latency_s) != self.env_num
+        ):
+            self._bin_packing_predicted_latency_s = [
+                initial_latency for _ in range(self.env_num)
+            ]
+
+        profile_start = time.perf_counter()
+        group_start = profile_start
+        bin_groups, predicted_bin_loads = self._build_latency_bin_packing_groups(
+            id,
+            bin_count,
+        )
+        group_end = time.perf_counter()
+
+        affinity_start = group_end
+        bin_cpu_core_groups = self._get_slot_cpu_core_groups(bin_count)
+        if len(bin_cpu_core_groups) < bin_count:
+            raise ValueError(
+                "latency_bin_packing needs at least one CPU core group per bin, "
+                f"got {len(bin_cpu_core_groups)} groups for {bin_count} bins"
+            )
+        affinity_end = time.perf_counter()
+
+        if not self._bin_packing_logged:
+            self._bin_packing_logged = True
+            logger.info(
+                "latency_bin_packing enabled: local_envs=%s, bin_count=%s, "
+                "cpu_groups=%s, first_groups=%s",
+                len(id),
+                bin_count,
+                len(self._env_cpu_core_groups),
+                self._env_cpu_core_groups[: min(8, len(self._env_cpu_core_groups))],
+            )
+
+        env_step_results: list[Any | None] = [None for _ in id]
+        in_flight: dict[EnvWorker, tuple[int, int, int, float, dict[str, Any]]] = {}
+        bin_actual_loads = [0.0 for _ in range(bin_count)]
+        dispatch_call_time_s = 0.0
+        wait_call_time_s = 0.0
+        recv_call_time_s = 0.0
+        first_ready_time: float | None = None
+        last_recv_time: float | None = None
+
+        def dispatch_bin_env(bin_index: int, bin_offset: int) -> None:
+            nonlocal dispatch_call_time_s
+            group = bin_groups[bin_index]
+            if bin_offset >= len(group):
+                return
+            local_pos = group[bin_offset]
+            env_id = id[local_pos]
+            worker = self.workers[env_id]
+            core_group = bin_cpu_core_groups[bin_index]
+            worker.set_cpu_affinity(core_group)
+            extra = {
+                "action_chunk_steps": chunk_size,
+                "action_repeat_per_chunk_step": action_repeat_per_chunk_step,
+                "bin_index": bin_index,
+                "bin_offset": bin_offset,
+                "predicted_latency_s": self._bin_packing_predicted_latency_s[env_id],
+                "predicted_bin_load_s": predicted_bin_loads[bin_index],
+                "vector_step": self._sim_vector_step_index,
+            }
+            self._write_subenv_timestamp_event(
+                "subenv_start",
+                local_env_id=int(env_id),
+                worker=worker,
+                operation="latency_bin_packing_chunk_step",
+                extra=extra,
+            )
+            send_start = time.perf_counter()
+            worker.send_chunk_step(
+                (chunk_action[local_pos], action_repeat_per_chunk_step)
+            )
+            send_end = time.perf_counter()
+            dispatch_call_time_s += send_end - send_start
+            in_flight[worker] = (
+                local_pos,
+                bin_index,
+                bin_offset,
+                time.perf_counter(),
+                extra,
+            )
+
+        initial_dispatch_start = time.perf_counter()
+        for bin_index in range(bin_count):
+            dispatch_bin_env(bin_index, 0)
+        initial_dispatch_end = time.perf_counter()
+
+        wait_recv_start = time.perf_counter()
+        while in_flight:
+            wait_start = time.perf_counter()
+            ready_workers = self.worker_class.wait(list(in_flight), 1, self.timeout)
+            wait_end = time.perf_counter()
+            wait_call_time_s += wait_end - wait_start
+            if not ready_workers:
+                continue
+            if first_ready_time is None:
+                first_ready_time = wait_end
+            for worker in ready_workers:
+                (
+                    local_pos,
+                    bin_index,
+                    bin_offset,
+                    start_time,
+                    extra,
+                ) = in_flight.pop(worker)
+                recv_start = time.perf_counter()
+                env_step_results[local_pos] = worker.recv()
+                recv_end = time.perf_counter()
+                recv_call_time_s += recv_end - recv_start
+                last_recv_time = recv_end
+                actual_latency = max(time.perf_counter() - start_time, 0.0)
+                bin_actual_loads[bin_index] += actual_latency
+                env_id = id[local_pos]
+                old_latency = self._bin_packing_predicted_latency_s[env_id]
+                self._bin_packing_predicted_latency_s[env_id] = (
+                    float(ema_alpha) * actual_latency
+                    + (1.0 - float(ema_alpha)) * old_latency
+                )
+                end_extra = dict(extra)
+                end_extra["updated_predicted_latency_s"] = (
+                    self._bin_packing_predicted_latency_s[env_id]
+                )
+                end_extra["actual_latency_s"] = actual_latency
+                self._write_subenv_timestamp_event(
+                    "subenv_end",
+                    local_env_id=int(env_id),
+                    worker=worker,
+                    operation="latency_bin_packing_chunk_step",
+                    perf_start=start_time,
+                    extra=end_extra,
+                )
+                dispatch_bin_env(bin_index, bin_offset + 1)
+        wait_recv_end = time.perf_counter()
+
+        env_results = [result for result in env_step_results if result is not None]
+        if len(env_results) != len(id):
+            raise RuntimeError("latency bin packing chunk_step missed env results")
+        self._sim_vector_step_index += 1
+        stack_start = time.perf_counter()
+        stacked = stack_vector_chunk_returns(env_results)
+        stack_end = time.perf_counter()
+        self._last_chunk_profile = {
+            "operation": "latency_bin_packing_chunk_step",
+            "env_count": len(id),
+            "bin_count": bin_count,
+            "bin_groups": [
+                [id[local_pos] for local_pos in group] for group in bin_groups
+            ],
+            "bin_loads_predicted_s": predicted_bin_loads,
+            "bin_loads_actual_s": bin_actual_loads,
+            "group_s": group_end - group_start,
+            "affinity_s": affinity_end - affinity_start,
+            "initial_dispatch_s": initial_dispatch_end - initial_dispatch_start,
+            "dispatch_call_s": dispatch_call_time_s,
+            "wait_recv_s": wait_recv_end - wait_recv_start,
+            "wait_call_s": wait_call_time_s,
+            "recv_call_s": recv_call_time_s,
+            "time_to_first_ready_s": (
+                first_ready_time - wait_recv_start
+                if first_ready_time is not None
+                else None
+            ),
+            "first_ready_to_last_recv_s": (
+                last_recv_time - first_ready_time
+                if first_ready_time is not None and last_recv_time is not None
+                else None
+            ),
+            "stack_s": stack_end - stack_start,
+            "total_s": stack_end - profile_start,
+        }
+        return stacked
+
     def _get_slot_cpu_core_groups(self, slot_count: int) -> tuple[tuple[int, ...], ...]:
         unique_groups: list[tuple[int, ...]] = []
         seen_groups: set[tuple[int, ...]] = set()
@@ -1547,6 +1803,29 @@ class BaseVectorEnv(object):
                 env_ids[local_pos]
             ]
         return groups
+
+    def _build_latency_bin_packing_groups(
+        self, env_ids: list[int], bin_count: int
+    ) -> tuple[list[list[int]], list[float]]:
+        if self._bin_packing_predicted_latency_s is None:
+            raise RuntimeError("latency predictions are not initialized")
+        groups: list[list[int]] = [[] for _ in range(bin_count)]
+        loads = [0.0 for _ in range(bin_count)]
+        local_positions = list(range(len(env_ids)))
+        local_positions.sort(
+            key=lambda pos: (
+                -self._bin_packing_predicted_latency_s[env_ids[pos]],
+                pos,
+            )
+        )
+
+        for local_pos in local_positions:
+            target_bin = min(range(bin_count), key=lambda index: (loads[index], index))
+            groups[target_bin].append(local_pos)
+            loads[target_bin] += self._bin_packing_predicted_latency_s[
+                env_ids[local_pos]
+            ]
+        return groups, loads
 
     def seed(
         self,

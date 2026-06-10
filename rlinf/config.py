@@ -908,6 +908,36 @@ def validate_embodied_cfg(cfg):
                         ),
                     }
                 )
+        if mode == "latency_bin_packing":
+            bin_cfg = env_cfg.get("latency_bin_packing", {})
+            bin_count = int(bin_cfg.get("bin_count", 4))
+            bin_ema_alpha = float(bin_cfg.get("ema_alpha", 0.3))
+            assert bin_count >= 1, (
+                f"{cfg_path}.latency_bin_packing.bin_count must be >= 1, "
+                f"got {bin_count}"
+            )
+            assert bin_count <= local_num_envs, (
+                f"{cfg_path}.latency_bin_packing.bin_count({bin_count}) must be "
+                f"<= local env num({local_num_envs})"
+            )
+            assert 0.0 < bin_ema_alpha <= 1.0, (
+                f"{cfg_path}.latency_bin_packing.ema_alpha must be in (0, 1], "
+                f"got {bin_ema_alpha}"
+            )
+            initial_latency_ms = bin_cfg.get("initial_latency_ms", None)
+            if initial_latency_ms is not None:
+                assert float(initial_latency_ms) > 0.0, (
+                    f"{cfg_path}.latency_bin_packing.initial_latency_ms must be "
+                    f"positive when set, got {initial_latency_ms}"
+                )
+            with open_dict(env_cfg):
+                env_cfg.latency_bin_packing = OmegaConf.create(
+                    {
+                        "bin_count": bin_count,
+                        "ema_alpha": bin_ema_alpha,
+                        "initial_latency_ms": initial_latency_ms,
+                    }
+                )
         if env_type == SupportedEnvType.MANISKILL and mode == "parallel_shard":
             assert num_shards == 1, (
                 "ManiSkill parallel_shard chunk_step currently supports only "

@@ -20,7 +20,12 @@ from typing import Any
 import numpy as np
 import torch
 
-CHUNK_STEP_MODES = {"sync_time_major", "parallel_shard", "latency_balanced_pair"}
+CHUNK_STEP_MODES = {
+    "sync_time_major",
+    "parallel_shard",
+    "latency_balanced_pair",
+    "latency_bin_packing",
+}
 
 
 @dataclass
@@ -62,9 +67,7 @@ def split_env_indices(
     if num_shards <= 0:
         raise ValueError(f"num_shards must be positive, got {num_shards}")
     if num_shards > num_envs:
-        raise ValueError(
-            f"num_shards({num_shards}) must be <= num_envs({num_envs})"
-        )
+        raise ValueError(f"num_shards({num_shards}) must be <= num_envs({num_envs})")
 
     indices = torch.arange(num_envs, device=device)
     return [chunk for chunk in torch.tensor_split(indices, num_shards) if len(chunk)]

@@ -195,6 +195,106 @@ def test_default_solver_reuses_per_stage_slots_when_core_pool_is_smaller_than_en
     assert bindings["env"][0].cpu.env_cpu_core_groups == ((0,), (1,), (0,), (1,))
 
 
+def test_default_solver_reuses_bin_slots_for_latency_bin_packing() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-3"}},
+                        "components": {
+                            "env": {"pool": "env_cpu", "granularity": "per_env"}
+                        },
+                    },
+                },
+            },
+            "env": {
+                "train": {
+                    "total_num_envs": 8,
+                    "chunk_step_mode": "latency_bin_packing",
+                    "latency_bin_packing": {"bin_count": 4},
+                },
+                "eval": {"total_num_envs": 8},
+            },
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 1},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+    pool_cfg = ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+    bindings = ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
+
+    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1, 2, 3)
+    assert bindings["env"][0].cpu.env_cpu_core_groups == (
+        (0,),
+        (1,),
+        (2,),
+        (3,),
+        (0,),
+        (1,),
+        (2,),
+        (3,),
+    )
+
+
+def test_default_solver_reuses_bin_slots_per_stage_for_latency_bin_packing() -> None:
+    cfg = OmegaConf.create(
+        {
+            "cluster": {
+                "num_nodes": 1,
+                "component_placement": {
+                    "env": {"node_group": "node", "placement": "0"}
+                },
+                "resource_pool": {
+                    "enabled": True,
+                    "cpu": {
+                        "enabled": True,
+                        "pools": {"env_cpu": {"node_group": "node", "cores": "0-1"}},
+                        "components": {
+                            "env": {"pool": "env_cpu", "granularity": "per_env"}
+                        },
+                    },
+                },
+            },
+            "env": {
+                "train": {
+                    "total_num_envs": 8,
+                    "chunk_step_mode": "latency_bin_packing",
+                    "latency_bin_packing": {"bin_count": 2},
+                },
+                "eval": {"total_num_envs": 8},
+            },
+            "runner": {"only_eval": False, "val_check_interval": -1},
+            "rollout": {"pipeline_stage_num": 2},
+        }
+    )
+    cluster = create_fake_cluster(num_nodes=1, accelerators_per_node=0)
+    placement = HybridComponentPlacement(cfg, cluster)
+    pool_cfg = ResourcePoolConfig.from_cluster_cfg(cfg.cluster)
+
+    bindings = ResourcePoolSolver(pool_cfg, cfg, cluster, placement).solve()
+
+    assert bindings["env"][0].cpu.process_cpu_cores == (0, 1)
+    assert bindings["env"][0].cpu.env_cpu_core_groups == (
+        (0,),
+        (1,),
+        (0,),
+        (1,),
+        (0,),
+        (1,),
+        (0,),
+        (1,),
+    )
+
+
 def test_default_solver_reuses_cpu_pool_per_cluster_node() -> None:
     cfg = OmegaConf.create(
         {

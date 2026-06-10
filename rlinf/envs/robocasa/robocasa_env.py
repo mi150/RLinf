@@ -344,6 +344,16 @@ class RobocasaEnv(gym.Env):
 
         return obs
 
+    def _record_robocasa_step_timing_events(
+        self,
+        info_lists,
+        *,
+        vector_step: int,
+    ) -> None:
+        recorder = getattr(self.env, "record_robocasa_step_timing_events", None)
+        if recorder is not None:
+            recorder(list(info_lists), vector_step=vector_step)
+
     def reset(
         self,
         env_idx: Optional[Union[int, list[int], np.ndarray]] = None,
@@ -392,7 +402,12 @@ class RobocasaEnv(gym.Env):
 
         # Use vectorized environment step (subprocess isolation avoids OpenGL issues)
         # Robosuite returns 4 values: (obs, reward, done, info)
+        vector_step = getattr(self.env, "_sim_vector_step_index", 0)
         raw_obs, rewards, dones, info_lists = self.env.step(actions)
+        self._record_robocasa_step_timing_events(
+            info_lists,
+            vector_step=vector_step,
+        )
         infos = list_of_dict_to_dict_of_list(info_lists)
 
         # Extract success from infos
@@ -422,7 +437,10 @@ class RobocasaEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, denoising_curvature=None):
+        del denoising_curvature
+        if self.chunk_step_mode == "latency_bin_packing":
+            return self._chunk_step_latency_bin_packing(chunk_actions)
         if self.chunk_step_mode == "latency_balanced_pair":
             return self._chunk_step_latency_balanced_pair(chunk_actions)
         if self.chunk_step_mode == "parallel_shard":
@@ -432,6 +450,11 @@ class RobocasaEnv(gym.Env):
     def _chunk_step_sync_time_major(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        action_repeat = int(self.cfg.get("action_repeat_per_chunk_step", 1))
+        if action_repeat < 1:
+            raise ValueError(
+                f"action_repeat_per_chunk_step must be >= 1, got {action_repeat}"
+            )
         obs_list = []
         infos_list = []
 
@@ -441,9 +464,10 @@ class RobocasaEnv(gym.Env):
         raw_chunk_truncations = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
-            )
+            for _ in range(action_repeat):
+                extracted_obs, step_reward, terminations, truncations, infos = (
+                    self.step(actions, auto_reset=False)
+                )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
@@ -570,6 +594,9 @@ class RobocasaEnv(gym.Env):
             info_lists_list,
         ) = self.env.latency_balanced_pair_chunk_step(
             chunk_actions,
+            action_repeat_per_chunk_step=int(
+                self.cfg.get("action_repeat_per_chunk_step", 1)
+            ),
             envs_per_core=int(pair_cfg.get("envs_per_core", 1)),
             ema_alpha=float(pair_cfg.get("ema_alpha", 0.3)),
             initial_latency_ms=pair_cfg.get("initial_latency_ms", None),
@@ -580,6 +607,45 @@ class RobocasaEnv(gym.Env):
             ),
         )
 
+        return self._build_chunk_step_result_from_vector_returns(
+            raw_obs_list,
+            terminations_list,
+            info_lists_list,
+        )
+
+    def _chunk_step_latency_bin_packing(self, chunk_actions):
+        # chunk_actions: [num_envs, chunk_step, action_dim]
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+
+        bin_cfg = self.cfg.get("latency_bin_packing", {})
+        (
+            raw_obs_list,
+            _reward_list,
+            terminations_list,
+            info_lists_list,
+        ) = self.env.latency_bin_packing_chunk_step(
+            chunk_actions,
+            action_repeat_per_chunk_step=int(
+                self.cfg.get("action_repeat_per_chunk_step", 1)
+            ),
+            bin_count=int(bin_cfg.get("bin_count", 4)),
+            ema_alpha=float(bin_cfg.get("ema_alpha", 0.3)),
+            initial_latency_ms=bin_cfg.get("initial_latency_ms", None),
+        )
+
+        return self._build_chunk_step_result_from_vector_returns(
+            raw_obs_list,
+            terminations_list,
+            info_lists_list,
+        )
+
+    def _build_chunk_step_result_from_vector_returns(
+        self,
+        raw_obs_list,
+        terminations_list,
+        info_lists_list,
+    ):
         obs_list = []
         infos_list = []
         chunk_rewards = []
@@ -589,6 +655,11 @@ class RobocasaEnv(gym.Env):
         for raw_obs, terminations, info_lists in zip(
             raw_obs_list, terminations_list, info_lists_list
         ):
+            vector_step = len(obs_list)
+            self._record_robocasa_step_timing_events(
+                info_lists,
+                vector_step=vector_step,
+            )
             self._elapsed_steps += 1
             info_lists = list(info_lists)
             infos = list_of_dict_to_dict_of_list(info_lists)

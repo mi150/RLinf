@@ -115,12 +115,27 @@ class ResourcePoolSolver:
         pair_cfg = env_cfg.get("latency_balanced_pair", {})
         return int(pair_cfg.get("envs_per_core", 1))
 
+    def _component_latency_bin_count(self) -> int:
+        if bool(getattr(self.cfg.runner, "only_eval", False)):
+            env_cfg = self.cfg.env.eval
+        else:
+            env_cfg = self.cfg.env.train
+        bin_cfg = env_cfg.get("latency_bin_packing", {})
+        return int(bin_cfg.get("bin_count", 4))
+
     def _component_uses_latency_balanced_pair(self) -> bool:
         if bool(getattr(self.cfg.runner, "only_eval", False)):
             env_cfg = self.cfg.env.eval
         else:
             env_cfg = self.cfg.env.train
         return env_cfg.get("chunk_step_mode", None) == "latency_balanced_pair"
+
+    def _component_uses_latency_bin_packing(self) -> bool:
+        if bool(getattr(self.cfg.runner, "only_eval", False)):
+            env_cfg = self.cfg.env.eval
+        else:
+            env_cfg = self.cfg.env.train
+        return env_cfg.get("chunk_step_mode", None) == "latency_bin_packing"
 
     def _solve_component(self, component: str) -> list[WorkerResourceBinding]:
         strategy = self.component_placement.get_strategy(component)
@@ -181,6 +196,11 @@ class ResourcePoolSolver:
             if component == "env" and request.granularity == "per_env"
             else False
         )
+        use_latency_bin_packing = (
+            self._component_uses_latency_bin_packing()
+            if component == "env" and request.granularity == "per_env"
+            else False
+        )
         for node_rank in sorted(placements_by_node):
             node_placements = sorted(
                 placements_by_node[node_rank], key=lambda placement: placement.rank
@@ -217,6 +237,29 @@ class ResourcePoolSolver:
                         )
                         env_cpu_core_groups = tuple(
                             slot_cpu_core_groups[index % slot_count]
+                            for _stage in range(stage_num)
+                            for index in range(per_stage_env_count)
+                        )
+                    elif use_latency_bin_packing:
+                        stage_num = self._component_pipeline_stage_num()
+                        if local_env_count % stage_num != 0:
+                            raise ValueError(
+                                "local env count must be divisible by "
+                                "pipeline_stage_num"
+                            )
+                        per_stage_env_count = local_env_count // stage_num
+                        bin_count = self._component_latency_bin_count()
+                        if per_stage_env_count < bin_count:
+                            raise ValueError(
+                                "per-stage local env count must be >= "
+                                "latency_bin_packing.bin_count"
+                            )
+                        slot_cpu_core_groups = build_even_split_cpu_groups(
+                            process_cpu_cores,
+                            bin_count,
+                        )
+                        env_cpu_core_groups = tuple(
+                            slot_cpu_core_groups[index % bin_count]
                             for _stage in range(stage_num)
                             for index in range(per_stage_env_count)
                         )

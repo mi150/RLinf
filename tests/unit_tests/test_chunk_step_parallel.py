@@ -136,6 +136,23 @@ class PidBackedScriptedWorker(ScriptedWorker):
         self.process = type("FakeProcess", (), {"pid": pid})()
 
 
+class OrderedCompletionWorker(ScriptedWorker):
+    completion_order = []
+    send_log = []
+
+    def send_chunk_step(self, _chunk_action):
+        OrderedCompletionWorker.send_log.append(self.env_id)
+
+    @staticmethod
+    def wait(workers, _wait_num, _timeout=None):
+        worker_ids = {worker.env_id: worker for worker in workers}
+        for env_id in list(OrderedCompletionWorker.completion_order):
+            if env_id in worker_ids:
+                OrderedCompletionWorker.completion_order.remove(env_id)
+                return [worker_ids[env_id]]
+        return []
+
+
 def test_split_env_indices_and_select_local_actions():
     shards = split_env_indices(5, 2)
 
@@ -510,6 +527,48 @@ def test_latency_balanced_pair_donation_uses_pid_affinity_without_pipe(monkeypat
     assert env.workers[0].affinity_calls == [(0,)]
     assert env.workers[1].affinity_calls == [(1,)]
     assert affinity_calls == [(1000, (0, 1)), (1000, (0,))]
+
+
+def test_latency_bin_packing_dispatches_k_bins_with_serial_envs():
+    env = SubprocVectorEnv.__new__(SubprocVectorEnv)
+    env.is_async = False
+    env.env_num = 8
+    env.workers = [OrderedCompletionWorker(i) for i in range(8)]
+    env.worker_class = OrderedCompletionWorker
+    env.timeout = None
+    env.is_closed = False
+    env._sim_vector_step_index = 0
+    env._sim_timestamp_context = None
+    env._last_chunk_profile = None
+    env._bin_packing_predicted_latency_s = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+    env._env_cpu_core_groups = ((0,), (1,), (2,), (3,))
+    env._bin_packing_logged = True
+    OrderedCompletionWorker.completion_order = [0, 1, 2, 3, 7, 6, 5, 4]
+    OrderedCompletionWorker.send_log = []
+    chunk_actions = np.arange(8).reshape(8, 1, 1)
+
+    obs_list, rewards_list, dones_list, infos_list = env.latency_bin_packing_chunk_step(
+        chunk_actions,
+        bin_count=4,
+        ema_alpha=0.5,
+    )
+
+    assert OrderedCompletionWorker.send_log[:4] == [0, 1, 2, 3]
+    assert OrderedCompletionWorker.send_log[4:] == [7, 6, 5, 4]
+    assert env.workers[0].affinity_calls == [(0,)]
+    assert env.workers[7].affinity_calls == [(0,)]
+    assert env.workers[1].affinity_calls == [(1,)]
+    assert env.workers[6].affinity_calls == [(1,)]
+    assert obs_list[0].tolist() == [[env_id, 1] for env_id in range(8)]
+    assert rewards_list[0].tolist() == [float(env_id) for env_id in range(8)]
+    assert dones_list[0].tolist() == [False for _ in range(8)]
+    assert infos_list[0][4]["env_id"] == 4
+    profile = env.get_last_chunk_profile()
+    assert profile is not None
+    assert profile["operation"] == "latency_bin_packing_chunk_step"
+    assert profile["bin_count"] == 4
+    assert profile["bin_groups"] == [[0, 7], [1, 6], [2, 5], [3, 4]]
+    assert profile["bin_loads_predicted_s"] == [9.0, 9.0, 9.0, 9.0]
 
 
 def test_latency_balanced_pair_rejects_non_core_donation_v2_modes():
