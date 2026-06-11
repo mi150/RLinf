@@ -1,15 +1,11 @@
 # DreamZero world-model proxy RL performance test on LIBERO Spatial.
 #
-# Local machine assumptions for this first benchmark:
+# Local machine assumptions for this benchmark:
 # - 8 visible GPUs.
-# - Actor/training owns GPUs 0-3; env/rollout owns GPUs 4-7.
-# - CPU pool uses cores 0-55 for LIBERO env workers, matching the paper's
-#   56-physical-core testbed assumption even when nproc exposes SMT threads.
-# - train.total_num_envs=112 is 2x the allocated physical-core count.
-# - rollout.pipeline_stage_num=2 overlaps simulator and generation work within
-#   each env worker; each of 4 env workers hosts 28 envs split as 14 per stage.
-#   The latency-balanced pair scheduler gets one CPU slot per stage-local env,
-#   then reuses those slots across the two pipeline stages.
+# - Actor, env, and rollout share GPUs 0-7 through MPS resource pools.
+# - Actor gets 60% SM and rollout gets 40% SM; env keeps GPU SM at 0.
+# - CPU pool uses cores 0-63 for 128 LIBERO env workers with pipeline=2.
+# - rollout.pipeline_stage_num=2 is kept for pipeline overlap.
 
 defaults:
   - env/libero_spatial@env.train
@@ -30,9 +26,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 0-3
-    env: 4-7
-    rollout: 4-7
+    actor,env,rollout: 0-7
   resource_pool:
     enabled: true
     allocation_mode: default
@@ -41,45 +35,27 @@ cluster:
       pools:
         env_cpu:
           node_group: cluster
-          cores: "0-55"
-        actor_cpu:
-          node_group: cluster
-          cores: "56-59"
-        rollout_cpu:
-          node_group: cluster
-          cores: "60-63"
+          cores: 0-63
       components:
         env:
           pool: env_cpu
           granularity: per_env
-        actor:
-          pool: actor_cpu
-          granularity: process
-        rollout:
-          pool: rollout_cpu
-          granularity: process
     gpu:
       enabled: true
       mode: mps
       pools:
-        actor_gpu:
+        gpu_pool:
           node_group: cluster
-          devices: 0-3
-        rollout_gpu:
-          node_group: cluster
-          devices: 4-7
-        env_gpu:
-          node_group: cluster
-          devices: 4-7
+          devices: 0-7
       components:
         actor:
-          pool: actor_gpu
-          sm_percent: 100
+          pool: gpu_pool
+          sm_percent: 60
         rollout:
-          pool: rollout_gpu
-          sm_percent: 100
+          pool: gpu_pool
+          sm_percent: 40
         env:
-          pool: env_gpu
+          pool: gpu_pool
           sm_percent: 0
 
 runner:
@@ -144,8 +120,9 @@ env:
     max_steps_per_rollout_epoch: 512
     auto_reset: false
     ignore_terminations: false
+    use_ordered_reset_state_ids: false
     video_cfg:
-      save_video: true
+      save_video: false
       info_on_video: false
       video_base_dir: ${runner.logger.log_path}/video/train
     init_params:
@@ -155,6 +132,8 @@ env:
     log_sim_timestamps: true
     log_sim_affinity_interval: 1
     latency_balanced_pair:
+      # Current RLinf validation requires envs_per_core=1 for
+      # latency_balanced_pair core donation v2.
       envs_per_core: 1
       ema_alpha: 0.3
       initial_latency_ms: null
