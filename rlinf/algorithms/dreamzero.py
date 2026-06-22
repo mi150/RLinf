@@ -14,7 +14,7 @@
 
 """DreamZero algorithms aligned with RLinf registries."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -136,6 +136,103 @@ def _compute_ppo_fallback_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     return policy_loss, metrics
 
 
+def _align_vector_like(
+    value: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    value = value.to(device=target.device, dtype=dtype or target.dtype)
+    if value.shape == target.shape:
+        return value
+    if value.numel() == target.numel():
+        return value.reshape_as(target)
+    if value.ndim > 0 and value.shape[0] == target.shape[0]:
+        return value.reshape(value.shape[0], -1).mean(dim=-1).reshape_as(target)
+    if value.numel() == 1:
+        return value.expand_as(target)
+    raise ValueError(
+        f"DreamZero PPO proxy could not align {name} shape "
+        f"{tuple(value.shape)} to action-loss shape {tuple(target.shape)}."
+    )
+
+
+def _as_sample_logprobs(
+    value: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    value = value.to(device=target.device, dtype=torch.float32)
+    if value.ndim == 0:
+        value = value.reshape(1)
+    if value.shape == target.shape:
+        return value
+    if value.numel() == target.numel():
+        return value.reshape_as(target)
+    if value.ndim > 0 and value.shape[0] == target.shape[0]:
+        return value.reshape(value.shape[0], -1).sum(dim=-1).reshape_as(target)
+    if value.numel() == 1:
+        return value.expand_as(target)
+    raise ValueError(
+        f"DreamZero action-chain logprob could not align {name} shape "
+        f"{tuple(value.shape)} to sample shape {tuple(target.shape)}."
+    )
+
+
+def _reduce_sample_values_like_action_loss(
+    value: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype | None = None,
+    mode: Literal["mean", "last_valid"] = "mean",
+    loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    value = value.to(device=target.device, dtype=dtype or target.dtype)
+    if value.shape == target.shape:
+        return value
+    if value.numel() == target.numel():
+        return value.reshape_as(target)
+    if value.ndim > 0 and value.shape[0] == target.shape[0]:
+        flat = value.reshape(value.shape[0], -1)
+        if loss_mask is not None:
+            mask = loss_mask.to(device=target.device, dtype=torch.bool)
+            mask = mask.reshape(mask.shape[0], -1)
+            if mask.shape != flat.shape:
+                if mask.shape[0] == flat.shape[0] and mask.numel() != flat.numel():
+                    mask = mask.expand_as(flat)
+                elif mask.numel() == flat.numel():
+                    mask = mask.reshape_as(flat)
+                else:
+                    raise ValueError(
+                        f"DreamZero RL loss could not align loss_mask shape "
+                        f"{tuple(loss_mask.shape)} to {name} shape {tuple(value.shape)}."
+                    )
+        else:
+            mask = torch.ones_like(flat, dtype=torch.bool)
+
+        if mode == "last_valid":
+            valid = mask.any(dim=-1)
+            reversed_indices = mask.flip(dims=[-1]).float().argmax(dim=-1)
+            last_indices = flat.shape[-1] - 1 - reversed_indices
+            reduced = flat.gather(1, last_indices.to(torch.long).unsqueeze(-1)).squeeze(-1)
+            reduced = torch.where(valid, reduced, torch.zeros_like(reduced))
+        elif mode == "mean":
+            denom = mask.sum(dim=-1).clamp_min(1).to(flat.dtype)
+            reduced = (flat * mask.to(flat.dtype)).sum(dim=-1) / denom
+        else:
+            raise ValueError(f"Unsupported DreamZero reduction mode: {mode!r}")
+        return reduced.reshape_as(target)
+    if value.numel() == 1:
+        return value.expand_as(target)
+    raise ValueError(
+        f"DreamZero RL loss could not align {name} shape "
+        f"{tuple(value.shape)} to action-loss shape {tuple(target.shape)}."
+    )
+
+
 def compute_dreamzero_world_model_proxy_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     """Compute the DreamZero world-model proxy loss used by 18e6ef2.
 
@@ -177,13 +274,12 @@ def compute_dreamzero_world_model_proxy_loss(**kwargs) -> tuple[torch.Tensor, di
 
 @register_policy_loss("dreamzero_action_head_rl")
 def compute_dreamzero_action_head_rl_loss(**kwargs) -> tuple[torch.Tensor, dict]:
-    """Compute an advantage-weighted DreamZero action-head RL loss.
+    """Compute PPO over a DreamZero action-head log-probability proxy.
 
     DreamZeroPolicy.default_forward returns an ``action_loss`` tensor produced by
-    the real DreamZero action model on rollout observations/actions. The
-    environment advantage scales that loss, so positive-return samples reinforce
-    their sampled action chunks while zero/negative samples do not masquerade as
-    a successful policy update.
+    the real DreamZero action model on rollout observations/actions. DreamZero
+    can either expose an action-chain log-probability for PPO or fall back to the
+    historical ``-action_loss`` differentiable proxy when explicitly requested.
     """
     dreamzero_losses, dreamzero_metrics = _resolve_dreamzero_payload(kwargs)
 
@@ -200,49 +296,138 @@ def compute_dreamzero_action_head_rl_loss(**kwargs) -> tuple[torch.Tensor, dict]
     if action_loss.ndim == 0:
         action_loss = action_loss.reshape(1)
 
+    action_loss = action_loss.float()
+
     advantages = kwargs.get("advantages", None)
     if advantages is None:
         raise KeyError("DreamZero RL loss requires environment advantages.")
-    advantages = advantages.to(device=action_loss.device, dtype=action_loss.dtype)
-    while advantages.ndim > action_loss.ndim:
-        advantages = advantages.mean(dim=-1)
-    while advantages.ndim < action_loss.ndim:
-        advantages = advantages.unsqueeze(-1)
-    if advantages.shape != action_loss.shape:
-        advantages = advantages.expand_as(action_loss)
-
-    weight_mode = kwargs.get("dreamzero_advantage_weight_mode", "positive")
-    if weight_mode == "positive":
-        weights = advantages.clamp_min(0)
-    elif weight_mode == "signed":
-        weights = advantages
-    else:
-        raise ValueError(
-            "dreamzero_advantage_weight_mode must be 'positive' or 'signed', "
-            f"got {weight_mode!r}."
-        )
 
     loss_mask = kwargs.get("loss_mask", None)
-    if loss_mask is not None:
-        loss_mask = loss_mask.to(device=action_loss.device, dtype=action_loss.dtype)
-        while loss_mask.ndim > action_loss.ndim:
-            loss_mask = loss_mask.mean(dim=-1)
-        while loss_mask.ndim < action_loss.ndim:
-            loss_mask = loss_mask.unsqueeze(-1)
-        if loss_mask.shape != action_loss.shape:
-            loss_mask = loss_mask.expand_as(action_loss)
-        weights = weights * loss_mask
+    reduction_mode = kwargs.get(
+        "dreamzero_advantage_reduction",
+        "last_valid" if kwargs.get("reward_type") == "chunk_level" else "mean",
+    )
+    sample_advantages = _reduce_sample_values_like_action_loss(
+        advantages,
+        action_loss,
+        name="advantages",
+        dtype=torch.float32,
+        mode=reduction_mode,
+        loss_mask=loss_mask,
+    )
 
-    weight_sum = weights.detach().abs().sum().clamp_min(1.0)
-    scale = kwargs.get("dreamzero_action_loss_scale", 1.0)
-    total_loss = scale * (action_loss * weights.detach()).sum() / weight_sum
+    ppo_loss_mask = None
+    if loss_mask is not None and kwargs.get("dreamzero_use_loss_mask", False):
+        ppo_loss_mask = _reduce_sample_values_like_action_loss(
+            loss_mask,
+            action_loss,
+            name="loss_mask",
+            dtype=torch.float32,
+            mode="mean",
+            loss_mask=loss_mask,
+        ).bool()
 
-    metrics = {
-        "dreamzero/action_loss": total_loss.detach(),
-        "dreamzero/action_loss_unweighted": action_loss.detach().mean(),
-        "dreamzero/advantage_weight_mean": weights.detach().mean(),
-        "dreamzero/total_loss": total_loss.detach(),
-    }
+    logprob_mode = kwargs.get("dreamzero_logprob_mode", "action_chain")
+    if logprob_mode == "action_chain":
+        if "action_logprobs" not in dreamzero_losses:
+            raise KeyError(
+                "DreamZero action-chain mode requires dreamzero_losses['action_logprobs']."
+            )
+        logprobs = _as_sample_logprobs(
+            dreamzero_losses["action_logprobs"],
+            action_loss,
+            name="action_logprobs",
+        )
+        old_logprobs_input = kwargs.get("old_logprobs", None)
+        if old_logprobs_input is None:
+            old_logprobs_input = dreamzero_losses.get("old_action_logprobs", None)
+        if old_logprobs_input is None:
+            raise KeyError("DreamZero action-chain mode requires old_logprobs.")
+        old_logprobs = _as_sample_logprobs(
+            old_logprobs_input,
+            logprobs,
+            name="old_logprobs",
+        )
+        mode_metric = 1.0
+        extra_logprob_metrics = {
+            "dreamzero/action_chain_logprob": logprobs.detach().mean(),
+            "dreamzero/old_action_chain_logprob": old_logprobs.detach().mean(),
+        }
+    elif logprob_mode in ("action_loss_proxy", "proxy"):
+        proxy_scale = kwargs.get(
+            "dreamzero_action_logprob_proxy_scale",
+            kwargs.get("dreamzero_action_loss_scale", 1.0),
+        )
+        logprobs = -proxy_scale * action_loss
+        old_logprobs = kwargs.get("old_logprobs", None)
+        use_rollout_old_proxy = kwargs.get(
+            "dreamzero_use_rollout_old_logprob_proxy", False
+        )
+        if (
+            use_rollout_old_proxy
+            and old_logprobs is not None
+            and old_logprobs.numel() == logprobs.numel()
+        ):
+            old_logprobs = _align_vector_like(
+                old_logprobs,
+                logprobs,
+                name="old_logprobs",
+                dtype=torch.float32,
+            )
+        else:
+            old_logprobs = logprobs.detach()
+        mode_metric = 0.0
+        extra_logprob_metrics = {
+            "dreamzero/action_logprob_proxy": logprobs.detach().mean(),
+            "dreamzero/old_action_logprob_proxy": old_logprobs.detach().mean(),
+            "dreamzero/action_logprob_proxy_scale": torch.tensor(
+                float(proxy_scale), device=action_loss.device
+            ),
+        }
+    else:
+        raise ValueError(
+            "dreamzero_logprob_mode must be 'action_chain' or "
+            f"'action_loss_proxy', got {logprob_mode!r}."
+        )
+
+    ppo_kwargs = dict(kwargs)
+    if "dreamzero_ppo_clip_ratio_c" in kwargs:
+        ppo_kwargs["clip_ratio_c"] = kwargs["dreamzero_ppo_clip_ratio_c"]
+    else:
+        ppo_kwargs["clip_ratio_c"] = None
+    ppo_kwargs.update(
+        {
+            "logprobs": logprobs,
+            "old_logprobs": old_logprobs,
+            "advantages": sample_advantages,
+            "loss_mask": ppo_loss_mask,
+            "loss_mask_sum": None,
+            "max_episode_steps": None,
+        }
+    )
+    ppo_loss, metrics = compute_ppo_actor_loss(**ppo_kwargs)
+
+    total_scale = kwargs.get("dreamzero_ppo_loss_scale", 1.0)
+    total_loss = total_scale * ppo_loss
+    metrics.update(
+        {
+            "dreamzero/action_loss": total_loss.detach(),
+            "dreamzero/ppo_loss": ppo_loss.detach(),
+            "dreamzero/logprob_mode": torch.tensor(
+                mode_metric, device=action_loss.device
+            ),
+            "dreamzero/ppo_loss_scale": torch.tensor(
+                float(total_scale), device=action_loss.device
+            ),
+            "dreamzero/action_loss_unweighted": action_loss.detach().mean(),
+            "dreamzero/sample_advantage_mean": sample_advantages.detach().mean(),
+            "dreamzero/loss_mask_enabled": torch.tensor(
+                float(ppo_loss_mask is not None), device=action_loss.device
+            ),
+            "dreamzero/total_loss": total_loss.detach(),
+        }
+    )
+    metrics.update(extra_logprob_metrics)
     metrics.update(dreamzero_metrics)
     return total_loss, metrics
 

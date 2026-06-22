@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -28,6 +29,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.workers.actor.fsdp_actor_worker import filter_dreamzero_lora_state_dict
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
@@ -370,8 +372,14 @@ class MultiStepRolloutWorker(Worker):
             ).async_wait()
 
         if not self.weight_syncer.receiver_initialized():
+            state_dict = self.hf_model.state_dict()
+            state_dict = filter_dreamzero_lora_state_dict(
+                state_dict,
+                SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+                and bool(self.cfg.actor.model.get("is_lora", False)),
+            )
             await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
+                state_dict=state_dict,
                 recv=recv_func,
                 send=send_func,
             )
@@ -454,6 +462,10 @@ class MultiStepRolloutWorker(Worker):
 
         if self.enable_offload:
             self.offload_model()
+        elif os.environ.get(
+            "DREAMZERO_RELEASE_ROLLOUT_CACHE_AFTER_GENERATE", "true"
+        ).lower() not in {"0", "false", "no"}:
+            self.release_inference_cache()
 
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
@@ -471,6 +483,11 @@ class MultiStepRolloutWorker(Worker):
 
         if self.enable_offload:
             self.offload_model()
+
+    def release_inference_cache(self):
+        if hasattr(self.hf_model, "release_inference_cache"):
+            self.hf_model.release_inference_cache()
+        self.torch_platform.empty_cache()
 
     def offload_model(self):
         if self.enable_cuda_graph:

@@ -14,8 +14,11 @@
 
 """Tests for DreamZero algorithm registry integration."""
 
+import asyncio
+
 import pytest
 import torch
+from omegaconf import OmegaConf
 from transformers.feature_extraction_utils import BatchFeature
 
 import rlinf.algorithms  # noqa: F401
@@ -32,13 +35,14 @@ from rlinf.workers.actor.fsdp_actor_worker import (
     get_dreamzero_train_rollout_size,
     get_dreamzero_loss_action_dim,
     process_nested_dict_for_train,
+    should_log_actor_training_progress,
     strip_dreamzero_action_head_payload,
 )
 
 
-def test_dreamzero_policy_loss_weights_action_loss_by_environment_advantage():
-    action_loss = torch.tensor([1.0, 3.0], dtype=torch.float32)
-    advantages = torch.tensor([[2.0], [0.5]], dtype=torch.float32)
+def test_dreamzero_policy_loss_uses_ppo_with_action_loss_proxy():
+    action_loss = torch.tensor([0.1, 0.5], dtype=torch.float32, requires_grad=True)
+    advantages = torch.tensor([2.0, -1.0], dtype=torch.float32)
 
     loss, metrics = policy_loss(
         task_type="embodied",
@@ -47,23 +51,94 @@ def test_dreamzero_policy_loss_weights_action_loss_by_environment_advantage():
         reward_type="chunk_level",
         single_action_dim=3,
         logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
-        old_logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
+        old_logprobs=torch.zeros(2, dtype=torch.float32),
         advantages=advantages,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_loss_proxy",
         dreamzero_losses={
             "action_loss": action_loss,
         },
         dreamzero_metrics={"dreamzero/raw_action_loss": action_loss.mean()},
     )
 
-    weights = advantages.reshape(-1).clamp_min(0)
-    expected = (action_loss * weights).sum() / weights.abs().sum().clamp_min(1.0)
+    loss.backward()
+
+    logprobs = -action_loss
+    old_logprobs = logprobs.detach()
+    ratio = torch.exp(logprobs - old_logprobs)
+    clipped_ratio = ratio.clamp(0.8, 1.2)
+    expected = torch.max(-advantages * ratio, -advantages * clipped_ratio).mean()
     assert torch.allclose(loss, expected)
-    assert metrics["dreamzero/action_loss"] == expected.item()
+    assert action_loss.grad[0] > 0
+    assert action_loss.grad[1] < 0
+    assert metrics["actor/policy_loss"] == expected.item()
+    assert metrics["dreamzero/action_logprob_proxy"] == logprobs.mean().item()
     assert metrics["dreamzero/total_loss"] == loss.item()
     assert "dreamzero/model_loss" not in metrics
 
 
-def test_dreamzero_policy_loss_positive_mode_zeroes_all_zero_advantages():
+def test_dreamzero_action_chain_mode_uses_recomputed_logprobs_not_action_loss():
+    action_loss = torch.tensor([5.0, 7.0], dtype=torch.float32, requires_grad=True)
+    logprobs = torch.tensor([-1.0, -0.4], dtype=torch.float32, requires_grad=True)
+    old_logprobs = torch.tensor([-1.05, -0.35], dtype=torch.float32)
+    advantages = torch.tensor([2.0, -1.0], dtype=torch.float32)
+
+    loss, metrics = policy_loss(
+        task_type="embodied",
+        loss_type="dreamzero_action_head_rl",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=3,
+        logprobs=torch.zeros(2, dtype=torch.float32),
+        old_logprobs=old_logprobs,
+        advantages=advantages,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_chain",
+        dreamzero_losses={
+            "action_loss": action_loss,
+            "action_logprobs": logprobs,
+        },
+    )
+
+    loss.backward()
+
+    ratio = torch.exp(logprobs - old_logprobs)
+    clipped_ratio = ratio.clamp(0.8, 1.2)
+    expected = torch.max(-advantages * ratio, -advantages * clipped_ratio).mean()
+    assert torch.allclose(loss, expected)
+    assert action_loss.grad is None
+    assert torch.all(logprobs.grad != 0)
+    assert metrics["dreamzero/logprob_mode"] == 1.0
+    assert metrics["dreamzero/action_chain_logprob"] == logprobs.mean().item()
+    assert metrics["dreamzero/old_action_chain_logprob"] == old_logprobs.mean().item()
+
+
+def test_dreamzero_action_chain_mode_requires_chain_logprobs():
+    with pytest.raises(KeyError, match="action_logprobs"):
+        policy_loss(
+            task_type="embodied",
+            loss_type="dreamzero_action_head_rl",
+            logprob_type="chunk_level",
+            reward_type="chunk_level",
+            single_action_dim=3,
+            logprobs=torch.zeros(1, dtype=torch.float32),
+            old_logprobs=torch.zeros(1, dtype=torch.float32),
+            advantages=torch.ones(1, dtype=torch.float32),
+            clip_ratio_low=0.2,
+            clip_ratio_high=0.2,
+            clip_ratio_c=None,
+            dreamzero_logprob_mode="action_chain",
+            dreamzero_losses={
+                "action_loss": torch.tensor([1.0], dtype=torch.float32),
+            },
+        )
+
+
+def test_dreamzero_policy_loss_zeroes_all_zero_advantages():
     action_loss = torch.tensor([1.0, 3.0], dtype=torch.float32, requires_grad=True)
 
     loss, metrics = policy_loss(
@@ -73,8 +148,12 @@ def test_dreamzero_policy_loss_positive_mode_zeroes_all_zero_advantages():
         reward_type="chunk_level",
         single_action_dim=3,
         logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
-        old_logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
+        old_logprobs=torch.zeros(2, dtype=torch.float32),
         advantages=torch.zeros(2, 1, dtype=torch.float32),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_loss_proxy",
         dreamzero_losses={
             "action_loss": action_loss,
         },
@@ -84,16 +163,80 @@ def test_dreamzero_policy_loss_positive_mode_zeroes_all_zero_advantages():
 
     assert torch.allclose(loss, torch.tensor(0.0))
     assert torch.equal(action_loss.grad, torch.zeros_like(action_loss))
-    assert metrics["dreamzero/advantage_weight_mean"] == 0.0
+    assert metrics["actor/policy_loss"] == 0.0
+
+
+def test_dreamzero_policy_loss_uses_last_valid_timestep_advantage():
+    action_loss = torch.tensor([2.0], dtype=torch.float32, requires_grad=True)
+    advantages = torch.zeros(1, 4, 1, dtype=torch.float32)
+    advantages[0, -1, 0] = 3.0
+    loss_mask = torch.ones_like(advantages, dtype=torch.bool)
+
+    loss, metrics = policy_loss(
+        task_type="embodied",
+        loss_type="dreamzero_action_head_rl",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=3,
+        logprobs=torch.zeros(1, 1, 3, dtype=torch.float32),
+        old_logprobs=torch.zeros(1, dtype=torch.float32),
+        advantages=advantages,
+        loss_mask=loss_mask,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_loss_proxy",
+        dreamzero_losses={
+            "action_loss": action_loss,
+        },
+    )
+
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(-3.0))
+    assert torch.allclose(action_loss.grad, torch.tensor([3.0]))
+    assert metrics["dreamzero/sample_advantage_mean"] == 3.0
+
+
+def test_dreamzero_policy_loss_keeps_sample_gradient_when_rollout_mask_is_zero():
+    action_loss = torch.tensor([0.25], dtype=torch.float32, requires_grad=True)
+
+    loss, metrics = policy_loss(
+        task_type="embodied",
+        loss_type="dreamzero_action_head_rl",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=3,
+        logprobs=torch.zeros(1, 1, 3, dtype=torch.float32),
+        old_logprobs=torch.zeros(1, dtype=torch.float32),
+        advantages=torch.tensor([1.0], dtype=torch.float32),
+        loss_mask=torch.zeros(1, 1, 1, dtype=torch.bool),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=3.0,
+        dreamzero_logprob_mode="action_loss_proxy",
+        dreamzero_losses={
+            "action_loss": action_loss,
+        },
+    )
+
+    loss.backward()
+
+    assert torch.allclose(loss, torch.tensor(-1.0))
+    assert action_loss.grad.item() > 0.0
+    assert metrics["dreamzero/loss_mask_enabled"] == 0.0
 
 
 def test_dreamzero_policy_loss_consumes_model_side_rl_payload_once():
+    action_loss = torch.tensor([2.0, 4.0])
     set_dreamzero_loss_payload(
         {
-            "action_loss": torch.tensor([2.0, 4.0]),
+            "action_loss": action_loss,
         },
         {"dreamzero/raw_action_loss": torch.tensor(3.0)},
     )
+    old_logprobs = torch.zeros(2, dtype=torch.float32)
+    advantages = torch.tensor([[1.0], [0.0]], dtype=torch.float32)
 
     loss, metrics = policy_loss(
         task_type="embodied",
@@ -102,11 +245,23 @@ def test_dreamzero_policy_loss_consumes_model_side_rl_payload_once():
         reward_type="chunk_level",
         single_action_dim=3,
         logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
-        old_logprobs=torch.zeros(2, 1, 3, dtype=torch.float32),
-        advantages=torch.tensor([[1.0], [0.0]], dtype=torch.float32),
+        old_logprobs=old_logprobs,
+        advantages=advantages,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_loss_proxy",
     )
 
-    assert torch.allclose(loss, torch.tensor(2.0))
+    logprobs = -action_loss
+    old_logprobs = logprobs.detach()
+    ratio = torch.exp(logprobs - old_logprobs)
+    clipped_ratio = ratio.clamp(0.8, 1.2)
+    expected = torch.max(
+        -advantages.reshape(-1) * ratio,
+        -advantages.reshape(-1) * clipped_ratio,
+    ).mean()
+    assert torch.allclose(loss, expected)
     assert metrics["dreamzero/raw_action_loss"] == 3.0
 
 
@@ -118,15 +273,19 @@ def test_dreamzero_action_head_rl_skips_generic_logprob_preprocess():
         reward_type="chunk_level",
         single_action_dim=7,
         logprobs=torch.zeros(1, 768, dtype=torch.float32),
-        old_logprobs=torch.zeros(1, 768, dtype=torch.float32),
+        old_logprobs=torch.zeros(1, dtype=torch.float32),
         advantages=torch.tensor([2.0], dtype=torch.float32),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=None,
+        dreamzero_logprob_mode="action_loss_proxy",
         dreamzero_losses={
             "action_loss": torch.tensor([3.0], dtype=torch.float32),
         },
     )
 
-    assert torch.allclose(loss, torch.tensor(3.0))
-    assert metrics["dreamzero/action_loss"] == 3.0
+    assert torch.allclose(loss, torch.tensor(-2.0))
+    assert metrics["dreamzero/action_logprob_proxy"] == -3.0
 
 
 def test_dreamzero_action_head_rl_rejects_world_model_only_payload():
@@ -580,6 +739,312 @@ def test_dreamzero_rl_forward_clamps_actions_before_action_head():
     assert torch.allclose(outputs["dreamzero_losses"]["action_loss"], torch.tensor([0.0]))
 
 
+def test_dreamzero_rl_forward_recomputes_action_chain_logprob(monkeypatch):
+    dreamzero_policy_module = pytest.importorskip(
+        "rlinf.models.embodiment.dreamzero.dreamzero_policy"
+    )
+    DreamZeroPolicy = dreamzero_policy_module.DreamZeroPolicy
+
+    class FakeDreamZeroPolicy(DreamZeroPolicy):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+
+        def _slice_rl_sample(self, inputs, index):
+            return {
+                key: value[index : index + 1] if torch.is_tensor(value) else value
+                for key, value in inputs.items()
+            }
+
+        def lazy_joint_video_action_causal(self, inputs, *, return_video=True):
+            return BatchFeature(data={"action_pred": inputs["action"] + self.weight})
+
+    policy = FakeDreamZeroPolicy()
+    original_forward = dreamzero_policy_module.VLA.forward
+
+    def fake_vla_forward(self, sample_input):
+        raise AssertionError("action-chain logprob path should not run VLA.forward")
+
+    monkeypatch.setenv("DREAMZERO_ACTION_LOGPROB_STD", "1.0")
+    dreamzero_policy_module.VLA.forward = fake_vla_forward
+    try:
+        outputs = policy.rl_forward(
+            forward_inputs={
+                "dreamzero_rl.action": torch.tensor(
+                    [[[0.25, -0.25], [0.5, -0.5]]], dtype=torch.float32
+                ),
+                "dreamzero_rl.action_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+                "dreamzero_old_action_logprob": torch.tensor([-4.0]),
+                "dreamzero_action_logprob_std": torch.tensor([1.0]),
+            }
+        )
+    finally:
+        dreamzero_policy_module.VLA.forward = original_forward
+
+    assert outputs["logprobs"].shape == (1,)
+    assert outputs["dreamzero_losses"]["action_logprobs"].shape == (1,)
+    assert torch.equal(
+        outputs["dreamzero_losses"]["old_action_logprobs"], torch.tensor([-4.0])
+    )
+    outputs["logprobs"].sum().backward()
+    assert policy.weight.grad is not None
+
+
+def test_dreamzero_rl_forward_requests_action_only_recompute(monkeypatch):
+    dreamzero_policy_module = pytest.importorskip(
+        "rlinf.models.embodiment.dreamzero.dreamzero_policy"
+    )
+    DreamZeroPolicy = dreamzero_policy_module.DreamZeroPolicy
+
+    class FakeDreamZeroPolicy(DreamZeroPolicy):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.return_video_values = []
+
+        def lazy_joint_video_action_causal(self, inputs, *, return_video=True):
+            self.return_video_values.append(return_video)
+            return BatchFeature(data={"action_pred": inputs["action"]})
+
+    monkeypatch.setenv("DREAMZERO_ACTION_LOGPROB_STD", "1.0")
+    policy = FakeDreamZeroPolicy()
+    outputs = policy.rl_forward(
+        forward_inputs={
+            "dreamzero_rl.action": torch.tensor(
+                [[[0.25, -0.25], [0.5, -0.5]]], dtype=torch.float32
+            ),
+            "dreamzero_rl.action_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+            "dreamzero_old_action_logprob": torch.tensor([-4.0]),
+            "dreamzero_action_logprob_std": torch.tensor([1.0]),
+        }
+    )
+
+    assert policy.return_video_values == [False]
+    assert "action_logprobs" in outputs["dreamzero_losses"]
+
+
+def test_rollout_generate_releases_dreamzero_inference_cache():
+    rollout_module = pytest.importorskip(
+        "rlinf.workers.rollout.hf.huggingface_worker"
+    )
+    MultiStepRolloutWorker = rollout_module.MultiStepRolloutWorker
+
+    class FakeModel:
+        def __init__(self):
+            self.release_count = 0
+
+        def release_inference_cache(self):
+            self.release_count += 1
+
+    class FakeWorker(MultiStepRolloutWorker):
+        def __init__(self):
+            self.enable_offload = False
+            self.rollout_epoch = 2
+            self._rank = 0
+            self.hf_model = FakeModel()
+            self.generated = 0
+            self.empty_cache_count = 0
+
+            class FakeTorchPlatform:
+                def __init__(inner_self, outer):
+                    inner_self.outer = outer
+
+                def empty_cache(inner_self):
+                    inner_self.outer.empty_cache_count += 1
+
+            self.torch_platform = FakeTorchPlatform(self)
+
+        async def generate_one_epoch(self, input_channel, output_channel):
+            self.generated += 1
+
+    worker = FakeWorker()
+    asyncio.run(worker.generate(input_channel=None, output_channel=None))
+
+    assert worker.generated == 2
+    assert worker.hf_model.release_count == 1
+    assert worker.empty_cache_count == 1
+
+
+def test_rollout_sync_filters_dreamzero_lora_receiver_state_dict():
+    rollout_module = pytest.importorskip(
+        "rlinf.workers.rollout.hf.huggingface_worker"
+    )
+    MultiStepRolloutWorker = rollout_module.MultiStepRolloutWorker
+
+    class FakeModel:
+        def state_dict(self):
+            return {
+                "action_head.model.base_model.model.blocks.0.attn.q.lora_A.default.weight": torch.ones(1),
+                "action_head.model.base_model.model.action_decoder.weight": torch.ones(1),
+                "action_head.model.base_model.model.action_encoder.weight": torch.ones(1),
+                "action_head.model.base_model.model.state_encoder.weight": torch.ones(1),
+                "action_head.model.base_model.model.blocks.0.attn.q.base_layer.weight": torch.ones(1),
+            }
+
+        def set_global_step(self, step):
+            self.global_step = step
+
+    class FakeWeightSyncer:
+        def __init__(self):
+            self.receiver_state_keys = None
+
+        def receiver_initialized(self):
+            return False
+
+        async def init_receiver(self, *, state_dict, recv, send):
+            del recv, send
+            self.receiver_state_keys = set(state_dict)
+
+        async def apply(self, model, recv):
+            del model, recv
+            return 0
+
+    class FakeWorker(MultiStepRolloutWorker):
+        def __init__(self):
+            self.cfg = OmegaConf.create(
+                {
+                    "actor": {
+                        "model": {"model_type": "dreamzero", "is_lora": True},
+                    },
+                }
+            )
+            self.actor_group_name = "ActorGroup"
+            self.actor_weight_src_rank = 0
+            self._group_name = "RolloutGroup"
+            self._weight_sync_rollout_ranks = [0]
+            self._weight_sync_is_sender = False
+            self._sync_weight_comm_options = None
+            self.weight_syncer = FakeWeightSyncer()
+            self.hf_model = FakeModel()
+            self.finished_episodes = 0
+
+            class FakeTorchPlatform:
+                def empty_cache(inner_self):
+                    return None
+
+            self.torch_platform = FakeTorchPlatform()
+
+        def broadcast(self, *args, **kwargs):
+            raise AssertionError("syncer should not call recv in this unit test")
+
+    worker = FakeWorker()
+    asyncio.run(worker.sync_model_from_actor())
+
+    assert worker.weight_syncer.receiver_state_keys == {
+        "action_head.model.base_model.model.blocks.0.attn.q.lora_A.default.weight",
+        "action_head.model.base_model.model.action_decoder.weight",
+        "action_head.model.base_model.model.action_encoder.weight",
+        "action_head.model.base_model.model.state_encoder.weight",
+    }
+
+
+def test_actor_rollout_state_dict_filters_dreamzero_lora_sync_names():
+    actor_module = pytest.importorskip("rlinf.workers.actor.fsdp_actor_worker")
+    EmbodiedFSDPActor = actor_module.EmbodiedFSDPActor
+
+    class FakeActor(EmbodiedFSDPActor):
+        def __init__(self):
+            self.cfg = OmegaConf.create(
+                {
+                    "actor": {
+                        "model": {"model_type": "dreamzero", "is_lora": True},
+                    },
+                }
+            )
+            self.param_names_need_sync = [
+                "action_head.model.base_model.model.blocks.0.attn.q.lora_A.default.weight",
+                "action_head.model.base_model.model.blocks.0.attn.q.base_layer.weight",
+                "action_head.model.base_model.model.action_decoder.weight",
+                "action_head.model.base_model.model.action_encoder.weight",
+                "action_head.model.base_model.model.state_encoder.weight",
+                "world_model.rssm.weight",
+            ]
+
+        def get_model_state_dict(self, *, cpu_offload, full_state_dict):
+            assert cpu_offload is False
+            assert full_state_dict is False
+            return {
+                key: torch.ones(1)
+                for key in self.param_names_need_sync
+            }
+
+    actor = FakeActor()
+    state_dict = actor.get_rollout_state_dict()
+
+    assert set(state_dict) == {
+        "action_head.model.base_model.model.blocks.0.attn.q.lora_A.default.weight",
+        "action_head.model.base_model.model.action_decoder.weight",
+        "action_head.model.base_model.model.action_encoder.weight",
+        "action_head.model.base_model.model.state_encoder.weight",
+    }
+    assert actor.param_names_need_sync == list(state_dict.keys())
+
+
+def test_actor_training_progress_logging_samples_long_runs():
+    logged = [
+        idx for idx in range(64) if should_log_actor_training_progress(idx, total=64)
+    ]
+
+    assert logged[0] == 0
+    assert logged[-1] == 63
+    assert len(logged) <= 18
+    assert 3 in logged
+
+
+def test_dreamzero_rl_forward_does_not_reuse_action_chain_graph_between_microbatches(
+    monkeypatch,
+):
+    dreamzero_policy_module = pytest.importorskip(
+        "rlinf.models.embodiment.dreamzero.dreamzero_policy"
+    )
+    DreamZeroPolicy = dreamzero_policy_module.DreamZeroPolicy
+
+    class FakeActionHead:
+        def __init__(self):
+            self.kv_cache1 = None
+            self.kv_cache_neg = None
+            self.crossattn_cache = None
+            self.crossattn_cache_neg = None
+            self.clip_feas = None
+            self.ys = None
+            self.language = "cached"
+            self.current_start_frame = 1
+            self.skip_countdown = 1
+
+    class FakeDreamZeroPolicy(DreamZeroPolicy):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+            self.action_head = FakeActionHead()
+
+        def lazy_joint_video_action_causal(self, inputs, *, return_video=True):
+            action_pred = (inputs["action"] + self.weight).pow(2)
+            if self.action_head.kv_cache1 is not None:
+                action_pred = action_pred + self.action_head.kv_cache1
+            self.action_head.kv_cache1 = action_pred
+            return BatchFeature(data={"action_pred": action_pred})
+
+    def forward_inputs(action_value):
+        return {
+            "dreamzero_rl.action": torch.full(
+                (1, 2, 2), action_value, dtype=torch.float32
+            ),
+            "dreamzero_rl.action_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+            "dreamzero_old_action_logprob": torch.tensor([-4.0]),
+            "dreamzero_action_logprob_std": torch.tensor([1.0]),
+        }
+
+    monkeypatch.setenv("DREAMZERO_ACTION_LOGPROB_STD", "1.0")
+    policy = FakeDreamZeroPolicy()
+
+    first = policy.rl_forward(forward_inputs(0.25))
+    first["logprobs"].sum().backward()
+    policy.weight.grad = None
+    second = policy.rl_forward(forward_inputs(0.5))
+    second["logprobs"].sum().backward()
+
+    assert policy.weight.grad is not None
+
+
 def test_dreamzero_advantage_uses_unified_registry_entry():
     rewards = torch.tensor(
         [
@@ -626,6 +1091,100 @@ def test_dreamzero_loader_disables_torch_compile_from_env(monkeypatch):
         assert dreamzero_model_module._dreamzero_disable_torch_compile() is True
     finally:
         monkeypatch.setattr(torch, "compile", original_compile)
+
+
+def test_dreamzero_wan_policy_head_uses_configured_inference_timesteps():
+    wan_module = pytest.importorskip(
+        "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf"
+    )
+
+    cfg = wan_module.WANPolicyHeadConfig(
+        skip_component_loading=True,
+        train_architecture="none",
+        tune_diffusion_model=False,
+        text_encoder_cfg={"_target_": "torch.nn.Identity"},
+        image_encoder_cfg={"_target_": "torch.nn.Identity"},
+        vae_cfg={"_target_": "torch.nn.Identity"},
+        diffusion_model_cfg={
+            "_target_": "torch.nn.Linear",
+            "in_features": 1,
+            "out_features": 1,
+        },
+        action_dim=2,
+        action_horizon=2,
+        num_frames=1,
+        num_inference_timesteps=4,
+    )
+
+    head = wan_module.WANPolicyHead(cfg)
+
+    assert head.num_inference_timesteps == 4
+    assert head.num_inference_steps == 4
+
+
+def test_dreamzero_causal_inference_blocks_use_gradient_checkpointing(monkeypatch):
+    import torch.utils.checkpoint
+
+    wan_module = pytest.importorskip(
+        "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk"
+    )
+
+    checkpoint_calls = []
+
+    def fake_checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(kwargs.pop("use_reentrant", None))
+        return function(*args, **kwargs)
+
+    class FakeBlock(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            return x + 1, kwargs.get("kv_cache")
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", fake_checkpoint)
+
+    model = wan_module.CausalWanModel(
+        model_type="t2v",
+        patch_size=(1, 1, 1),
+        frame_seqlen=1,
+        text_len=2,
+        in_dim=4,
+        dim=4,
+        ffn_dim=8,
+        freq_dim=4,
+        text_dim=4,
+        out_dim=4,
+        num_heads=2,
+        num_layers=2,
+        max_chunk_size=-1,
+        cross_attn_norm=False,
+        concat_first_frame_latent=False,
+    )
+    model.blocks = torch.nn.ModuleList([FakeBlock(), FakeBlock()])
+    model.gradient_checkpointing = True
+
+    x = torch.ones(1, 4, 1, 1, 1, requires_grad=True)
+    timestep = torch.zeros(1, 1, dtype=torch.long)
+    context = torch.zeros(1, 2, 4)
+    freqs = torch.zeros(1, 1, 2)
+
+    output, action_pred, caches = model._forward_blocks(
+        x=x,
+        seq_len=1,
+        freqs=freqs,
+        timestep=timestep,
+        context=context,
+        clip_feature=None,
+        embodiment_id=None,
+        action=None,
+        timestep_action=None,
+        state=None,
+        kv_cache=[None, None],
+        current_start_frame=1,
+    )
+
+    assert output.requires_grad
+    assert action_pred is None
+    assert caches == [None, None]
+    assert checkpoint_calls == [False, False]
 
 
 def test_dreamzero_libero_observation_transform_builds_inference_modalities():

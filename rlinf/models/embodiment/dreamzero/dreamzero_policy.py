@@ -366,12 +366,104 @@ class DreamZeroPolicy(VLA, BasePolicy):
         return forward_inputs
 
     @staticmethod
+    def _dreamzero_action_logprob_std(default: float = 0.02) -> float:
+        raw = os.getenv("DREAMZERO_ACTION_LOGPROB_STD", str(default))
+        std = float(raw)
+        if std <= 0:
+            raise ValueError("DREAMZERO_ACTION_LOGPROB_STD must be positive.")
+        return std
+
+    @staticmethod
+    def _gaussian_action_logprob(
+        action: torch.Tensor,
+        mean: torch.Tensor,
+        *,
+        std: float,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        action = action.to(device=mean.device, dtype=torch.float32)
+        mean = mean.float()
+        if action.shape != mean.shape:
+            action = action.reshape_as(mean)
+        var = std * std
+        log_scale = float(np.log(std))
+        log_two_pi = float(np.log(2.0 * np.pi))
+        logprob = -0.5 * ((action - mean).pow(2) / var + 2.0 * log_scale + log_two_pi)
+        if mask is not None:
+            mask = mask.to(device=logprob.device, dtype=torch.bool)
+            if mask.shape != logprob.shape:
+                mask = mask.reshape_as(logprob)
+            logprob = torch.where(mask, logprob, torch.zeros_like(logprob))
+        return logprob.reshape(logprob.shape[0], -1).sum(dim=-1)
+
+    def _build_action_chain_payload(
+        self,
+        *,
+        normalized_action: torch.Tensor,
+        mean_action: torch.Tensor,
+        action_mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        std = self._dreamzero_action_logprob_std()
+        old_logprob = self._gaussian_action_logprob(
+            normalized_action,
+            mean_action,
+            std=std,
+            mask=action_mask,
+        )
+        timesteps = torch.zeros(
+            normalized_action.shape[0], 1, dtype=torch.long, device=normalized_action.device
+        )
+        return {
+            "dreamzero_action_chain": torch.stack(
+                [mean_action.detach(), normalized_action.detach()], dim=1
+            )
+            .cpu()
+            .contiguous(),
+            "dreamzero_action_timesteps": timesteps.detach().cpu().contiguous(),
+            "dreamzero_old_action_logprob": old_logprob.detach().cpu().contiguous(),
+            "dreamzero_action_logprob_std": torch.full(
+                (normalized_action.shape[0],),
+                std,
+                dtype=torch.float32,
+                device=normalized_action.device,
+            )
+            .cpu()
+            .contiguous(),
+        }
+
+    @staticmethod
     def _restore_rl_tensor_payload(forward_inputs: dict[str, Any]) -> dict[str, Any]:
         return {
             key.removeprefix("dreamzero_rl."): value
             for key, value in forward_inputs.items()
             if key.startswith("dreamzero_rl.")
         }
+
+    def _reset_action_chain_inference_state(self) -> None:
+        action_head = getattr(self, "action_head", None)
+        if action_head is None:
+            return
+        if hasattr(action_head, "release_inference_cache"):
+            action_head.release_inference_cache()
+            return
+        for name in (
+            "kv_cache1",
+            "kv_cache_neg",
+            "crossattn_cache",
+            "crossattn_cache_neg",
+            "clip_feas",
+            "ys",
+            "language",
+        ):
+            if hasattr(action_head, name):
+                setattr(action_head, name, None)
+        if hasattr(action_head, "current_start_frame"):
+            action_head.current_start_frame = 0
+        if hasattr(action_head, "skip_countdown"):
+            action_head.skip_countdown = 0
+
+    def release_inference_cache(self) -> None:
+        self._reset_action_chain_inference_state()
 
     def _infer_real_action_dim(self, fallback: int) -> int:
         transforms = getattr(getattr(self.config, "data_transforms", None), "transforms", [])
@@ -503,6 +595,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
         )
         action_mask = torch.zeros_like(normalized_action, dtype=torch.bool)
         action_mask[..., :real_action_dim] = True
+        action_chain_payload = self._build_action_chain_payload(
+            normalized_action=normalized_action.cpu(),
+            mean_action=normalized_action.detach().cpu(),
+            action_mask=action_mask.cpu(),
+        )
         rl_input = dict(normalized_input)
         rl_input["action"] = normalized_action.cpu()
         rl_input["action_mask"] = action_mask.cpu()
@@ -516,9 +613,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
             .contiguous(),
         }
         forward_inputs.update(self._flatten_rl_tensor_payload(rl_input))
+        forward_inputs.update(action_chain_payload)
         forward_inputs = self._normalize_forward_payload_for_rollout(forward_inputs)
         result = {
-            "prev_logprobs": torch.zeros_like(flat_env_action, dtype=torch.float32),
+            "prev_logprobs": action_chain_payload[
+                "dreamzero_old_action_logprob"
+            ].to(dtype=torch.float32),
             "prev_values": torch.zeros((flat_env_action.shape[0], 1), dtype=torch.float32),
             "forward_inputs": forward_inputs,
         }
@@ -618,43 +718,81 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 images.shape[0], target_frames, *images.shape[2:]
             ).contiguous()
 
-        action_losses = []
+        action_logprobs = None
         extra_metrics: dict[str, torch.Tensor] = {}
-        for index in range(actions.shape[0]):
-            sample_input = self._slice_rl_sample(rl_input, index)
-            outputs = VLA.forward(self, sample_input)
-            if "action_loss" not in outputs:
-                raise KeyError(
-                    "DreamZero action-head forward did not return 'action_loss'; "
-                    "cannot compute a real RL update."
-                )
-            action_losses.append(outputs["action_loss"].reshape(()))
-            if index == 0:
-                if "dynamics_loss" in outputs:
-                    extra_metrics["dreamzero/dynamics_loss"] = outputs[
-                        "dynamics_loss"
-                    ].detach()
-                if "loss" in outputs:
-                    extra_metrics["dreamzero/base_loss"] = outputs["loss"].detach()
+        if "dreamzero_old_action_logprob" in forward_inputs:
+            self._reset_action_chain_inference_state()
+            mean_pred = self.lazy_joint_video_action_causal(
+                rl_input, return_video=False
+            )["action_pred"]
+            action_logprob_std = forward_inputs.get("dreamzero_action_logprob_std", None)
+            if torch.is_tensor(action_logprob_std):
+                std = float(action_logprob_std.float().reshape(-1)[0].item())
+            else:
+                std = self._dreamzero_action_logprob_std()
+            action_logprobs = self._gaussian_action_logprob(
+                actions,
+                mean_pred.to(device=actions.device),
+                std=std,
+                mask=rl_input.get("action_mask"),
+            )
+            action_loss = torch.zeros(
+                actions.shape[0],
+                device=actions.device,
+                dtype=actions.dtype if actions.is_floating_point() else torch.float32,
+            )
+        else:
+            action_losses = []
+            for index in range(actions.shape[0]):
+                sample_input = self._slice_rl_sample(rl_input, index)
+                outputs = VLA.forward(self, sample_input)
+                if "action_loss" not in outputs:
+                    raise KeyError(
+                        "DreamZero action-head forward did not return 'action_loss'; "
+                        "cannot compute a real RL update."
+                    )
+                action_losses.append(outputs["action_loss"].reshape(()))
+                if index == 0:
+                    if "dynamics_loss" in outputs:
+                        extra_metrics["dreamzero/dynamics_loss"] = outputs[
+                            "dynamics_loss"
+                        ].detach()
+                    if "loss" in outputs:
+                        extra_metrics["dreamzero/base_loss"] = outputs["loss"].detach()
 
-        action_loss = torch.stack(action_losses)
+            action_loss = torch.stack(action_losses)
 
         losses = {"action_loss": action_loss}
+        if action_logprobs is not None:
+            losses["action_logprobs"] = action_logprobs
+            old_action_logprobs = forward_inputs["dreamzero_old_action_logprob"].to(
+                device=actions.device, dtype=torch.float32
+            )
+            losses["old_action_logprobs"] = old_action_logprobs.reshape_as(
+                action_logprobs
+            )
         metrics = {
             "dreamzero/raw_action_loss": action_loss.detach().mean(),
             "dreamzero/rl_batch_size": torch.tensor(
                 actions.shape[0], device=actions.device, dtype=torch.float32
             ),
         }
+        if action_logprobs is not None:
+            metrics["dreamzero/action_chain_logprob_forward"] = (
+                action_logprobs.detach().mean()
+            )
         metrics.update(extra_metrics)
         set_dreamzero_loss_payload(losses, metrics)
 
-        flat_logprobs = torch.zeros(
-            actions.shape[0],
-            actions.shape[1] * actions.shape[2],
-            dtype=torch.float32,
-            device=actions.device,
-        )
+        if action_logprobs is None:
+            flat_logprobs = torch.zeros(
+                actions.shape[0],
+                actions.shape[1] * actions.shape[2],
+                dtype=torch.float32,
+                device=actions.device,
+            )
+        else:
+            flat_logprobs = action_logprobs.float()
         result: dict[str, Any] = {
             "logprobs": flat_logprobs,
             "dreamzero_losses": losses,

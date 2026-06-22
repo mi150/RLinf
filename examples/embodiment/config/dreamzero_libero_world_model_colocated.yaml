@@ -53,6 +53,8 @@ algorithm:
   update_epoch: 1
   adv_type: dreamzero
   loss_type: dreamzero_world_model_proxy
+  dreamzero_logprob_mode: action_chain
+  dreamzero_action_logprob_std: 0.02
   loss_agg_func: token-mean
   kl_beta: 0.0
   entropy_bonus: 0.0
@@ -81,8 +83,8 @@ env:
     task_suite_name: libero_spatial
     total_num_envs: 64
     group_size: ${algorithm.group_size}
-    max_episode_steps: 512
-    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 256
+    max_steps_per_rollout_epoch: 256
     auto_reset: false
     ignore_terminations: false
     video_cfg:
@@ -99,8 +101,8 @@ env:
     auto_reset: true
     ignore_terminations: true
     is_eval: true
-    max_episode_steps: 512
-    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 256
+    max_steps_per_rollout_epoch: 256
     video_cfg:
       save_video: true
       info_on_video: true

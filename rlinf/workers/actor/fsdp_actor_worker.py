@@ -132,6 +132,27 @@ def filter_dreamzero_lora_state_dict(
     return filtered
 
 
+def filter_dreamzero_lora_sync_names(
+    param_names: list[str] | None,
+    enabled: bool,
+) -> list[str] | None:
+    if param_names is None or not enabled:
+        return param_names
+    filtered = filter_dreamzero_lora_state_dict(
+        {key: None for key in param_names},
+        enabled=True,
+    )
+    return [key for key in param_names if key in filtered]
+
+
+def should_log_actor_training_progress(index: int, total: int) -> bool:
+    if total <= 0:
+        return False
+    if total <= 16:
+        return True
+    return index == 0 or index == total - 1 or (index + 1) % max(1, total // 16) == 0
+
+
 def get_dreamzero_loss_action_dim(model_cfg, loss_type: str) -> int:
     action_dim = model_cfg.get("action_dim", 7)
     model_type = model_cfg.get("model_type")
@@ -1000,7 +1021,7 @@ class FSDPActor(FSDPModelManager, Worker):
                     yield next(batch)
 
             micro_batches_iter = iterator_wrapper()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         mbs_metrics_list = {}
         for idx, m_batch in enumerate(micro_batches_iter):
             backward_ctx = self.before_micro_batch(
@@ -1324,14 +1345,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 for key, value in state_dict.items()
                 if not key.startswith("world_model.")
             }
+        dreamzero_lora_sync = (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+            and bool(self.cfg.actor.model.get("is_lora", False))
+        )
         state_dict = filter_dreamzero_lora_state_dict(
             state_dict,
-            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
-            and bool(self.cfg.actor.model.get("is_lora", False)),
+            dreamzero_lora_sync,
+        )
+        self.param_names_need_sync = filter_dreamzero_lora_sync_names(
+            self.param_names_need_sync,
+            dreamzero_lora_sync,
         )
         return state_dict
 
     async def sync_model_to_rollout(self) -> None:
+        self.log_info("sync_model_to_rollout: collecting rollout state_dict")
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
                 self.offload_optimizer()
@@ -1340,6 +1369,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.load_param_and_grad(self.device, False)
 
         state_dict = self.get_rollout_state_dict()
+        self.log_info(
+            f"sync_model_to_rollout: state_dict_keys={len(state_dict)} "
+            f"sync_names={len(self.param_names_need_sync or [])} "
+            f"version={self.version}"
+        )
 
         async def send_func(data):
             if not self._is_weight_sender:
@@ -1380,14 +1414,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return metadata
 
         if not self.weight_syncer.sender_initialized():
+            self.log_info("sync_model_to_rollout: initializing weight sync sender")
             await self.weight_syncer.init_sender(
                 state_dict=state_dict,
                 send=send_func,
                 recv=recv_func,
                 param_names_need_sync=self.param_names_need_sync,
             )
+            self.log_info("sync_model_to_rollout: weight sync sender initialized")
 
+        self.log_info("sync_model_to_rollout: syncing weights")
         await self.weight_syncer.sync(state_dict, send_func, version=self.version)
+        self.log_info("sync_model_to_rollout: weights synced")
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
@@ -1656,9 +1694,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Run the training process using the received rollout batch.
         """
+        run_started = time.monotonic()
         if self.is_weight_offloaded:
+            self.log_on_first_rank("actor training: loading offloaded parameters")
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
+            self.log_on_first_rank("actor training: loading offloaded optimizer")
             self.load_optimizer(self.device)
 
         self.model.train()
@@ -1698,14 +1739,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
-        metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        num_global_batches = rollout_size // batch_size_per_rank
+        num_micro_batches_per_global = (
+            batch_size_per_rank // self.cfg.actor.micro_batch_size
+        )
+        total_micro_batches = (
+            update_epoch * num_global_batches * num_micro_batches_per_global
+        )
+        self.log_on_first_rank(
+            "actor training: start "
+            f"rollout_size_per_rank={rollout_size} "
+            f"global_batch_size={self.cfg.actor.global_batch_size} "
+            f"batch_size_per_rank={batch_size_per_rank} "
+            f"micro_batch_size={self.cfg.actor.micro_batch_size} "
+            f"gradient_accumulation={self.gradient_accumulation} "
+            f"update_epoch={update_epoch} "
+            f"global_batches_per_rank={num_global_batches} "
+            f"micro_batches_per_global={num_micro_batches_per_global} "
+            f"total_micro_batches_per_rank={total_micro_batches}"
+        )
+        metrics = {}
+        micro_batch_seen = 0
+        for epoch_idx in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
-                rollout_size // batch_size_per_rank,
+                num_global_batches,
             )
-            for train_global_batch in rollout_dataloader_iter:
+            for global_batch_idx, train_global_batch in enumerate(
+                rollout_dataloader_iter
+            ):
+                batch_started = time.monotonic()
                 # split batch into micro_batches
                 train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
                 assert (
@@ -1722,8 +1786,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 for idx, batch in enumerate(train_micro_batch):
+                    micro_index = micro_batch_seen
+                    micro_batch_seen += 1
+                    log_progress = self._rank == 0 and should_log_actor_training_progress(
+                        micro_index,
+                        total_micro_batches,
+                    )
+                    if log_progress:
+                        self.log_info(
+                            "actor training: micro-batch start "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"epoch={epoch_idx + 1}/{update_epoch} "
+                            f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                            f"micro={idx + 1}/{num_micro_batches_per_global}"
+                        )
                     batch = put_tensor_device(
                         batch,
                         f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
@@ -1773,6 +1851,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
+                    forward_started = time.monotonic()
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1781,6 +1860,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             compute_values=compute_values,
                             use_cache=False,
                             **kwargs,
+                        )
+                    if log_progress:
+                        self.log_info(
+                            "actor training: model forward done "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"elapsed={time.monotonic() - forward_started:.2f}s"
                         )
 
                     if (
@@ -1819,16 +1904,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         SupportedModel(self.cfg.actor.model.model_type)
                         == SupportedModel.DREAMZERO
                     ):
-                        kwargs["dreamzero_advantage_weight_mode"] = (
-                            self.cfg.algorithm.get(
-                                "dreamzero_advantage_weight_mode", "positive"
-                            )
-                        )
-                        kwargs["dreamzero_action_loss_scale"] = (
-                            self.cfg.algorithm.get(
-                                "dreamzero_action_loss_scale", 1.0
-                            )
-                        )
+                        for key in (
+                            "dreamzero_advantage_weight_mode",
+                            "dreamzero_action_loss_scale",
+                            "dreamzero_logprob_mode",
+                            "dreamzero_action_logprob_std",
+                            "dreamzero_action_logprob_proxy_scale",
+                            "dreamzero_use_rollout_old_logprob_proxy",
+                            "dreamzero_ppo_loss_scale",
+                            "dreamzero_ppo_clip_ratio_c",
+                            "dreamzero_advantage_reduction",
+                            "dreamzero_use_loss_mask",
+                        ):
+                            if key in self.cfg.algorithm:
+                                kwargs[key] = self.cfg.algorithm.get(key)
                     loss, metrics_data = policy_loss(**kwargs)
 
                     entropy_loss = torch.tensor(
@@ -1853,8 +1942,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self._train_sft_epoch(metrics_data, loss)
 
                     loss /= self.gradient_accumulation
+                    backward_started = time.monotonic()
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
+                    if log_progress:
+                        self.log_info(
+                            "actor training: backward done "
+                            f"{micro_index + 1}/{total_micro_batches} "
+                            f"elapsed={time.monotonic() - backward_started:.2f}s"
+                        )
 
                     metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
@@ -1862,9 +1958,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_micro_batch[idx] = None
                     del batch, output_dict, forward_inputs, loss, metrics_data
 
+                if self._rank == 0:
+                    self.log_info(
+                        "actor training: global batch done "
+                        f"{global_batch_idx + 1}/{num_global_batches} "
+                        f"epoch={epoch_idx + 1}/{update_epoch} "
+                        f"elapsed={time.monotonic() - batch_started:.2f}s"
+                    )
+                empty_cache_started = time.monotonic()
                 self.torch_platform.empty_cache()
+                if self._rank == 0:
+                    self.log_info(
+                        "actor training: empty_cache done "
+                        f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                        f"elapsed={time.monotonic() - empty_cache_started:.2f}s"
+                    )
 
+                optimizer_started = time.monotonic()
                 grad_norm, lr_list = self.optimizer_step()
+                if self._rank == 0:
+                    self.log_info(
+                        "actor training: optimizer step done "
+                        f"global_batch={global_batch_idx + 1}/{num_global_batches} "
+                        f"grad_norm={float(grad_norm):.6g} "
+                        f"elapsed={time.monotonic() - optimizer_started:.2f}s"
+                    )
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1874,11 +1992,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 append_to_dict(metrics, data)
         # put LR scheduler step here
         self.lr_scheduler.step()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         clear_memory()
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        self.log_on_first_rank("actor training: reducing metrics")
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        self.log_on_first_rank(
+            f"actor training: done elapsed={time.monotonic() - run_started:.2f}s"
         )
 
         return mean_metric_dict

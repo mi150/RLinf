@@ -162,11 +162,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     st_index = model_path / "model.safetensors.index.json"
     has_full_model_weights = st.exists() or st_index.exists()
 
-    # Disable defer_lora_injection for immediate loading
     if "config" in dreamzero_config.action_head_cfg and isinstance(
         dreamzero_config.action_head_cfg["config"], dict
     ):
-        dreamzero_config.action_head_cfg["config"]["defer_lora_injection"] = False
         # If full DreamZero safetensors are absent, fall back to component loading from
         # WAN paths in config.json (diffusion_model_pretrained_path / text / image / vae).
         dreamzero_config.action_head_cfg["config"]["skip_component_loading"] = (
@@ -254,6 +252,15 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             len(missing),
             len(unexpected),
         )
+        action_head = getattr(model, "action_head", None)
+        action_head_config = getattr(action_head, "config", None)
+        if (
+            action_head is not None
+            and hasattr(action_head, "inject_lora_after_loading")
+            and bool(getattr(action_head_config, "defer_lora_injection", False))
+        ):
+            action_head.inject_lora_after_loading()
+            log_stage("deferred action_head LoRA injected")
     else:
         get_logger().warning(
             "No model.safetensors under %s; initializing DreamZero from component weights "
