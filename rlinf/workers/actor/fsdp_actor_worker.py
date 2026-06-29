@@ -338,6 +338,7 @@ def ensure_dreamzero_world_model_forward_inputs(
 def build_dreamzero_forward_inputs(
     rollout_batch: dict[str, torch.Tensor],
     preserve_action_head_payload: bool = True,
+    action_head_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build DreamZero RL inputs while preserving model-native payloads."""
 
@@ -371,13 +372,36 @@ def build_dreamzero_forward_inputs(
         target_frames = blocks * num_frame_per_block * 4 + 1
         return images.expand(*images.shape[:2], target_frames, *images.shape[3:])
 
+    forward_inputs = dict(rollout_batch.get("forward_inputs", {}))
+    if action_head_only:
+        forward_inputs = {
+            key: value
+            for key, value in forward_inputs.items()
+            if key == "model_action" or key.startswith("dreamzero_")
+        }
+        if "model_action" in forward_inputs:
+            forward_inputs["model_action"] = _clamp_action_head_input(
+                forward_inputs["model_action"]
+            )
+        if "dreamzero_rl.action" in forward_inputs:
+            forward_inputs["dreamzero_rl.action"] = _clamp_action_head_input(
+                forward_inputs["dreamzero_rl.action"]
+            )
+            if "dreamzero_rl.images" in forward_inputs:
+                forward_inputs["dreamzero_rl.images"] = (
+                    _expand_single_frame_video_for_action_head(
+                        forward_inputs["dreamzero_rl.images"],
+                        forward_inputs["dreamzero_rl.action"],
+                    )
+                )
+        return forward_inputs
+
     actions = rollout_batch["actions"]
     rewards = rollout_batch["rewards"]
     dones = rollout_batch["dones"]
     if dones.shape[0] == actions.shape[0] + 1:
         dones = dones[1:]
 
-    forward_inputs = dict(rollout_batch.get("forward_inputs", {}))
     forward_inputs.update(
         {
             "curr_states": _expand_obs_to_action_chunks(
@@ -1477,10 +1501,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             rollout_batch["forward_inputs"] = build_dreamzero_forward_inputs(
                 rollout_batch,
                 preserve_action_head_payload=preserve_action_head_payload,
+                action_head_only=preserve_action_head_payload,
             )
-            if not preserve_action_head_payload:
-                rollout_batch.pop("curr_obs", None)
-                rollout_batch.pop("next_obs", None)
+            rollout_batch.pop("curr_obs", None)
+            rollout_batch.pop("next_obs", None)
 
         if (
             not self.cfg.env.train.auto_reset
@@ -1846,6 +1870,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         == SupportedModel.GR00T
                     ):
                         kwargs["prev_logprobs"] = prev_logprobs
+                    elif (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.DREAMZERO
+                    ):
+                        kwargs["dreamzero_logprob_mode"] = self.cfg.algorithm.get(
+                            "dreamzero_logprob_mode", "action_chain"
+                        )
 
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False

@@ -1,0 +1,891 @@
+{
+  "bindings": [
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 100,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 100,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 100,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 100,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 100,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 100,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 100,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 100,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ],
+          [
+            5
+          ],
+          [
+            6
+          ],
+          [
+            7
+          ],
+          [
+            0
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ],
+          [
+            5
+          ],
+          [
+            6
+          ],
+          [
+            7
+          ]
+        ],
+        "process_cpu_cores": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 0,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            8
+          ],
+          [
+            9
+          ],
+          [
+            10
+          ],
+          [
+            11
+          ],
+          [
+            12
+          ],
+          [
+            13
+          ],
+          [
+            14
+          ],
+          [
+            15
+          ],
+          [
+            8
+          ],
+          [
+            9
+          ],
+          [
+            10
+          ],
+          [
+            11
+          ],
+          [
+            12
+          ],
+          [
+            13
+          ],
+          [
+            14
+          ],
+          [
+            15
+          ]
+        ],
+        "process_cpu_cores": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 0,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            16
+          ],
+          [
+            17
+          ],
+          [
+            18
+          ],
+          [
+            19
+          ],
+          [
+            20
+          ],
+          [
+            21
+          ],
+          [
+            22
+          ],
+          [
+            23
+          ],
+          [
+            16
+          ],
+          [
+            17
+          ],
+          [
+            18
+          ],
+          [
+            19
+          ],
+          [
+            20
+          ],
+          [
+            21
+          ],
+          [
+            22
+          ],
+          [
+            23
+          ]
+        ],
+        "process_cpu_cores": [
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 0,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            24
+          ],
+          [
+            25
+          ],
+          [
+            26
+          ],
+          [
+            27
+          ],
+          [
+            28
+          ],
+          [
+            29
+          ],
+          [
+            30
+          ],
+          [
+            31
+          ],
+          [
+            24
+          ],
+          [
+            25
+          ],
+          [
+            26
+          ],
+          [
+            27
+          ],
+          [
+            28
+          ],
+          [
+            29
+          ],
+          [
+            30
+          ],
+          [
+            31
+          ]
+        ],
+        "process_cpu_cores": [
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 0,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            32
+          ],
+          [
+            33
+          ],
+          [
+            34
+          ],
+          [
+            35
+          ],
+          [
+            36
+          ],
+          [
+            37
+          ],
+          [
+            38
+          ],
+          [
+            39
+          ],
+          [
+            32
+          ],
+          [
+            33
+          ],
+          [
+            34
+          ],
+          [
+            35
+          ],
+          [
+            36
+          ],
+          [
+            37
+          ],
+          [
+            38
+          ],
+          [
+            39
+          ]
+        ],
+        "process_cpu_cores": [
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 0,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            40
+          ],
+          [
+            41
+          ],
+          [
+            42
+          ],
+          [
+            43
+          ],
+          [
+            44
+          ],
+          [
+            45
+          ],
+          [
+            46
+          ],
+          [
+            47
+          ],
+          [
+            40
+          ],
+          [
+            41
+          ],
+          [
+            42
+          ],
+          [
+            43
+          ],
+          [
+            44
+          ],
+          [
+            45
+          ],
+          [
+            46
+          ],
+          [
+            47
+          ]
+        ],
+        "process_cpu_cores": [
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 0,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            48
+          ],
+          [
+            49
+          ],
+          [
+            50
+          ],
+          [
+            51
+          ],
+          [
+            52
+          ],
+          [
+            53
+          ],
+          [
+            54
+          ],
+          [
+            55
+          ],
+          [
+            48
+          ],
+          [
+            49
+          ],
+          [
+            50
+          ],
+          [
+            51
+          ],
+          [
+            52
+          ],
+          [
+            53
+          ],
+          [
+            54
+          ],
+          [
+            55
+          ]
+        ],
+        "process_cpu_cores": [
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 0,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": {
+        "env_cpu_core_groups": [
+          [
+            56
+          ],
+          [
+            57
+          ],
+          [
+            58
+          ],
+          [
+            59
+          ],
+          [
+            60
+          ],
+          [
+            61
+          ],
+          [
+            62
+          ],
+          [
+            63
+          ],
+          [
+            56
+          ],
+          [
+            57
+          ],
+          [
+            58
+          ],
+          [
+            59
+          ],
+          [
+            60
+          ],
+          [
+            61
+          ],
+          [
+            62
+          ],
+          [
+            63
+          ]
+        ],
+        "process_cpu_cores": [
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      },
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 0,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 20,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 20,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 20,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 20,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 20,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 20,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 20,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 20,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    }
+  ],
+  "enabled": true,
+  "summary": {
+    "mps_gpu_totals": {
+      "node0:gpu0": 120,
+      "node0:gpu1": 120,
+      "node0:gpu2": 120,
+      "node0:gpu3": 120,
+      "node0:gpu4": 120,
+      "node0:gpu5": 120,
+      "node0:gpu6": 120,
+      "node0:gpu7": 120
+    },
+    "shared_cpu_cores": {},
+    "shared_mig_uuids": {}
+  }
+}

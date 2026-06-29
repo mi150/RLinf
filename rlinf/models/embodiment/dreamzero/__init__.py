@@ -103,6 +103,10 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         load_dreamzero_dataset_metadata,
     )
     from rlinf.utils.patcher import Patcher
+    from rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only import (
+        flow_unipc_step,
+        lazy_joint_video_action,
+    )
 
     Patcher.clear()
     Patcher.add_patch(
@@ -138,6 +142,27 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     Patcher.add_patch(
         f"{_dit_chunk}.CausalWanModel._forward_train",
         "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_train._forward_train",
+    )
+    Patcher.add_patch(
+        f"{_dit_chunk}.CausalWanModel._forward_blocks",
+        "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference._forward_blocks",
+    )
+    Patcher.add_patch(
+        f"{_dit_chunk}.CausalWanModel._forward_inference",
+        "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference._forward_inference",
+    )
+    _wan_policy_head = "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf"
+    Patcher.add_patch(
+        f"{_wan_policy_head}.WANPolicyHead._run_diffusion_steps",
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._run_diffusion_steps",
+    )
+    Patcher.add_wrapper(
+        f"{_wan_policy_head}.WANPolicyHead.lazy_joint_video_action",
+        lazy_joint_video_action,
+    )
+    Patcher.add_wrapper(
+        "groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler.FlowUniPCMultistepScheduler.step",
+        flow_unipc_step,
     )
     Patcher.apply()
     log_stage("patches applied")

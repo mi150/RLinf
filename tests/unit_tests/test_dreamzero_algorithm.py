@@ -15,6 +15,8 @@
 """Tests for DreamZero algorithm registry integration."""
 
 import asyncio
+import importlib
+import types
 
 import pytest
 import torch
@@ -790,6 +792,50 @@ def test_dreamzero_rl_forward_recomputes_action_chain_logprob(monkeypatch):
     assert policy.weight.grad is not None
 
 
+def test_dreamzero_rl_forward_action_loss_proxy_ignores_action_chain_payload(
+    monkeypatch,
+):
+    dreamzero_policy_module = pytest.importorskip(
+        "rlinf.models.embodiment.dreamzero.dreamzero_policy"
+    )
+    DreamZeroPolicy = dreamzero_policy_module.DreamZeroPolicy
+
+    class FakeDreamZeroPolicy(DreamZeroPolicy):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+        def _slice_rl_sample(self, inputs, index):
+            return {
+                key: value[index : index + 1] if torch.is_tensor(value) else value
+                for key, value in inputs.items()
+            }
+
+        def lazy_joint_video_action_causal(self, inputs, *, return_video=True):
+            raise AssertionError("PPO proxy path should not recompute action-chain logprob")
+
+    policy = FakeDreamZeroPolicy()
+
+    def fake_vla_forward(self, sample_input):
+        return BatchFeature(data={"action_loss": sample_input["action"].sum() + 1.0})
+
+    monkeypatch.setattr(dreamzero_policy_module.VLA, "forward", fake_vla_forward)
+    outputs = policy.rl_forward(
+        forward_inputs={
+            "dreamzero_rl.action": torch.tensor(
+                [[[0.25, -0.25], [0.5, -0.5]]], dtype=torch.float32
+            ),
+            "dreamzero_rl.action_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+            "dreamzero_old_action_logprob": torch.tensor([-4.0]),
+            "dreamzero_action_logprob_std": torch.tensor([1.0]),
+        },
+        dreamzero_logprob_mode="action_loss_proxy",
+    )
+
+    assert torch.allclose(outputs["dreamzero_losses"]["action_loss"], torch.tensor([1.0]))
+    assert "action_logprobs" not in outputs["dreamzero_losses"]
+    assert outputs["logprobs"].shape == (1, 4)
+
+
 def test_dreamzero_rl_forward_requests_action_only_recompute(monkeypatch):
     dreamzero_policy_module = pytest.importorskip(
         "rlinf.models.embodiment.dreamzero.dreamzero_policy"
@@ -820,6 +866,290 @@ def test_dreamzero_rl_forward_requests_action_only_recompute(monkeypatch):
 
     assert policy.return_video_values == [False]
     assert "action_logprobs" in outputs["dreamzero_losses"]
+
+
+def test_dreamzero_wan_forward_blocks_skips_video_head_for_action_only():
+    patch_module = importlib.import_module(
+        "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference"
+    )
+
+    class FakeBlock:
+        def __call__(self, *, x, **kwargs):
+            return x + 1.0, torch.ones(1)
+
+    class FakeWanModel:
+        def __init__(self):
+            self.dim = 4
+            self.freq_dim = 4
+            self.freqs_action = torch.zeros(1)
+            self.freqs_state = torch.zeros(1)
+            self.gradient_checkpointing = False
+            self.blocks = [FakeBlock()]
+            self.head_calls = 0
+
+        def action_encoder(self, action, timestep_action, embodiment_id):
+            del timestep_action, embodiment_id
+            return torch.ones(action.shape[0], action.shape[1], self.dim)
+
+        def state_encoder(self, state, embodiment_id):
+            del embodiment_id
+            return torch.ones(state.shape[0], state.shape[1], self.dim)
+
+        def action_decoder(self, action_tokens, embodiment_id):
+            del embodiment_id
+            return action_tokens
+
+        def time_embedding(self, timestep_embedding):
+            return torch.zeros(
+                timestep_embedding.shape[0],
+                self.dim,
+                dtype=timestep_embedding.dtype,
+                device=timestep_embedding.device,
+            )
+
+        def time_projection(self, embeddings):
+            return torch.zeros(
+                *embeddings.shape[:-1],
+                6 * self.dim,
+                dtype=embeddings.dtype,
+                device=embeddings.device,
+            )
+
+        def text_embedding(self, context):
+            return context
+
+        def head(self, x_video, e_video):
+            del e_video
+            self.head_calls += 1
+            return x_video
+
+    model = FakeWanModel()
+    x_video, action_noise_pred, updated_kv_caches = patch_module._forward_blocks(
+        model,
+        x=torch.zeros(1, 4, 1, 1, 2),
+        seq_len=2,
+        freqs=torch.zeros(1),
+        timestep=torch.zeros(1, 1, dtype=torch.int64),
+        context=torch.zeros(1, 2, 4),
+        clip_feature=None,
+        embodiment_id=torch.zeros(1, dtype=torch.long),
+        action=torch.zeros(1, 1, 3),
+        timestep_action=torch.zeros(1, 1, dtype=torch.int64),
+        state=torch.zeros(1, 1, 3),
+        kv_cache=[torch.zeros(1)],
+        current_start_frame=0,
+        return_video_pred=False,
+    )
+
+    assert x_video is None
+    assert model.head_calls == 0
+    assert action_noise_pred is not None
+    assert len(updated_kv_caches) == 1
+
+
+def test_dreamzero_wan_forward_inference_skips_unpatchify_for_action_only():
+    patch_module = importlib.import_module(
+        "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference"
+    )
+
+    class FakeWanModel:
+        model_type = "t2v"
+        concat_first_frame_latent = False
+        text_len = 2
+
+        def __init__(self):
+            self.unpatchify_calls = 0
+            self._forward_blocks = types.MethodType(patch_module._forward_blocks, self)
+
+        def patch_embedding(self, x):
+            return x
+
+        def _create_freqs(self, *, grid_size, start_frame):
+            del grid_size, start_frame
+            return torch.zeros(1)
+
+        def unpatchify(self, x_video, grid_size):
+            del x_video, grid_size
+            self.unpatchify_calls += 1
+            raise AssertionError("unpatchify should be skipped in action-only inference")
+
+        dim = 4
+        freq_dim = 4
+        freqs_action = torch.zeros(1)
+        freqs_state = torch.zeros(1)
+        gradient_checkpointing = False
+        blocks = []
+
+        def action_encoder(self, action, timestep_action, embodiment_id):
+            del timestep_action, embodiment_id
+            return torch.ones(action.shape[0], action.shape[1], self.dim)
+
+        def state_encoder(self, state, embodiment_id):
+            del embodiment_id
+            return torch.ones(state.shape[0], state.shape[1], self.dim)
+
+        def action_decoder(self, action_tokens, embodiment_id):
+            del embodiment_id
+            return action_tokens
+
+        def time_embedding(self, timestep_embedding):
+            return torch.zeros(
+                timestep_embedding.shape[0],
+                self.dim,
+                dtype=timestep_embedding.dtype,
+                device=timestep_embedding.device,
+            )
+
+        def time_projection(self, embeddings):
+            return torch.zeros(
+                *embeddings.shape[:-1],
+                6 * self.dim,
+                dtype=embeddings.dtype,
+                device=embeddings.device,
+            )
+
+        def text_embedding(self, context):
+            return context
+
+        def head(self, x_video, e_video):
+            del e_video
+            return x_video
+
+    model = FakeWanModel()
+    video_noise_pred, action_noise_pred, updated_kv_caches = patch_module._forward_inference(
+        model,
+        x=torch.zeros(1, 4, 1, 1, 2),
+        timestep=torch.zeros(1, 1, dtype=torch.int64),
+        context=torch.zeros(1, 2, 4),
+        seq_len=2,
+        kv_cache=[],
+        crossattn_cache=[],
+        current_start_frame=0,
+        y=None,
+        clip_feature=None,
+        action=torch.zeros(1, 1, 3),
+        timestep_action=torch.zeros(1, 1, dtype=torch.int64),
+        state=torch.zeros(1, 1, 3),
+        embodiment_id=torch.zeros(1, dtype=torch.long),
+        return_video_pred=False,
+    )
+
+    assert video_noise_pred is None
+    assert model.unpatchify_calls == 0
+    assert action_noise_pred is not None
+    assert updated_kv_caches == []
+
+
+def test_dreamzero_run_diffusion_steps_passes_action_only_flag_to_model():
+    patch_module = importlib.import_module(
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only"
+    )
+
+    class FakePolicyHead:
+        trt_engine = None
+        ip_size = 1
+
+        def __init__(self):
+            self.seen_return_video_flags = []
+
+        def model(self, *args, **kwargs):
+            del args
+            self.seen_return_video_flags.append(kwargs["return_video_pred"])
+            return None, kwargs["action"] + 1.0, [torch.ones(1)]
+
+        def _exchange_predictions(self, predictions):
+            return predictions
+
+    head = FakePolicyHead()
+    with patch_module._action_only_video_context(enabled=True):
+        predictions = patch_module._run_diffusion_steps(
+            head,
+            noisy_input=torch.zeros(1, 1, 1, 1, 2),
+            timestep=torch.zeros(1, 1, dtype=torch.int64),
+            action=torch.zeros(1, 2, 3),
+            timestep_action=torch.zeros(1, 2, dtype=torch.int64),
+            state=torch.zeros(1, 1, 3),
+            embodiment_id=torch.zeros(1, dtype=torch.long),
+            context=[torch.zeros(1, 2, 4)],
+            seq_len=2,
+            y=torch.zeros(1, 1, 1, 1, 2),
+            clip_feature=torch.zeros(1, 4),
+            kv_caches=[[torch.zeros(1)]],
+            crossattn_caches=[[torch.zeros(1)]],
+            kv_cache_metadata={"start_frame": 0, "update_kv_cache": False},
+        )
+
+    assert head.seen_return_video_flags == [False]
+    assert torch.equal(predictions[0][0], torch.zeros(1, 1, 1, 1, 2))
+    assert torch.equal(predictions[0][1], torch.ones(1, 2, 3))
+
+
+def test_dreamzero_action_only_video_scheduler_step_is_noop():
+    patch_module = importlib.import_module(
+        "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only"
+    )
+    called = {"value": False}
+
+    def original_step(self, *, model_output, timestep, sample, step_index, return_dict=True):
+        del self, model_output, timestep, sample, step_index, return_dict
+        called["value"] = True
+        raise AssertionError("video scheduler step should be skipped in action-only mode")
+
+    wrapped_step = patch_module.flow_unipc_step(original_step)
+    sample = torch.zeros(1, 1, 1, 1, 2)
+
+    with patch_module._action_only_video_context(enabled=True):
+        result = wrapped_step(
+            object(),
+            model_output=torch.ones_like(sample),
+            timestep=torch.tensor(0),
+            sample=sample,
+            step_index=0,
+            return_dict=False,
+        )
+
+    assert called["value"] is False
+    assert result == (sample,)
+
+
+def test_dreamzero_get_model_registers_action_only_video_postprocess_patches(monkeypatch):
+    dreamzero_module = importlib.import_module("rlinf.models.embodiment.dreamzero")
+    patcher_module = importlib.import_module("rlinf.utils.patcher")
+    original_apply = patcher_module.Patcher.apply
+
+    def stop_after_patch_registration():
+        raise RuntimeError("stop after patch registration")
+
+    monkeypatch.setattr(patcher_module.Patcher, "apply", stop_after_patch_registration)
+
+    with pytest.raises(RuntimeError, match="stop after patch registration"):
+        dreamzero_module.get_model(OmegaConf.create({"model_path": "/tmp/not-needed"}))
+
+    mappings = patcher_module.Patcher._mappings_dict
+    wrappers = patcher_module.Patcher._wrappers_dict
+    assert (
+        mappings[
+            "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel._forward_inference"
+        ]
+        == "rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference._forward_inference"
+    )
+    assert (
+        mappings[
+            "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead._run_diffusion_steps"
+        ]
+        == "rlinf.models.embodiment.dreamzero.patch.wan_policy_head_action_only._run_diffusion_steps"
+    )
+    assert (
+        "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead.lazy_joint_video_action"
+        in wrappers
+    )
+    assert (
+        "groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler.FlowUniPCMultistepScheduler.step"
+        in wrappers
+    )
+
+    patcher_module.Patcher.apply = original_apply
+    patcher_module.Patcher.clear()
 
 
 def test_rollout_generate_releases_dreamzero_inference_cache():
@@ -1296,6 +1626,40 @@ def test_build_dreamzero_forward_inputs_expands_single_frame_dreamzero_video():
         result["dreamzero_rl.images"][:, :, 0],
         result["dreamzero_rl.images"][:, :, -1],
     )
+
+
+def test_build_dreamzero_forward_inputs_can_keep_only_action_head_payload():
+    rollout_batch = {
+        "curr_obs": {"states": torch.zeros(1, 1, 8)},
+        "next_obs": {"states": torch.zeros(1, 1, 8)},
+        "actions": torch.zeros(1, 1, 2, 7),
+        "rewards": torch.zeros(1, 1, 2),
+        "dones": torch.zeros(1, 1, 2, dtype=torch.bool),
+        "forward_inputs": {
+            "action": torch.zeros(1, 1, 14),
+            "model_action": torch.full((1, 1, 2, 32), 2.0),
+            "dreamzero_rl.action": torch.zeros(1, 1, 2, 32),
+            "dreamzero_rl.images": torch.zeros(1, 1, 1, 8, 8, 3),
+            "dreamzero_old_action_logprob": torch.zeros(1, 1),
+            "dreamzero_action_logprob_std": torch.ones(1, 1),
+        },
+    }
+
+    result = build_dreamzero_forward_inputs(
+        rollout_batch,
+        action_head_only=True,
+    )
+
+    assert set(result) == {
+        "model_action",
+        "dreamzero_rl.action",
+        "dreamzero_rl.images",
+        "dreamzero_old_action_logprob",
+        "dreamzero_action_logprob_std",
+    }
+    assert result["model_action"].min() >= -1.0
+    assert result["model_action"].max() <= 1.0
+    assert result["dreamzero_rl.images"].shape == (1, 1, 9, 8, 8, 3)
 
 
 def test_dreamzero_forward_payload_images_stack_across_online_history_lengths():

@@ -718,9 +718,15 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 images.shape[0], target_frames, *images.shape[2:]
             ).contiguous()
 
+        logprob_mode = kwargs.get("dreamzero_logprob_mode", "action_chain")
+        use_action_chain_logprob = (
+            logprob_mode == "action_chain"
+            and "dreamzero_old_action_logprob" in forward_inputs
+        )
+
         action_logprobs = None
         extra_metrics: dict[str, torch.Tensor] = {}
-        if "dreamzero_old_action_logprob" in forward_inputs:
+        if use_action_chain_logprob:
             self._reset_action_chain_inference_state()
             mean_pred = self.lazy_joint_video_action_causal(
                 rl_input, return_video=False
@@ -736,11 +742,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 std=std,
                 mask=rl_input.get("action_mask"),
             )
-            action_loss = torch.zeros(
-                actions.shape[0],
-                device=actions.device,
-                dtype=actions.dtype if actions.is_floating_point() else torch.float32,
-            )
+            action_loss = action_logprobs.detach().new_zeros(action_logprobs.shape)
         else:
             action_losses = []
             for index in range(actions.shape[0]):

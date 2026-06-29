@@ -53,7 +53,7 @@ cluster:
           sm_percent: 100
         rollout:
           pool: gpu_pool
-          sm_percent: 100
+          sm_percent: 20
         env:
           pool: gpu_pool
           sm_percent: 0
@@ -87,7 +87,7 @@ algorithm:
   logprob_type: chunk_level
   entropy_type: chunk_level
   adv_type: dreamzero
-  loss_type: dreamzero_world_model_proxy
+  loss_type: dreamzero_action_head_rl
   dreamzero_logprob_mode: action_chain
   dreamzero_action_logprob_std: 0.02
   loss_agg_func: token-mean
@@ -174,7 +174,7 @@ rollout:
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 1
+  micro_batch_size: 2
   global_batch_size: 64
   seed: 42
   enable_offload: false

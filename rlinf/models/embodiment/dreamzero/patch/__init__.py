@@ -15,6 +15,10 @@
 from rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_train import (
     _forward_train,
 )
+from rlinf.models.embodiment.dreamzero.patch.wan_causal_model_forward_inference import (
+    _forward_blocks,
+    _forward_inference,
+)
 from rlinf.models.embodiment.dreamzero.patch.wan_video_vae import (
     WanVideoVAE,
     WanVideoVAE38,
@@ -26,4 +30,6 @@ __all__ = [
     "WanVideoVAE38",
     "WanVideoVAEStateDictConverter",
     "_forward_train",
+    "_forward_blocks",
+    "_forward_inference",
 ]
