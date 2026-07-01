@@ -174,7 +174,7 @@ rollout:
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 2
+  micro_batch_size: 1
   global_batch_size: 64
   seed: 42
   enable_offload: false
@@ -201,7 +201,7 @@ actor:
     add_value_head: false
     add_q_head: false
     is_lora: false
-    gradient_checkpointing: true
+    gradient_checkpointing: false
   optim:
     lr: 1.0e-5
     value_lr: 1.0e-5
@@ -215,7 +215,7 @@ actor:
     strategy: fsdp
     sharding_strategy: full_shard
     use_orig_params: true
-    gradient_checkpointing: true
+    gradient_checkpointing: false
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
