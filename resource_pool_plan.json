@@ -2,20 +2,200 @@
   "bindings": [
     {
       "cluster_node_rank": 0,
-      "component": "env",
-      "cpu": {
-        "affinity_scope": "process",
-        "env_cpu_core_groups": [],
-        "process_cpu_cores": [
-          28,
-          29,
-          30,
-          31,
-          32,
-          33,
-          34
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 20,
+        "visible_devices": [
+          "0"
         ]
       },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 20,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 20,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 20,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 20,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 20,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 20,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "actor",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 20,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 0,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 0,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 0,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 0,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "env",
+      "cpu": null,
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
@@ -26,24 +206,12 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 0
+      "rank": 4
     },
     {
       "cluster_node_rank": 0,
       "component": "env",
-      "cpu": {
-        "affinity_scope": "process",
-        "env_cpu_core_groups": [],
-        "process_cpu_cores": [
-          35,
-          36,
-          37,
-          38,
-          39,
-          40,
-          41
-        ]
-      },
+      "cpu": null,
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
@@ -54,24 +222,12 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 1
+      "rank": 5
     },
     {
       "cluster_node_rank": 0,
       "component": "env",
-      "cpu": {
-        "affinity_scope": "process",
-        "env_cpu_core_groups": [],
-        "process_cpu_cores": [
-          42,
-          43,
-          44,
-          45,
-          46,
-          47,
-          48
-        ]
-      },
+      "cpu": null,
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
@@ -82,24 +238,12 @@
         ]
       },
       "node_group_label": "cluster",
-      "rank": 2
+      "rank": 6
     },
     {
       "cluster_node_rank": 0,
       "component": "env",
-      "cpu": {
-        "affinity_scope": "process",
-        "env_cpu_core_groups": [],
-        "process_cpu_cores": [
-          49,
-          50,
-          51,
-          52,
-          53,
-          54,
-          55
-        ]
-      },
+      "cpu": null,
       "gpu": {
         "mig_device_uuid": null,
         "mode": "mps",
@@ -110,12 +254,149 @@
         ]
       },
       "node_group_label": "cluster",
+      "rank": 7
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 0,
+        "sm_percent": 100,
+        "visible_devices": [
+          "0"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 0
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 1,
+        "sm_percent": 100,
+        "visible_devices": [
+          "1"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 1
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 2,
+        "sm_percent": 100,
+        "visible_devices": [
+          "2"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 2
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 3,
+        "sm_percent": 100,
+        "visible_devices": [
+          "3"
+        ]
+      },
+      "node_group_label": "cluster",
       "rank": 3
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 4,
+        "sm_percent": 100,
+        "visible_devices": [
+          "4"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 4
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 5,
+        "sm_percent": 100,
+        "visible_devices": [
+          "5"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 5
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 6,
+        "sm_percent": 100,
+        "visible_devices": [
+          "6"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 6
+    },
+    {
+      "cluster_node_rank": 0,
+      "component": "rollout",
+      "cpu": null,
+      "gpu": {
+        "mig_device_uuid": null,
+        "mode": "mps",
+        "parent_gpu": 7,
+        "sm_percent": 100,
+        "visible_devices": [
+          "7"
+        ]
+      },
+      "node_group_label": "cluster",
+      "rank": 7
     }
   ],
   "enabled": true,
   "summary": {
-    "mps_gpu_totals": {},
+    "mps_gpu_totals": {
+      "node0:gpu0": 120,
+      "node0:gpu1": 120,
+      "node0:gpu2": 120,
+      "node0:gpu3": 120,
+      "node0:gpu4": 120,
+      "node0:gpu5": 120,
+      "node0:gpu6": 120,
+      "node0:gpu7": 120
+    },
     "shared_cpu_cores": {},
     "shared_mig_uuids": {}
   }

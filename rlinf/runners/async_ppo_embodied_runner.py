@@ -184,7 +184,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
         self.actor.set_global_step(self.global_step).wait()
         self.rollout.set_global_step(self.global_step).wait()
-        self.env.set_global_step(self.global_step).wait()
+        # self.env.set_global_step(self.global_step).wait()
         self.update_rollout_weights()
 
         env_handle: Handle = self.env.interact(
@@ -230,7 +230,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                         self.global_step += 1
                         self.actor.set_global_step(self.global_step).wait()
                         self.rollout.set_global_step(self.global_step).wait()
-                        self.env.set_global_step(self.global_step).wait()
+                        # self.env.set_global_step(self.global_step).wait()
                         with self.timer("update_rollout_weights"):
                             self.update_rollout_weights()
 
